@@ -49,8 +49,9 @@ const landingScriptBytes = entryScripts.reduce((sum, path) => {
   return sum + asset.bytes;
 }, 0);
 
-// Raised from 5 MiB for the docs diagrams (light and dark SVG renders).
-enforce('complete static site', assets.reduce((sum, asset) => sum + asset.bytes, 0), 5.25 * 1024 * 1024);
+// Raised from 5 MiB for the docs diagrams (light and dark SVG renders), and
+// from 5.25 MiB for the Wasm processors guide.
+enforce('complete static site', assets.reduce((sum, asset) => sum + asset.bytes, 0), 5.5 * 1024 * 1024);
 enforce('llms.txt exports', llmsText.reduce((sum, asset) => sum + asset.bytes, 0), 2 * 1024 * 1024);
 enforce('all JavaScript including Pagefind', total(assets, ['.js']), 768 * 1024);
 enforce('all CSS including Pagefind', total(assets, ['.css']), 256 * 1024);

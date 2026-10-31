@@ -41,6 +41,33 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
+  wasm:
+    name: Wasm processors
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Match the prebuilt modules to their sources
+        run: sh scripts/build-wasm-processors.sh --check
+      - name: Lint the guest SDK and the example processors as Wasm
+        run: |
+          rustup target add wasm32-unknown-unknown
+          cargo clippy --locked -p leani-wasm-guest --target wasm32-unknown-unknown -- -D warnings
+          cargo fmt --manifest-path examples/wasm-processors/Cargo.toml --all --check
+          cargo clippy --locked --manifest-path examples/wasm-processors/Cargo.toml \
+            --target wasm32-unknown-unknown -- -D warnings
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      - name: Build TypeScript twins and generated processors
+        run: |
+          # Generated crates build outside the checkout, so with the default
+          # toolchain; the pinned one already has the wasm32 target.
+          rustup default "$(rustup show active-toolchain | cut -d ' ' -f 1)"
+          cargo test --locked -p leani-processor-wasm -- --ignored --skip wasm_versus_native
+          cargo test --locked -p leani --lib wasm_build -- --ignored
+
   sdk:
     name: TypeScript SDK
     runs-on: ubuntu-24.04

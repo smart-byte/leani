@@ -25,12 +25,16 @@ members = [
   "crates/store-artifacts",
   "crates/store-sqlite",
   "crates/testkit",
+  "crates/processor-wasm",
+  "crates/wasm-guest",
   "examples/custom-node",
 ]
+# Wasm guest processors build for wasm32-unknown-unknown in their own workspace.
+exclude = ["examples/wasm-processors"]
 default-members = ["crates/node"]
 
 [workspace.package]
-version = "0.1.0-rc.8"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -123,6 +127,16 @@ toml = "1.1"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Deterministic profile: NaN canonicalization, so floats map alike on every
+# platform. No `wat`/`memory64`: guests are wasm32 binaries.
+wasmi = { version = "2.0", default-features = false, features = [
+  "auto-dispatch",
+  "deterministic",
+  "stable",
+  "std",
+  "validate",
+] }
+wat = "1.262"
 tree_hash = "0.12"
 url = { version = "2.5", features = ["serde"] }
 ssz = { package = "ethereum_ssz", version = "0.9.1" }

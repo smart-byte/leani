@@ -1,4 +1,5 @@
-//! Compact configuration generation for built-in processor presets.
+//! `leani init`: a compact configuration for a built-in processor preset,
+//! or a full one built from requirements.
 
 use std::{
     fs,
@@ -10,12 +11,47 @@ use anyhow::{Context as _, Result, bail};
 use url::Url;
 
 use crate::{
-    cli::SubscribeProtocol, config::StarterConfig, process::Exit, subscribe::initialize_checkpoint,
+    cli::{Follow, Keep, Recipe, SubscribeProtocol},
+    config::{HumanBytes, StarterConfig},
+    config_builder::{BuildContext, History, Limits, ProcessorChoice, Requirements},
+    process::Exit,
+    processors::ProcessorRegistry,
+    subscribe::initialize_checkpoint,
     uniswap_markets::resolve_markets,
 };
 
+/// Any of these flags, `--requirements`, or `--json` builds a full
+/// configuration instead of the compact one.
+pub(crate) struct RequirementFlags {
+    pub keep: Option<Keep>,
+    pub window_days: Option<u64>,
+    pub follow: Option<Follow>,
+    pub history_from_block: Option<u64>,
+    pub memory: Option<HumanBytes>,
+    pub disk: Option<HumanBytes>,
+    pub bandwidth: Option<u64>,
+    pub tuning: Vec<Recipe>,
+    pub requirements: Option<PathBuf>,
+    pub json: bool,
+}
+
+impl RequirementFlags {
+    fn given(&self) -> bool {
+        self.keep.is_some()
+            || self.window_days.is_some()
+            || self.follow.is_some()
+            || self.history_from_block.is_some()
+            || self.memory.is_some()
+            || self.disk.is_some()
+            || self.bandwidth.is_some()
+            || !self.tuning.is_empty()
+            || self.requirements.is_some()
+            || self.json
+    }
+}
+
 pub(crate) struct InitOptions {
-    pub protocol: SubscribeProtocol,
+    pub protocol: Option<SubscribeProtocol>,
     pub targets: Vec<String>,
     /// `--data-dir`; `None` for `./data` beside the configuration.
     pub data_dir: Option<PathBuf>,
@@ -24,9 +60,10 @@ pub(crate) struct InitOptions {
     pub accept_checkpoint: bool,
     pub config_path: PathBuf,
     pub working_directory: PathBuf,
+    pub flags: RequirementFlags,
 }
 
-pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
+pub(crate) async fn init(options: InitOptions, registry: &ProcessorRegistry) -> Result<Exit> {
     let config_path = absolute_path(&options.working_directory, &options.config_path);
     if config_path.exists() {
         bail!(
@@ -34,13 +71,17 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
             config_path.display()
         );
     }
-    let market_names = match options.protocol {
-        SubscribeProtocol::Blocks => {
-            if !options.targets.is_empty() {
-                bail!("the blocks preset does not take market arguments");
-            }
-            Vec::new()
-        }
+    if options.protocol == Some(SubscribeProtocol::Blocks) && !options.targets.is_empty() {
+        bail!("the blocks preset does not take market arguments");
+    }
+    if options.flags.given() {
+        return build(options, &config_path, registry).await;
+    }
+    let Some(protocol) = options.protocol else {
+        bail!("name a processor preset, or pass --requirements");
+    };
+    let market_names = match protocol {
+        SubscribeProtocol::Blocks => Vec::new(),
         SubscribeProtocol::UniswapV3 => {
             if options.targets.is_empty() {
                 bail!("the uniswap-v3 preset requires at least one market");
@@ -64,7 +105,7 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
     )
     .await?;
     let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
-    let config = match options.protocol {
+    let config = match protocol {
         SubscribeProtocol::Blocks => {
             StarterConfig::blocks(data_dir, checkpoint.root, checkpoint.slot, endpoints)
         }
@@ -80,7 +121,7 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
     write_new_config(&config_path, &encoded)?;
 
     println!("Created {}", config_path.display());
-    match options.protocol {
+    match protocol {
         SubscribeProtocol::Blocks => println!("Processor: block-summary"),
         SubscribeProtocol::UniswapV3 => {
             println!("Processor: uniswap-observations");
@@ -90,13 +131,136 @@ pub(crate) async fn init(options: InitOptions) -> Result<Exit> {
     println!();
     println!("Next:");
     println!("  leani serve");
-    match options.protocol {
+    match protocol {
         SubscribeProtocol::Blocks => println!("  leani subscribe blocks"),
         SubscribeProtocol::UniswapV3 => {
             println!("  leani subscribe uniswap-v3 {}", market_names.join(" "));
         }
     }
     Ok(Exit::Success)
+}
+
+async fn build(
+    options: InitOptions,
+    config_path: &Path,
+    registry: &ProcessorRegistry,
+) -> Result<Exit> {
+    let requirements = match &options.flags.requirements {
+        Some(path) => read_requirements(path, &options.working_directory)?,
+        None => flag_requirements(options.protocol, &options.targets, &options.flags)?,
+    };
+    // Before the checkpoint fetch, which may ask to confirm its providers.
+    crate::config_builder::check(&requirements, None).map_err(anyhow::Error::msg)?;
+    let (data_dir, runtime_data_dir) = init_data_dir(
+        config_path,
+        options.data_dir.as_deref(),
+        &options.working_directory,
+    );
+    let finality = if requirements.follow == Follow::None {
+        None
+    } else {
+        let checkpoint = initialize_checkpoint(
+            options.checkpoint_urls,
+            options.checkpoint_quorum,
+            options.accept_checkpoint,
+            &runtime_data_dir,
+        )
+        .await?;
+        let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
+        Some(
+            crate::config_builder::finality(checkpoint.root, checkpoint.slot, endpoints)
+                .map_err(anyhow::Error::msg)?,
+        )
+    };
+    let built = crate::config_builder::build(
+        &requirements,
+        &BuildContext {
+            registry,
+            finality,
+            head: None,
+            data_dir: Some(data_dir),
+        },
+    )
+    .map_err(anyhow::Error::msg)?;
+    let valid = built.errors.is_empty();
+    if valid {
+        write_new_config(config_path, &built.toml)?;
+    }
+    if options.flags.json {
+        let mut report = serde_json::to_value(&built)?;
+        report["path"] = serde_json::Value::String(config_path.display().to_string());
+        report["written"] = serde_json::Value::Bool(valid);
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if valid {
+        println!("Created {}", config_path.display());
+        println!();
+        println!("Derived from your requirements:");
+        for decision in &built.decisions {
+            println!(
+                "  {} = {}  ({})",
+                decision.setting, decision.value, decision.because
+            );
+        }
+        for warning in &built.warnings {
+            println!("warning: {warning}");
+        }
+        println!();
+        println!("Next:");
+        for step in &built.next {
+            println!("  {step}");
+        }
+    } else {
+        for error in &built.errors {
+            eprintln!("error: {}: {}", error.field, error.message);
+        }
+    }
+    Ok(if valid {
+        Exit::Success
+    } else {
+        Exit::InvalidConfiguration
+    })
+}
+
+/// Requirements as JSON from a file, or from standard input for `-`.
+fn read_requirements(path: &Path, working_directory: &Path) -> Result<Requirements> {
+    let text = if path == Path::new("-") {
+        std::io::read_to_string(std::io::stdin()).context("read requirements from stdin")?
+    } else {
+        let path = absolute_path(working_directory, path);
+        fs::read_to_string(&path)
+            .with_context(|| format!("read requirements {}", path.display()))?
+    };
+    serde_json::from_str(&text).context("requirements are not valid; see `leani guide config`")
+}
+
+fn flag_requirements(
+    protocol: Option<SubscribeProtocol>,
+    targets: &[String],
+    flags: &RequirementFlags,
+) -> Result<Requirements> {
+    let processor = match protocol {
+        Some(SubscribeProtocol::Blocks) => ProcessorChoice::Blocks,
+        Some(SubscribeProtocol::UniswapV3) => ProcessorChoice::Uniswap {
+            markets: targets.to_vec(),
+        },
+        None => bail!("name a processor preset, or pass --requirements"),
+    };
+    Ok(Requirements {
+        processor,
+        keep: flags.keep.unwrap_or_default(),
+        window_days: flags.window_days,
+        follow: flags.follow.unwrap_or_default(),
+        history: flags.history_from_block.map(|block| History {
+            from_block: Some(block),
+            last_days: None,
+        }),
+        limits: Limits {
+            memory: flags.memory,
+            disk: flags.disk,
+            bandwidth_mbit: flags.bandwidth,
+        },
+        tuning: (!flags.tuning.is_empty()).then(|| flags.tuning.clone()),
+    })
 }
 
 /// Beacon transports for a new compact configuration: the managed default

@@ -19,6 +19,8 @@ use leani_processor_api::{
 use semver::Version;
 use serde::{Deserialize, Serialize};
 
+pub const EVM_EVENTS_VERSION: &str = "1.1.0";
+
 /// Declarative event processor configuration.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EvmEventsConfig {

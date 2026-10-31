@@ -719,11 +719,16 @@ reaching the limit needs working finality, or a hard limit above the
 `rpc.minimum_recent_blocks` window plus the unfinalized tail.
 
 A processor's delivery log is pruned in the background by its
-`delivery.pruning` policy: finalized changes older than its window, and,
-while the log exceeds its byte limit or the processor is paused at it, older
-finalized changes whatever their age, never one a required consumer has not
-acknowledged. A paused processor resumes once the log is below 90 percent of
-its limit. Embedded subscriptions (`leani subscribe` without a node) prune
+`delivery.pruning` policy, oldest change first: finalized changes older than
+its window, and, while the log exceeds its byte limit or the processor is
+paused at it, older finalized changes whatever their age, never one a
+required consumer has not acknowledged. A block-local processor's history
+and live blocks share its log, so a live change still inside the window can
+precede older history. Pruning by age stops at that change. Pruning at the
+limit does not, since the window of a paused processor does not move; a
+best-effort consumer that had not read the change gets `reset_required`.
+A paused processor resumes once the log is below 90 percent of its limit.
+Embedded subscriptions (`leani subscribe` without a node) prune
 the same way while they run, so their built-in processors keep within 64 MiB
 and 24 hours of changes.
 

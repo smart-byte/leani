@@ -4444,14 +4444,22 @@ impl SharedLiveRuntime {
         // Request every configured lane's material, including lanes that are
         // parked now: they resume by replaying the frames retained meanwhile,
         // so those frames must carry their material too.
+        let mut request =
+            compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?;
+        // The execution P2P source follows the chain by header, so keeping
+        // headers costs nothing: ad-hoc runs of header-only processors can
+        // then use the retained frames whatever the configured lanes need.
+        if self
+            .source
+            .descriptor()
+            .complete_capabilities
+            .contains(leani_primitives::Capability::Header)
+        {
+            request.required = request.required.with(leani_primitives::Capability::Header);
+        }
         let events = self
             .source
-            .subscribe(
-                compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?,
-                start,
-                budget,
-                cancellation.clone(),
-            )
+            .subscribe(request, start, budget, cancellation.clone())
             .await;
         let mut events = match events {
             Ok(events) => events,
@@ -6921,7 +6929,14 @@ fn record_apply(report: &mut SharedProcessorLiveReport, outcome: &ApplyOutcome) 
     }
 }
 
-fn compile_live_request(
+/// The live request that covers every one of `processors`' requirements,
+/// for a subscription starting at `start`.
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::InvalidConfig`] when no processor declares a
+/// requirement or `start` names no valid range.
+pub fn compile_live_request(
     processors: &[Arc<dyn Processor>],
     chain_id: leani_primitives::ChainId,
     start: &LiveStart,
@@ -6943,12 +6958,11 @@ fn compile_live_request(
         )
         .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?,
         LiveStart::RetainedCanonical { canonical } => {
-            let first = canonical.first().ok_or_else(|| {
-                RuntimeError::InvalidConfig(
+            let (Some(first), Some(last)) = (canonical.first(), canonical.last()) else {
+                return Err(RuntimeError::InvalidConfig(
                     "retained live start requires a non-empty canonical suffix".to_owned(),
-                )
-            })?;
-            let last = canonical.last().expect("non-empty canonical suffix");
+                ));
+            };
             BlockRange::new(first.number, last.number)
                 .map_err(|error| RuntimeError::InvalidConfig(error.to_string()))?
         }
@@ -19984,6 +19998,54 @@ mod tests {
         assert_eq!(report.processors["paused-at-subscribe"].applied, 3);
         assert_eq!(report.processors["live-at-subscribe"].applied, 3);
         assert_gap_recovered(&store, paused.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn the_shared_lane_requests_headers_where_its_source_supplies_them() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Attested);
+        let mut with_headers = fixture_source_descriptor("live-with-headers", range);
+        with_headers.capabilities = with_headers.capabilities.with(Capability::Header);
+        with_headers.complete_capabilities =
+            with_headers.complete_capabilities.with(Capability::Header);
+        for (descriptor, headers) in [
+            (with_headers, true),
+            (
+                fixture_source_descriptor("live-without-headers", range),
+                false,
+            ),
+        ] {
+            let (_directory, store) = store().await;
+            let source = Arc::new(FilteringLiveSource::new(
+                descriptor,
+                chain
+                    .iter()
+                    .cloned()
+                    .map(|frame| ChainEvent::Block(Box::new(frame)))
+                    .collect(),
+            ));
+            SharedLiveRuntime::new(
+                store,
+                source.clone(),
+                vec![Arc::new(FilteredCounter::named(
+                    "senders",
+                    vec![sender_requirement(OTHER_SENDER)],
+                ))],
+                SharedLiveRuntimeConfig::default(),
+            )
+            .expect("runtime")
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+            assert_eq!(
+                source.requests()[0].required.contains(Capability::Header),
+                headers
+            );
+        }
     }
 
     #[tokio::test]

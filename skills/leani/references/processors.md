@@ -5,7 +5,7 @@ Read this before configuring a node to extract data. Contents:
 1. Choose a built-in processor
 2. Decode contract events with `evm-events`
 3. Backfill, serve, and check coverage
-4. Write a custom Rust processor
+4. Write your own processor
 
 A processor is configured as a `[[processors]]` table in leani.toml. Its `id`
 picks the built-in kind and `instance` names this configuration. Version,
@@ -48,8 +48,8 @@ node config has many required tables (budgets, sources, finality, API) that
 historical WETH transfers from the public Xatu dataset with no API key and no
 live source. Without a checkout, download that file from the GitHub tag of the
 installed version, `v` plus what `leani --version` prints
-(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.8/examples/weth-transfers/node.toml`
-for 0.1.0-rc.8).
+(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.1/examples/weth-transfers/node.toml`
+for 0.1.1).
 Copy it to `leani.toml` in an empty directory and edit its processor:
 
 ```toml
@@ -114,7 +114,7 @@ Keys shape the output:
 
 There is no filter on argument values, indexed or not: every configured event
 from the configured addresses is stored, so filter when you query, or write a
-custom processor (section 4) when the answer is an aggregate. A log from the
+processor of your own (section 4) when the answer is an aggregate. A log from the
 configured address whose data does not decode as the event, including data
 that is not the canonical ABI encoding, is skipped, not an error.
 
@@ -144,7 +144,7 @@ curl -s 'http://127.0.0.1:8081/v1/processors/usdc-transfers/collections/usdc.tra
   `$LEANI_SOURCE/config/modes/` profiles or the "Configure a node" operations
   guide rather than editing those tables blind.
 
-## 4. Write a custom Rust processor
+## 4. Write your own processor
 
 When no built-in produces the answer directly, write a processor; that is how
 Leani is meant to be extended. Typical reasons: an aggregate (distinct count,
@@ -153,6 +153,53 @@ state derived across events or contracts, a filter on argument values,
 fields of packed, non-ABI log data, or a typed query route of your own.
 Exporting every raw event to count it client-side is the sign a processor is
 missing.
+
+The quickest is a Wasm processor, which the stock binary runs with no node of
+your own to build. `leani processor create` writes its crate from a spec of the
+data to keep, or from a bundled template's source (`--template`), with the SDK
+of the installed binary; edit `src/lib.rs` where the spec falls short:
+
+```bash
+leani processor create usdc-volume --spec - --json <<'EOF'
+{"data": {"kind": "events", "contracts": ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+          "events": ["Transfer(address indexed from, address indexed to, uint256 value)"]},
+ "keep": {"kind": "totals", "by": "to", "sum": ["value"]}}
+EOF
+(cd usdc-volume && cargo build --release --target wasm32-unknown-unknown)
+leani processor run usdc-volume/target/wasm32-unknown-unknown/release/usdc_volume.wasm --from-block 21000000 --to-block 21000099
+```
+
+`data.kind` is `events` (`contracts`, `events`), `transactions` (`to`,
+`from`, and `functions`, whose calls it decodes), or `blocks`; `fields` picks
+what to keep, all by default. `keep.kind` is `rows`, or `totals` with `by` (one
+field, or none for one total) and `sum` (unsigned fields). Install the target
+once with `rustup target add wasm32-unknown-unknown`.
+
+`--language typescript` writes the same processor as a TypeScript package
+instead (AssemblyScript: TypeScript syntax, Wasm types such as `u64`), edited
+in `assembly/index.ts` and built with `npm install && npm run build` into
+`build/<name>.wasm`; it needs Node.js 20 or later. Each bundled template has a
+TypeScript twin that publishes the same changes
+(`--template <name> --language typescript`).
+
+The contract, in short: `manifest` names the reduction (`block_local`, each
+block alone, or `ordered`, reading what earlier blocks wrote) and the
+capabilities and filter the processor needs; `map` turns one block, holding
+only that material, into a delta; `reduce` writes entities and publishes
+changes with `upsert` and `remove`. To keep it running, configure a processor
+with `id = "wasm"`, `settings.module` (the file, relative to the
+configuration), `settings.params` (JSON for the module), and optionally
+`settings.blake3` (a pin of the module bytes) and `settings.limits`;
+`leani init --requirements` builds that configuration with the `custom`
+preset (`leani guide config`). The guide has the details:
+`$LEANI_SOURCE/docs/guides/wasm-processors.mdx`, or "Run your own processor as
+Wasm" in https://leani.dev/_llms-txt/guides.txt.
+
+A running node also generates the source (`POST /v1/wasm/compose`) and, with
+`api.allow_wasm_builds = true`, builds it (`POST /admin/v1/wasm/build`), as
+its `/playground` does. Node-side builds are a development feature: in
+production, build the module locally or in CI and configure it. A native
+processor, below, suits typed query routes and the hottest paths.
 
 The descriptor declares the block material the processor reads, such as
 `Capability::Header`, `Body` (transaction `to`, value, nonce), `Senders`, or

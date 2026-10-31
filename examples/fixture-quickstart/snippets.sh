@@ -2,7 +2,7 @@
 # script: `leani serve` intentionally remains in the foreground.
 
 # docs:start source-install
-git clone https://github.com/smart-byte/leani.git
+git clone --branch v0.1.1 https://github.com/smart-byte/leani.git
 cd leani
 cargo build --locked -p leani
 export LEANI_SOURCE="$PWD"

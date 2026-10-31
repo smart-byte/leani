@@ -30,7 +30,8 @@ The manually dispatched **Coordinate release** workflow
    moved, builds and tests every artifact once, and records the runs and
    checksums in a release plan. It then dispatches the publishers in their
    protected environments, checks each publication against the plan, promotes
-   the documentation site, and waits until leani.dev serves the release.
+   the documentation site, and waits until leani.dev serves the release. Once a
+   stable release exists, a prerelease leaves the site on it.
    Publication is resumable rather than atomic: a retry reuses matching
    publications, and different bytes stop it.
 

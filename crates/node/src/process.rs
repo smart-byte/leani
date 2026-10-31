@@ -2,6 +2,7 @@
 
 mod backfill;
 mod shutdown;
+mod wasm_run;
 
 use std::{
     collections::BTreeMap,
@@ -27,7 +28,7 @@ use crate::{
     benchmark::{BenchmarkOptions, RealSourceBenchmarkOptions},
     cli::{
         BenchmarkCommand, Cli, Command, ConformanceCommand, DbCommand, E2eCommand, LogFormat,
-        ProbeSource, ResetCommand, SourceCommand, SubscribeProtocol,
+        ProbeSource, ProcessorCommand, ResetCommand, SourceCommand, SubscribeProtocol,
     },
     config::{
         ArtifactStorageBackend, Config, HistoryMaterialCoordinatorMode, ProcessorConfig,
@@ -3154,6 +3155,29 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         Command::Doctor { json } => doctor(&config_path, json, registry),
         Command::Serve => serve(&config_path, registry).await,
         Command::Guide { topic } => crate::guide::print(topic),
+        Command::Processor {
+            command:
+                ProcessorCommand::Create {
+                    directory,
+                    spec,
+                    template,
+                    language,
+                    json,
+                },
+        } => wasm_run::new_project(
+            &directory,
+            spec.as_deref(),
+            template.as_deref(),
+            language.map(|language| match language {
+                crate::cli::ProcessorLanguage::Rust => {
+                    leani_processor_wasm::scaffold::Language::Rust
+                }
+                crate::cli::ProcessorLanguage::Typescript => {
+                    leani_processor_wasm::scaffold::Language::TypeScript
+                }
+            }),
+            json,
+        ),
         Command::Init {
             protocol,
             targets,
@@ -3161,17 +3185,42 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
             checkpoint_url,
             checkpoint_quorum,
             yes,
+            keep,
+            window_days,
+            follow,
+            history_from_block,
+            memory,
+            disk,
+            bandwidth,
+            tuning,
+            requirements,
+            json,
         } => {
-            crate::init::init(crate::init::InitOptions {
-                protocol,
-                targets,
-                data_dir,
-                checkpoint_urls: checkpoint_url,
-                checkpoint_quorum,
-                accept_checkpoint: yes,
-                config_path: requested_config.unwrap_or_else(|| PathBuf::from("leani.toml")),
-                working_directory,
-            })
+            crate::init::init(
+                crate::init::InitOptions {
+                    protocol,
+                    targets,
+                    data_dir,
+                    checkpoint_urls: checkpoint_url,
+                    checkpoint_quorum,
+                    accept_checkpoint: yes,
+                    config_path: requested_config.unwrap_or_else(|| PathBuf::from("leani.toml")),
+                    working_directory,
+                    flags: crate::init::RequirementFlags {
+                        keep,
+                        window_days,
+                        follow,
+                        history_from_block,
+                        memory,
+                        disk,
+                        bandwidth,
+                        tuning,
+                        requirements,
+                        json,
+                    },
+                },
+                registry,
+            )
             .await
         }
         Command::Subscribe {
@@ -3269,6 +3318,33 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
                 token.as_deref(),
                 registry,
             )
+            .await
+        }
+        Command::Processor {
+            command:
+                ProcessorCommand::Run {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    params,
+                    params_json,
+                    data_dir,
+                },
+        } => {
+            Box::pin(wasm_run::run(
+                &config_path,
+                wasm_run::RunOptions {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    params,
+                    params_json,
+                    data_dir,
+                },
+                registry,
+            ))
             .await
         }
         Command::Source {
@@ -5584,6 +5660,93 @@ fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<Stri
     attested_gating_warnings(processors.iter().map(|processor| processor.descriptor()))
 }
 
+/// Check a posted configuration the way `leani doctor --json` checks a file,
+/// for the playground. It is written to a throwaway directory, so its
+/// relative paths name nothing on this host, and Wasm modules are not read:
+/// their paths would.
+fn check_configuration(input: &str, registry: &ProcessorRegistry) -> serde_json::Value {
+    let failed = |message: String| {
+        serde_json::json!({
+            "valid": false,
+            "errors": [{ "field": "config", "message": message }],
+            "warnings": [],
+        })
+    };
+    let directory = match tempfile::tempdir() {
+        Ok(directory) => directory,
+        Err(error) => return failed(error.to_string()),
+    };
+    let path = directory.path().join("leani.toml");
+    if let Err(error) = fs::write(&path, input) {
+        return failed(error.to_string());
+    }
+    let hide = |text: String| text.replace(&directory.path().display().to_string(), ".");
+    let (config, load_warnings) = match Config::load_with_warnings(&path, None) {
+        Ok(loaded) => loaded,
+        Err(error) => return failed(hide(format!("{:#}", anyhow::Error::from(error)))),
+    };
+    let mut errors = config.validation_errors();
+    let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
+    warnings.extend(load_warnings);
+    for (index, configured) in config.processors.iter().enumerate() {
+        if configured.id == leani_processor_wasm::PROCESSOR_ID {
+            warnings.push(format!(
+                "processors[{index}]: {}",
+                crate::processors::WASM_CHECKED_WHERE_INSTALLED
+            ));
+        } else {
+            match registry.instantiate(configured, config.chain.chain_id) {
+                Ok(processor) => {
+                    warnings.extend(crate::processors::output_warning(index, processor.as_ref()));
+                }
+                Err(error) => errors.push(ValidationError::new(
+                    format!("processors[{index}]"),
+                    error.to_string(),
+                )),
+            }
+        }
+    }
+    for error in &mut errors {
+        error.message = hide(std::mem::take(&mut error.message));
+    }
+    serde_json::json!({
+        "valid": errors.is_empty(),
+        "errors": errors,
+        "warnings": warnings.into_iter().map(hide).collect::<Vec<_>>(),
+        "chain": config.chain.name,
+        "chainId": config.chain.chain_id,
+        "processors": config
+            .processors
+            .iter()
+            .map(|processor| processor.instance.as_str())
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The feed an ad-hoc Wasm run opens when the live lane lacks its material:
+/// its own subscription to `source` for its processor's kinds of material,
+/// unfiltered. A run that swaps in another filter then reruns the blocks it
+/// holds without fetching them again; the Wasm host still hands a module
+/// only what its own filter selects.
+fn live_feed(
+    source: Arc<dyn leani_source_api::LiveSource>,
+    budget: leani_source_api::SourceBudget,
+) -> leani_api::LiveFeed {
+    Arc::new(move |processor, start, cancellation| {
+        let source = source.clone();
+        Box::pin(async move {
+            let mut request = leani_runtime::compile_live_request(
+                &[processor],
+                source.descriptor().chain_id,
+                &start,
+            )
+            .map_err(|error| leani_source_api::SourceError::InvalidPlan(error.to_string()))?;
+            request.filters = leani_source_api::FilterSet::default();
+            source.subscribe(request, start, budget, cancellation).await
+        })
+    })
+}
+
 fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit> {
     // The report carries what loading would log.
     let working_directory = std::env::current_dir().ok();
@@ -5615,6 +5778,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
     let mut warnings = finality_anchor_warnings(&config, SystemTime::now());
     warnings.extend(live_lane_warnings(&config, registry));
     warnings.extend(load_warnings);
+    warnings.extend(registry.validation_warnings(&config));
     let report = DoctorReport {
         project: leani_primitives::PROJECT_NAME,
         version: env!("CARGO_PKG_VERSION"),
@@ -5905,6 +6069,18 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     };
     let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
     let network_lanes = live_required && finality_required;
+    // The lanes and the feeds of ad-hoc Wasm runs share one execution P2P
+    // source: a run's feed then reuses the lanes' peers.
+    let attested_heads = leani_source_api::AttestedHeadPublisher::new();
+    let execution_source = network_lanes
+        .then(|| {
+            execution_p2p_source(
+                config.get(),
+                network_telemetry.clone(),
+                Some(attested_heads.subscribe()),
+            )
+        })
+        .transpose()?;
     // Only the network lanes publish the P2P history bridge's anchors, and
     // `run_network_lanes` gives up before the first one off Ethereum mainnet.
     let p2p_bridge_expected = network_lanes && config.get().chain.chain_id == 1;
@@ -6102,6 +6278,32 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 .clone()
                 .map(|control| control as Arc<dyn leani_api::RawHistoryControl>),
             shutdown: cancellation.clone(),
+            live_events: Some(committed_events.clone()),
+            live_feed: execution_source
+                .clone()
+                .map(|source| live_feed(source, live_source_budget(config.get()))),
+            config_check: Some({
+                let registry = registry.clone();
+                Arc::new(move |input: &str| check_configuration(input, &registry))
+            }),
+            config_build: Some({
+                let registry = registry.clone();
+                let finality = config.get().finality.clone();
+                Arc::new(move |requirements: &serde_json::Value, head: Option<u64>| {
+                    crate::config_builder::build_json(requirements, head, &registry, &finality)
+                })
+            }),
+            wasm_build: config
+                .get()
+                .api
+                .allow_wasm_builds
+                .then(|| -> leani_api::WasmBuild {
+                    let builder = crate::wasm_build::WasmBuilder::new(&config.get().data_dir);
+                    Arc::new(move |source: String, language| {
+                        let builder = builder.clone();
+                        Box::pin(async move { builder.build(source, language).await })
+                    })
+                }),
             ..NativeApiConfig::default()
         },
     )?;
@@ -6204,7 +6406,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             backfill_control: Some(backfill_control),
             verified_anchor: None,
             checkpoint_origin: leani_finality_beacon_api::CheckpointOrigin::Operator,
-            attested_heads: leani_source_api::AttestedHeadPublisher::new(),
+            attested_heads,
         };
         background.spawn("network lane supervisor", async move {
             let end = Box::pin(supervise_network_lanes(
@@ -6212,7 +6414,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 supervisor_store,
                 supervisor_processors,
                 supervisor_handles,
-                None,
+                execution_source,
             ))
             .await?;
             match end {
@@ -6300,8 +6502,12 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             "live ingestion requires both execution P2P and verified finality; readiness remains false"
         );
     }
-    let api_server = axum::serve(api_listener, api)
-        .with_graceful_shutdown(cancellation.clone().cancelled_owned());
+    // Peers' addresses: the API builds Rust only for requests from this machine.
+    let api_server = axum::serve(
+        api_listener,
+        api.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(cancellation.clone().cancelled_owned());
     let rpc_server = axum::serve(rpc_listener, rpc)
         .with_graceful_shutdown(cancellation.clone().cancelled_owned());
     let rpc_websocket_server = axum::serve(rpc_websocket_listener, rpc_websocket)
@@ -8743,6 +8949,186 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::{shutdown::SHUTDOWN_DEADLINE, *};
+
+    #[tokio::test]
+    async fn a_live_feed_subscribes_with_its_processors_material_only() {
+        use futures::StreamExt as _;
+
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(0),
+            leani_primitives::BlockNumber(2),
+        )
+        .expect("range");
+        let frame = fixture_frame(1, leani_primitives::BlockHash::ZERO);
+        // The source supplies transactions, receipts and logs, not headers.
+        let source = Arc::new(leani_testkit::ScriptedLiveSource::new(
+            leani_testkit::fixture_source_descriptor("feed", range),
+            vec![leani_testkit::LiveStep::Event(
+                leani_source_api::ChainEvent::Block(Box::new(frame.clone())),
+            )],
+        ));
+        let feed = live_feed(source, leani_testkit::default_source_budget());
+        let start = || leani_source_api::LiveStart::Block(frame.block);
+        let mut events = feed(
+            Arc::new(BlockLocalCounter::default()),
+            start(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a feed of transactions");
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(leani_source_api::ChainEvent::Block(_)))
+        ));
+        let headers = feed(
+            Arc::new(leani_testkit::OrderedLedgerProcessor::default()),
+            start(),
+            CancellationToken::new(),
+        )
+        .await;
+        assert!(
+            headers.is_err(),
+            "this processor needs headers, which the source lacks"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_feed_fetches_its_processors_kinds_of_material_unfiltered() {
+        use leani_processor_wasm::{
+            TEMPLATES, WasmContract, WasmLimits, WasmModule, WasmProcessor,
+        };
+        use leani_source_api::{
+            ChainEventStream, DataRequest, LiveSource, LiveStart, SourceBudget, SourceDescriptor,
+            SourceError,
+        };
+
+        struct Recording(
+            leani_testkit::ScriptedLiveSource,
+            std::sync::Mutex<Vec<DataRequest>>,
+        );
+        #[async_trait::async_trait]
+        impl LiveSource for Recording {
+            fn descriptor(&self) -> &SourceDescriptor {
+                self.0.descriptor()
+            }
+
+            async fn subscribe(
+                &self,
+                request: DataRequest,
+                start: LiveStart,
+                budget: SourceBudget,
+                cancellation: CancellationToken,
+            ) -> Result<ChainEventStream, SourceError> {
+                self.1.lock().expect("requests").push(request.clone());
+                self.0.subscribe(request, start, budget, cancellation).await
+            }
+        }
+
+        let range = leani_primitives::BlockRange::new(
+            leani_primitives::BlockNumber(0),
+            leani_primitives::BlockNumber(2),
+        )
+        .expect("range");
+        let source = Arc::new(Recording(
+            leani_testkit::ScriptedLiveSource::new(
+                leani_testkit::fixture_source_descriptor("feed", range),
+                Vec::new(),
+            ),
+            std::sync::Mutex::default(),
+        ));
+        let template = TEMPLATES
+            .iter()
+            .find(|template| template.name == "erc20-transfers")
+            .expect("template");
+        let limits = WasmLimits::default();
+        let transfers = WasmProcessor::new(
+            WasmModule::new(template.module, &limits).expect("module"),
+            &serde_json::from_str(template.params).expect("params"),
+            WasmContract {
+                instance: leani_processor_api::ProcessorInstanceId::new("feed").expect("instance"),
+                version: semver::Version::new(0, 0, 0),
+                start_block: leani_primitives::BlockNumber(0),
+                publication: leani_processor_api::PublicationPolicy::Attested,
+                lifecycle: leani_processor_api::LifecyclePolicies::default(),
+            },
+            limits,
+        )
+        .expect("processor");
+        assert!(
+            transfers.descriptor().requirements[0]
+                .filter
+                .constrains_logs(),
+            "the module selects one token's transfers"
+        );
+        let feed = live_feed(source.clone(), leani_testkit::default_source_budget());
+        let _events = feed(
+            Arc::new(transfers),
+            LiveStart::Block(fixture_frame(1, leani_primitives::BlockHash::ZERO).block),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("a feed of logs");
+        let requests = source.1.lock().expect("requests");
+        assert!(
+            requests[0]
+                .required
+                .contains(leani_primitives::Capability::Logs)
+        );
+        // Every log of each block, so the run can swap in another filter
+        // without fetching its blocks again.
+        assert_eq!(requests[0].filter_scope(), None);
+    }
+
+    #[test]
+    fn posted_configurations_are_checked_like_doctor_without_reading_modules() {
+        let registry = ProcessorRegistry::standard();
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let profile =
+            fs::read_to_string(repository.join("config/modes/windowed.toml")).expect("profile");
+        let report = check_configuration(&profile, &registry);
+        assert_eq!(report["valid"], true, "{report}");
+        assert_eq!(
+            report["processors"],
+            serde_json::json!(["uniswap-v2-sync-30d"])
+        );
+
+        let broken = check_configuration("config_version = 1\n[chain\n", &registry);
+        assert_eq!(broken["valid"], false);
+        let message = broken["errors"][0]["message"].as_str().expect("message");
+        assert!(message.contains("leani.toml"), "{message}");
+        assert!(
+            !message.contains(std::env::temp_dir().to_string_lossy().as_ref()),
+            "{message}"
+        );
+
+        let wasm = check_configuration(
+            &format!(
+                "{profile}\n[[processors]]\nid = \"wasm\"\ninstance = \"mine\"\nversion = \"1.0.0\"\nhistory_mode = \"on_demand\"\nstart_block = 1\npublish = \"finalized\"\nstate = {{ mode = \"durable\" }}\noutput = {{ mode = \"full\" }}\ndelivery = {{ mode = \"window\" }}\ncheckpoint = {{ mode = \"none\", keep = 0 }}\nundo = {{ mode = \"none\", safety_blocks = 0 }}\nsettings = {{ module = \"/etc/hosts\" }}\n"
+            ),
+            &registry,
+        );
+        let warnings = wasm["warnings"].to_string();
+        assert!(
+            warnings.contains("Wasm modules are checked where they are installed"),
+            "{wasm}"
+        );
+        assert!(!wasm["errors"].to_string().contains("/etc/hosts"), "{wasm}");
+
+        // `latest` on the block-local event decoder keeps every event.
+        let latest = profile.replace(
+            "[processors.output]\nmode = \"window\"\n\n[processors.output.window]\nmax_blocks = 216000\n",
+            "[processors.output]\nmode = \"latest\"\n",
+        );
+        assert_ne!(latest, profile, "the profile's output section moved");
+        let report = check_configuration(&latest, &registry);
+        assert_eq!(report["valid"], true, "{report}");
+        assert!(
+            report["warnings"]
+                .to_string()
+                .contains("output \\\"latest\\\""),
+            "{report}"
+        );
+    }
 
     #[test]
     fn history_reads_acquire_by_disk_and_hold_by_memory() {

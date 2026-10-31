@@ -223,6 +223,30 @@ fn is_loopback_host(host: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1" | "[::1]")
 }
 
+/// Whether a request comes from the node's own machine: a loopback peer,
+/// addressed to a loopback host, and not relayed by a proxy, which would
+/// make a remote client's request arrive from loopback too. An SSH tunnel
+/// to the node counts as its own machine.
+pub(crate) fn from_this_machine(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> bool {
+    let relayed = [
+        "forwarded",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-real-ip",
+    ]
+    .iter()
+    .any(|name| headers.contains_key(*name));
+    let local_host = headers
+        .get(header::HOST)
+        .map_or(Some(true), |host| {
+            host.to_str()
+                .ok()
+                .map(|host| is_loopback_host(&authority_host(host).to_ascii_lowercase()))
+        })
+        .unwrap_or(false);
+    peer.is_some_and(|peer| peer.to_canonical().is_loopback()) && !relayed && local_host
+}
+
 /// Whether the `Content-Type` media type is `application/json`, with any
 /// parameters.
 fn is_json_content_type(headers: &HeaderMap) -> bool {

@@ -65,7 +65,8 @@
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "bind": { "$ref": "#/$defs/socketAddress", "default": "127.0.0.1:18080" }
+        "bind": { "$ref": "#/$defs/socketAddress", "default": "127.0.0.1:18080" },
+        "allow_wasm_builds": { "$ref": "#/$defs/allowWasmBuilds" }
       }
     },
     "advancedConfig": {
@@ -713,6 +714,7 @@
           "$ref": "#/$defs/allowedOrigins",
           "description": "Browser origins, besides loopback ones on any port, that may call the API. Any other Origin gets HTTP 403."
         },
+        "allow_wasm_builds": { "$ref": "#/$defs/allowWasmBuilds" },
         "delivery": {
           "type": "object",
           "additionalProperties": false,
@@ -722,6 +724,11 @@
           }
         }
       }
+    },
+    "allowWasmBuilds": {
+      "type": "boolean",
+      "default": false,
+      "description": "Compile processor source sent to POST /admin/v1/wasm/build, as the playground's editor does. A development feature, not for production: rustc can read the host's files while it compiles, so Rust builds only for requests from the node's own machine, TypeScript for any client the API admits. Build modules where you write them and configure the module file instead."
     },
     "deliveryBatch": {
       "type": "object",

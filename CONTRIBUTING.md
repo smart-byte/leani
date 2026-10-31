@@ -30,7 +30,7 @@ git config core.hooksPath "$PWD/scripts/git-hooks"
 ```
 
 The hooks check staged files and commit messages, and inspect the complete
-history of every pushed branch or tag. Private plans, agent instructions,
+history of every pushed branch or tag. Private plans,
 design explorations, raw reports, credentials, and local user paths belong
 under ignored `.private/`. Deleting a file in a later commit does not remove
 it from history. Never push archive, backup, or private refs; keep recovery

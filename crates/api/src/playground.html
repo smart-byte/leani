@@ -1,0 +1,2026 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M9.96 30L16.36 30L19.76 14L13.36 14Z' fill='%23e6f0ea'/%3E%3Crect x='14' y='3' width='8' height='8' rx='.6' fill='%233ee07f'/%3E%3C/svg%3E">
+  <title>leani playground</title>
+  <style>
+    /* The design tokens of leani.dev (site/src/styles/global.css). */
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f0d;
+      --panel: #101613;
+      --panel-edge: #21302a;
+      --field: #0c110e;
+      --ink: #e6f0ea;
+      --ink-dim: #8fa89a;
+      --accent: #3ee07f;
+      --accent-dim: #1f7a4a;
+      --slot: #3c5247;
+      --amber: #f2c46d;
+      --red: #f07178;
+      --font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+      --font-sans: 'Inter Variable', Inter, system-ui, -apple-system, 'Segoe UI', sans-serif;
+    }
+    * { box-sizing: border-box; margin: 0; }
+    body {
+      background: var(--bg);
+      color: var(--ink);
+      font: 15px/1.6 var(--font-sans);
+      -webkit-font-smoothing: antialiased;
+    }
+    body::before {
+      content: ""; position: fixed; inset: 0 0 auto; height: 28rem; pointer-events: none; z-index: -1;
+      background: radial-gradient(48rem 20rem at 80% -6rem, rgb(62 224 127 / .08), transparent 70%);
+    }
+    code, pre, textarea, input, table, button { font-family: var(--font-mono); }
+    button, input, textarea { font-size: inherit; color: inherit; }
+    a { color: var(--accent); text-decoration-color: var(--accent-dim); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+    [hidden] { display: none !important; }
+
+    .top { border-bottom: 1px solid var(--panel-edge); }
+    .top .wrap { display: flex; align-items: center; gap: 1.25rem; min-height: 3.5rem; flex-wrap: wrap; padding-block: .5rem; }
+    .brand { display: flex; align-items: baseline; gap: .6rem; text-decoration: none; color: var(--ink-dim); font: 12px var(--font-mono); }
+    .brand svg { height: 21px; width: auto; align-self: center; }
+    .tabs { display: flex; gap: 1.1rem; margin-left: auto; }
+    .tabs button { background: none; border: 0; padding: .3rem 0; font-size: 13px; color: var(--ink-dim); border-bottom: 2px solid transparent; cursor: pointer; }
+    .tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--accent); }
+    .auth { display: flex; align-items: center; gap: .5rem; font: 12px var(--font-mono); color: var(--ink-dim); }
+    .auth input { width: 11rem; }
+
+    .wrap { width: 100%; max-width: 92rem; margin-inline: auto; padding-inline: 1.25rem; }
+    .intro { padding-block: 2rem 1.5rem; max-width: 46rem; }
+    .eyebrow {
+      display: inline-flex; align-items: center; gap: .5rem; color: var(--accent);
+      border: 1px solid var(--accent-dim); border-radius: 999px; padding: .28rem .65rem;
+      font: .72rem var(--font-mono); letter-spacing: .06em; text-transform: uppercase;
+    }
+    .eyebrow::before { content: ""; width: .42rem; height: .42rem; border-radius: 50%; background: var(--accent); }
+    h1 { margin-top: .9rem; font-size: clamp(1.6rem, 3.4vw, 2.3rem); line-height: 1.15; font-weight: 650; letter-spacing: -.01em; text-wrap: balance; }
+    h1 .accent { color: var(--accent); }
+    .intro p { margin-top: .6rem; color: var(--ink-dim); }
+
+    .layout { display: grid; grid-template-columns: minmax(18rem, 25rem) minmax(0, 1fr); gap: 1rem; align-items: start; padding-bottom: 3.5rem; }
+    .layout > *, .stats > *, .recipes > * { min-width: 0; }
+    .stack > * + * { margin-top: 1rem; }
+    .panel { background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1rem; }
+    .label { display: flex; align-items: center; gap: .5rem; font: 11px var(--font-mono); letter-spacing: .08em; text-transform: uppercase; color: var(--ink-dim); margin-bottom: .75rem; }
+    .label b { color: var(--accent); font-weight: 500; }
+    .label .live { width: .42rem; height: .42rem; border-radius: 50%; background: var(--accent); }
+    .label .end { margin-left: auto; text-transform: none; letter-spacing: 0; }
+    .dim { color: var(--ink-dim); }
+
+    .cards { display: grid; gap: .5rem; }
+    .card {
+      display: grid; gap: .15rem; width: 100%; text-align: left; padding: .7rem .8rem; border-radius: 8px;
+      background: var(--field); border: 1px solid var(--panel-edge); cursor: pointer; transition: border-color .15s;
+    }
+    .card:hover { border-color: var(--accent-dim); }
+    .card[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-dim); }
+    .card strong { font: 600 13px var(--font-mono); }
+    .card small { font: 12px/1.45 var(--font-sans); color: var(--ink-dim); }
+    .card small.meta { font: 11px var(--font-mono); color: var(--slot); }
+    .card .actions { margin-top: .45rem; }
+
+    .btn {
+      display: inline-flex; align-items: center; gap: .4rem; padding: .55rem 1rem; border-radius: 6px; font-size: 13px;
+      border: 1px solid var(--panel-edge); background: transparent; cursor: pointer; transition: border-color .15s, filter .15s;
+    }
+    .btn:hover:not(:disabled) { border-color: var(--accent-dim); }
+    .btn:disabled { opacity: .45; cursor: not-allowed; }
+    .btn.primary { background: var(--accent); border-color: var(--accent); color: #06130c; font-weight: 600; }
+    .btn.primary:hover:not(:disabled) { filter: brightness(1.1); }
+    .btn.small { padding: .3rem .65rem; font-size: 12px; }
+    .btn input[type=file] { display: none; }
+    .actions { display: flex; flex-wrap: wrap; gap: .5rem; }
+
+    .chips { display: flex; flex-wrap: wrap; gap: .4rem; margin-bottom: .6rem; }
+    .chip { padding: .2rem .65rem; border-radius: 999px; font-size: 12px; background: transparent; border: 1px solid var(--panel-edge); color: var(--ink-dim); cursor: pointer; }
+    .chip:hover { border-color: var(--accent-dim); }
+    .chip[aria-pressed="true"] { border-color: var(--accent); color: var(--accent); }
+    input[type=text], input[type=password], input[type=number], textarea {
+      background: var(--field); border: 1px solid var(--panel-edge); border-radius: 6px; padding: .45rem .6rem; font-size: 12.5px;
+    }
+    textarea { width: 100%; min-height: 9rem; resize: vertical; line-height: 1.5; }
+    textarea:focus, input:focus { border-color: var(--accent-dim); outline: none; }
+    .row { display: flex; align-items: center; gap: .75rem; flex-wrap: wrap; font: 12px var(--font-mono); color: var(--ink-dim); }
+    .row label { display: flex; align-items: center; gap: .5rem; }
+    input[type=range] { accent-color: var(--accent); width: 10rem; }
+    input[type=checkbox] { accent-color: var(--accent); width: 15px; height: 15px; }
+    output { color: var(--ink); }
+    .hint { font: 12px/1.5 var(--font-mono); color: var(--ink-dim); min-height: 1.5em; margin-top: .45rem; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .hint.bad { color: var(--red); }
+    .hint.good { color: var(--accent); }
+
+    .stats { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1rem; padding: .9rem 1rem; border: 1px solid var(--panel-edge); border-radius: 10px; background: var(--panel); }
+    .stat strong { display: block; font: 600 14px var(--font-mono); color: var(--accent); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .stat span { display: block; font: 11px var(--font-mono); color: var(--ink-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: var(--slot); margin-right: .45rem; vertical-align: 1px; }
+    .dot.live { background: var(--accent); animation: pulse 1.6s ease-in-out infinite; }
+    .dot.bad { background: var(--red); }
+    @keyframes pulse { 50% { box-shadow: 0 0 0 5px rgb(62 224 127 / .14); } }
+
+    .banner { margin-top: 1rem; padding: .65rem .85rem; border-radius: 8px; border: 1px solid var(--accent-dim); background: rgb(62 224 127 / .05); font-size: 13px; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .banner.bad { border-color: rgb(240 113 120 / .5); background: rgb(240 113 120 / .07); }
+
+    .engine { margin-top: 1rem; }
+    .strip { display: flex; flex-wrap: wrap; gap: 6px; min-height: 24px; }
+    .cell {
+      width: 24px; height: 24px; padding: 0; border: 0; border-radius: 3px; cursor: pointer;
+      background: transparent; display: grid; place-items: center; position: relative;
+    }
+    .cell::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: var(--slot); transition: all .25s; }
+    .cell[data-level="1"]::before { width: 10px; height: 10px; border-radius: 1.5px; background: color-mix(in srgb, var(--accent) 45%, var(--panel)); }
+    .cell[data-level="2"]::before { width: 16px; height: 16px; border-radius: 2px; background: color-mix(in srgb, var(--accent) 72%, var(--panel)); }
+    .cell[data-level="3"]::before { width: 22px; height: 22px; border-radius: 2.5px; background: var(--accent); }
+    .cell.diff::after { content: ""; position: absolute; inset: -3px; border: 1.5px solid var(--amber); border-radius: 3px; }
+    .cell.stale { opacity: .3; }
+    .cell.undone::before { background: var(--red); }
+    .cell[aria-pressed="true"] { outline: 1.5px solid var(--ink); outline-offset: 2px; }
+    .cell.flash::before { animation: flash .7s ease-out; }
+    @keyframes flash { from { box-shadow: 0 0 0 4px rgb(62 224 127 / .45); } to { box-shadow: 0 0 0 0 transparent; } }
+    .strip-foot { display: flex; justify-content: space-between; gap: 1rem; margin-top: .6rem; font: 11px var(--font-mono); color: var(--ink-dim); }
+    .legend { display: flex; flex-wrap: wrap; gap: .9rem; }
+    .legend i { display: inline-block; width: 9px; height: 9px; border-radius: 1.5px; background: var(--accent); margin-right: .35rem; vertical-align: -1px; }
+    .legend i.none { width: 5px; height: 5px; border-radius: 50%; background: var(--slot); vertical-align: 1px; }
+    .legend i.changed { background: transparent; border: 1.5px solid var(--amber); }
+
+    .changes { margin-top: 1rem; padding: 0; overflow: hidden; }
+    .changes-head { display: flex; flex-wrap: wrap; align-items: center; gap: .5rem 1rem; padding: .75rem 1rem; border-bottom: 1px solid var(--panel-edge); }
+    .changes-head .label { margin: 0; }
+    .diffbar { display: flex; flex-wrap: wrap; gap: .4rem; font: 12px var(--font-mono); }
+    .diffbar span { padding: .05rem .45rem; border-radius: 4px; border: 1px solid var(--panel-edge); }
+    .diffbar .added { color: var(--accent); border-color: var(--accent-dim); }
+    .diffbar .changed { color: var(--amber); border-color: rgb(242 196 109 / .4); }
+    .diffbar .removed { color: var(--red); border-color: rgb(240 113 120 / .4); }
+    #status-line { flex-basis: 100%; margin: 0; }
+    #head { margin-left: auto; font: 11px var(--font-mono); color: var(--ink-dim); }
+    .scroll { max-height: 34rem; overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    th, td { padding: .42rem 1rem; text-align: left; vertical-align: top; border-bottom: 1px solid #18221d; }
+    th { position: sticky; top: 0; z-index: 1; background: var(--panel); color: var(--ink-dim); font-weight: 500; }
+    td.n { color: var(--ink-dim); white-space: nowrap; }
+    td.n b { display: inline-block; width: 1.1em; font-weight: 600; }
+    td.k { color: var(--accent); white-space: nowrap; }
+    td.key { color: var(--ink-dim); white-space: nowrap; }
+    td.v code { display: block; max-height: 1.5em; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; cursor: pointer; }
+    td.v code.open { max-height: none; white-space: pre-wrap; word-break: break-all; }
+    tr.fresh td { animation: fresh 1.1s ease-out; }
+    @keyframes fresh { from { background: rgb(62 224 127 / .09); } to { background: transparent; } }
+    tr.added td.n b { color: var(--accent); }
+    tr.changed td.n b, tr.changed td.v code { color: var(--amber); }
+    tr.removed td { color: var(--red); text-decoration: line-through; text-decoration-color: rgb(240 113 120 / .55); }
+    tr.removed td.n b { text-decoration: none; }
+    tr.undo td { color: var(--amber); text-decoration: line-through; }
+    .empty { padding: 2rem 1rem; text-align: center; color: var(--ink-dim); }
+
+    details.use { margin-top: 1rem; }
+    details.use summary { cursor: pointer; color: var(--ink-dim); font: 12px var(--font-mono); padding: .3rem 0; }
+    .term { margin-top: .5rem; border: 1px solid var(--panel-edge); border-radius: 10px; overflow: hidden; background: var(--panel); box-shadow: 0 12px 40px rgb(0 0 0 / .4); }
+    .term-bar { display: flex; align-items: center; gap: .4rem; padding: .45rem .8rem; border-bottom: 1px solid var(--panel-edge); flex-wrap: wrap; }
+    .term-bar .dots { display: flex; gap: .4rem; margin-right: .5rem; }
+    .term-bar .dots i { width: 10px; height: 10px; border-radius: 50%; background: var(--panel-edge); }
+    .term-bar .view { background: none; border: 0; padding: .15rem .45rem; font-size: 12px; color: var(--ink-dim); border-radius: 4px; cursor: pointer; }
+    .term-bar .view[aria-pressed="true"] { color: var(--accent); background: rgb(62 224 127 / .08); }
+    .term-bar .btn { margin-left: auto; }
+    pre { margin: 0; padding: .8rem 1rem; overflow: auto; font-size: 12px; line-height: 1.65; max-height: 28rem; }
+
+    .keeps { margin-bottom: 1rem; }
+    .keeps-intro { color: var(--ink-dim); font-size: 14px; max-width: 62rem; }
+    .lanes { display: grid; gap: .5rem; margin-top: .9rem; }
+    .lane {
+      display: grid; grid-template-columns: 11rem minmax(0, 1fr) 1.2rem 10.5rem 10rem;
+      grid-template-areas: "name store arrow out foot"; align-items: center; gap: .75rem;
+      width: 100%; text-align: left; padding: .6rem .8rem; border-radius: 8px; cursor: pointer;
+      background: var(--field); border: 1px solid var(--panel-edge); transition: border-color .15s;
+    }
+    .lane:hover { border-color: var(--accent-dim); }
+    .lane[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-dim); }
+    .lane-name { grid-area: name; }
+    .lane-name strong { display: block; font: 600 13px var(--font-mono); }
+    .lane-name small, .lane-foot, .out-caption, .more { font: 11px/1.4 var(--font-mono); color: var(--ink-dim); }
+    .lane-store { grid-area: store; display: flex; gap: 4px; align-items: center; justify-content: flex-end; min-height: 18px; overflow: hidden; }
+    .lane-arrow { grid-area: arrow; color: var(--slot); font: 12px var(--font-mono); text-align: center; }
+    .lane-out { grid-area: out; display: flex; gap: 4px; align-items: center; min-height: 18px; overflow: hidden; }
+    .lane-foot { grid-area: foot; }
+    .out-caption { margin-left: .35rem; white-space: nowrap; }
+    .more { margin-right: .25rem; white-space: nowrap; }
+    .one-value { font: 600 11px var(--font-mono); color: var(--accent); margin-left: .45rem; white-space: nowrap; }
+    i.k { width: 14px; height: 14px; flex: none; display: grid; place-items: center; }
+    i.k::before { content: ""; width: 4px; height: 4px; border-radius: 50%; background: var(--slot); }
+    i.k.kept::before { width: 12px; height: 12px; border-radius: 2px; background: var(--accent); opacity: var(--fade, 1); }
+    i.k.done::before { width: 8px; height: 8px; border-radius: 1.5px; background: color-mix(in srgb, var(--accent) 32%, var(--panel)); }
+    i.k.waiting::before { width: 12px; height: 12px; border-radius: 2px; background: var(--amber); }
+    i.k.result::before { width: 14px; height: 14px; border-radius: 2px; background: var(--accent); box-shadow: 0 0 0 3px rgb(62 224 127 / .25); }
+    i.k.new::before { animation: pop .45s ease-out; }
+    @keyframes pop { from { transform: scale(.2); } to { transform: scale(1); } }
+    .keeps-legend { margin-top: .75rem; font: 11px var(--font-mono); color: var(--ink-dim); }
+    .keeps-legend i.waiting { background: var(--amber); }
+    .keeps-legend i.done { width: 7px; height: 7px; background: color-mix(in srgb, var(--accent) 32%, var(--panel)); vertical-align: 0; }
+    .builder { display: grid; grid-template-columns: minmax(0, 1fr) minmax(22rem, 36rem); gap: 1rem; align-items: start; padding-bottom: 3.5rem; }
+    .builder > *, .fields > * { min-width: 0; }
+    .builder-main > .panel + .panel { margin-top: 1rem; }
+    .fields { display: grid; grid-template-columns: repeat(auto-fill, minmax(10.5rem, 1fr)); gap: .75rem .9rem; }
+    .field { display: grid; gap: .3rem; align-content: start; font: 11px var(--font-mono); color: var(--ink-dim); }
+    .field.wide { grid-column: 1 / -1; }
+    .field.span2 { grid-column: span 2; }
+    .field select, .field input, .field textarea, .inline input {
+      font: 12.5px var(--font-mono); color: var(--ink); background: var(--field);
+      border: 1px solid var(--panel-edge); border-radius: 6px; padding: .4rem .55rem; min-width: 0;
+    }
+    .field textarea { min-height: 3.2rem; }
+    .segmented { display: flex; border: 1px solid var(--panel-edge); border-radius: 6px; overflow: hidden; }
+    .segmented button { flex: 1; background: var(--field); border: 0; padding: .45rem .3rem; font-size: 12px; color: var(--ink-dim); cursor: pointer; }
+    .segmented button + button { border-left: 1px solid var(--panel-edge); }
+    .segmented button[aria-pressed="true"] { background: rgb(62 224 127 / .12); color: var(--accent); }
+    .inline { display: inline-flex; align-items: center; gap: .5rem; margin-top: .8rem; font: 12px var(--font-mono); color: var(--ink-dim); }
+    .inline input { width: 5rem; }
+    .linkish { background: none; border: 0; padding: 0; color: var(--accent); font: 11px var(--font-mono); cursor: pointer; }
+    button.recipe { width: 100%; text-align: left; color: inherit; cursor: pointer; transition: border-color .15s; }
+    button.recipe:hover { border-color: var(--accent-dim); }
+    button.recipe[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent-dim); }
+    button.recipe p { font-family: var(--font-sans); }
+    .recipe .state { font: 11px var(--font-mono); color: var(--slot); }
+    .recipe[aria-pressed="true"] .state { color: var(--accent); }
+    .result { position: sticky; top: 1rem; }
+    .result .term { margin-top: 0; box-shadow: none; }
+    .term-actions { margin-left: auto; display: flex; gap: .4rem; }
+    .term-actions .btn { margin-left: 0; }
+    pre.config { max-height: calc(100vh - 15rem); color: var(--ink); }
+    pre.config .c { color: var(--ink-dim); }
+    pre.config .d { color: var(--accent); }
+    #config-changed { white-space: pre-wrap; overflow-wrap: anywhere; }
+    .notes { margin-top: .75rem; display: grid; gap: .35rem; font: 12px/1.5 var(--font-mono); color: var(--ink-dim); }
+    .notes .warn { color: var(--amber); }
+    .notes .bad { color: var(--red); }
+    .notes code { color: var(--ink); }
+    textarea.toml { min-height: 26rem; font-size: 12px; white-space: pre; overflow: auto; }
+    .recipes { display: grid; grid-template-columns: repeat(auto-fill, minmax(17rem, 1fr)); gap: .75rem; margin-top: .75rem; }
+    .recipe { border: 1px solid var(--panel-edge); border-radius: 8px; background: var(--field); padding: .85rem; display: grid; gap: .5rem; align-content: start; }
+    .recipe strong { font: 600 13px var(--font-mono); }
+    .recipe p { font-size: 13px; color: var(--ink-dim); }
+    .panel > p { color: var(--ink-dim); font-size: 14px; }
+
+    .sublabel { font: 11px var(--font-mono); color: var(--ink-dim); margin: .85rem 0 .45rem; }
+    .compose { display: grid; gap: .6rem; margin-top: .75rem; }
+    .compose .chips { margin-bottom: 0; }
+    .compose select { background: var(--field); border: 1px solid var(--panel-edge); border-radius: 6px; padding: .4rem .5rem; font-size: 12.5px; color: var(--ink); }
+    .inline-row { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; font: 12px var(--font-mono); color: var(--ink-dim); }
+    .code-panel > summary { cursor: pointer; list-style: none; }
+    .code-panel > summary::-webkit-details-marker { display: none; }
+    .code-panel { margin-top: 1rem; }
+    .code-panel > summary .label { margin-bottom: 0; }
+    .code-panel[open] > summary .label { margin-bottom: .75rem; }
+    .code-panel .label { flex-wrap: wrap; row-gap: .5rem; }
+    .code-panel .label .end { display: flex; align-items: center; gap: .5rem; flex-wrap: wrap; justify-content: flex-end; }
+    .editor { display: grid; grid-template-columns: auto minmax(0, 1fr); border: 1px solid var(--panel-edge); border-radius: 6px; background: var(--field); overflow: hidden; }
+    .editor .gutter { margin: 0; padding: .45rem .55rem; text-align: right; color: var(--slot); font: 12px/1.5 var(--font-mono); user-select: none; overflow: hidden; border-right: 1px solid var(--panel-edge); white-space: pre; }
+    .editor .gutter .bad { color: var(--red); }
+    .editor .gutter .warn { color: var(--amber); }
+    /* The highlighted code under a transparent textarea, which keeps native editing. */
+    .code-stack { position: relative; min-width: 0; }
+    .code-view, .editor textarea { font: 12px/1.5 var(--font-mono); tab-size: 4; letter-spacing: 0; padding: .45rem .6rem; }
+    .code-view { position: absolute; inset: 0; margin: 0; overflow: hidden; white-space: pre; color: var(--ink); pointer-events: none; padding-bottom: 3rem; padding-right: 3rem; }
+    .editor textarea { position: relative; display: block; border: 0; border-radius: 0; min-height: 16rem; height: 28rem; white-space: pre; overflow: auto; resize: vertical;
+      background: transparent; color: transparent; -webkit-text-fill-color: transparent; caret-color: var(--ink); }
+    .editor textarea::selection { background: rgb(62 224 127 / .28); }
+    .hl-k { color: #c792ea; }
+    .hl-t { color: #82aaff; }
+    .hl-f { color: #9fe3b8; }
+    .hl-s { color: var(--amber); }
+    .hl-n { color: #f78c6c; }
+    .hl-c { color: #61806f; }
+    .hl-m { color: var(--accent); }
+    .hl-a, .hl-l { color: #89ddff; }
+    .hl-line { display: inline-block; min-width: 100%; vertical-align: top; }
+    .hl-line.hl-bad { background: rgb(240 113 120 / .16); }
+    .hl-line.hl-warn { background: rgb(242 196 109 / .11); }
+    .panel > p.code-warning { margin-top: .6rem; font: 11.5px/1.5 var(--font-mono); color: var(--amber); }
+    .panel > p.code-warning strong { font-weight: 600; }
+    .code-panel .segmented { display: inline-flex; }
+    .code-panel .segmented button { flex: none; padding: .25rem .6rem; font: 11px var(--font-mono); }
+    .diagnostics { margin: .5rem 0 0; padding: 0; list-style: none; display: grid; gap: .25rem; font: 12px/1.45 var(--font-mono); }
+    .diagnostics li { cursor: pointer; color: var(--amber); overflow-wrap: anywhere; }
+    .diagnostics li.error { color: var(--red); }
+    .diagnostics li:hover { text-decoration: underline; }
+
+    @media (max-width: 1100px) {
+      .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .lane { grid-template-columns: minmax(0, 1fr); grid-template-areas: "name" "store" "out" "foot"; gap: .45rem; }
+      .builder { grid-template-columns: 1fr; }
+      .field.span2 { grid-column: 1 / -1; }
+      .result { position: static; }
+      pre.config { max-height: 36rem; }
+      .lane-arrow { display: none; }
+      .lane-store { justify-content: flex-start; }
+    }
+    @media (max-width: 560px) {
+      .wrap { padding-inline: 1rem; }
+      .tabs { margin-left: 0; width: 100%; }
+      .auth, .auth input { width: 100%; }
+      .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      th, td { padding-inline: .6rem; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation: none !important; transition: none !important; }
+    }
+  </style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <a class="brand" href="https://leani.dev/docs/guides/wasm-processors/" aria-label="leani: Wasm processor guide">
+      <svg viewBox="0 0 220.37 75.2" aria-hidden="true">
+        <path d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74" fill="none" stroke="#e6f0ea" stroke-width="10"/>
+        <path d="M195.8 74L205.8 74L216 26L206 26Z" fill="#e6f0ea"/>
+        <rect x="207.37" y="6" width="13" height="13" rx="1.2" fill="#3ee07f"/>
+      </svg>
+      playground
+    </a>
+    <nav class="tabs" role="tablist" aria-label="Playground">
+      <button role="tab" id="tab-processors" aria-selected="true" aria-controls="processors">processors</button>
+      <button role="tab" id="tab-config" aria-selected="false" aria-controls="config">node configuration</button>
+    </nav>
+    <label class="auth">token
+      <input type="password" id="token" autocomplete="off" placeholder="if the node needs one">
+    </label>
+  </div>
+</header>
+
+<main class="wrap">
+  <section id="processors" role="tabpanel" aria-labelledby="tab-processors">
+    <div class="intro">
+      <span class="eyebrow">Edits re-run live</span>
+      <h1>Shape this node's <span class="accent">live blocks</span> with a processor.</h1>
+      <p>Run a Wasm processor over the node's recent blocks, then change it: every edit re-runs the same blocks and marks what changed, and the run keeps following new ones. Nothing is persisted.</p>
+    </div>
+    <div class="layout">
+      <div class="stack">
+        <div class="panel">
+          <p class="label"><b>01</b>processor</p>
+          <div class="cards" id="templates"><p class="dim">Loading templates…</p></div>
+        </div>
+        <div class="panel" id="params-panel">
+          <p class="label"><b>02</b>parameters</p>
+          <div class="chips" id="chips" aria-label="Presets"></div>
+          <textarea id="params" spellcheck="false" aria-label="Parameters as JSON"></textarea>
+          <p class="hint" id="params-hint">While a run is open, edits apply as you type.</p>
+        </div>
+        <div class="panel" id="compose-panel" hidden>
+          <p class="label"><b>02</b>what to index</p>
+          <div class="segmented" id="compose-kind" aria-label="Data">
+            <button type="button" data-kind="events">events</button><button type="button" data-kind="transactions">transactions</button><button type="button" data-kind="blocks">blocks</button>
+          </div>
+          <div class="compose">
+            <label class="field" data-kinds="events"><span>contracts, blank for any</span><input type="text" id="compose-contracts" spellcheck="false"></label>
+            <label class="field" data-kinds="transactions"><span>to, blank for any</span><input type="text" id="compose-to" spellcheck="false"></label>
+            <div class="chips" id="compose-tokens" data-kinds="events transactions" aria-label="Tokens"></div>
+            <label class="field" data-kinds="transactions"><span>from, blank for any</span><input type="text" id="compose-from" spellcheck="false"></label>
+            <label class="field" data-kinds="events"><span>events, one Solidity signature per line</span><textarea id="compose-events" rows="3" spellcheck="false"></textarea></label>
+            <div class="chips" id="compose-event-presets" data-kinds="events" aria-label="Events"></div>
+            <label class="field" data-kinds="transactions"><span>functions, one signature per line, blank for every transaction</span><textarea id="compose-functions" rows="2" spellcheck="false"></textarea></label>
+            <div class="chips" id="compose-function-presets" data-kinds="transactions" aria-label="Functions"></div>
+          </div>
+          <p class="sublabel">fields to keep</p>
+          <div class="chips" id="compose-fields" aria-label="Fields"><span class="dim">…</span></div>
+          <p class="sublabel">keep</p>
+          <div class="segmented" id="compose-keep" aria-label="Keep">
+            <button type="button" data-keep="rows">a row per match</button><button type="button" data-keep="totals">running totals</button>
+          </div>
+          <div class="compose" id="compose-totals" hidden>
+            <label class="inline-row">one total per <select id="compose-by"></select></label>
+            <div class="inline-row">adding up <div class="chips" id="compose-sums" aria-label="Sums"></div></div>
+          </div>
+          <label class="field" style="margin-top:.85rem"><span>name</span><input type="text" id="compose-name" spellcheck="false"></label>
+          <p class="hint" id="compose-hint"></p>
+        </div>
+        <div class="panel">
+          <p class="label"><b>03</b>blocks</p>
+          <div class="stack">
+            <div class="row">
+              <label for="blocks">recent blocks</label>
+              <input type="range" id="blocks" min="1" max="64" value="12">
+              <output id="blocks-out" for="blocks">12</output>
+            </div>
+            <div class="row">
+              <label><input type="checkbox" id="follow" checked> follow new blocks</label>
+              <label>for <input type="number" id="seconds" min="1" max="3600" value="600" style="width:5.5rem"> s</label>
+            </div>
+            <div class="actions">
+              <button class="btn primary" id="run">Run</button>
+              <button class="btn" id="stop" disabled>Stop</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="stats" aria-live="polite">
+          <div class="stat"><strong id="s-name">—</strong><span>processor</span></div>
+          <div class="stat"><strong id="s-version">—</strong><span>version</span></div>
+          <div class="stat"><strong id="s-feed">—</strong><span>blocks from</span></div>
+          <div class="stat"><strong id="s-window">—</strong><span id="s-range">window</span></div>
+          <div class="stat"><strong id="s-changes">0</strong><span>changes</span></div>
+          <div class="stat"><strong id="s-status"><i class="dot"></i>idle</strong><span>status</span></div>
+        </div>
+        <div id="banner" class="banner" role="status" hidden></div>
+
+        <div class="panel engine">
+          <p class="label"><i class="live"></i>blocks<span class="end" id="strip-range"></span></p>
+          <div class="strip" id="strip" aria-label="Blocks of this run; pick one to show only its changes"></div>
+          <div class="strip-foot">
+            <span class="legend"><span><i></i>output</span><span><i class="none"></i>none</span><span><i class="changed"></i>changed by the new version</span></span>
+            <span id="focus-note"></span>
+          </div>
+        </div>
+
+
+        <div class="panel changes">
+          <div class="changes-head">
+            <p class="label">changes</p>
+            <div class="diffbar" id="diff"></div>
+            <span id="head"></span>
+            <p class="hint" id="status-line"></p>
+          </div>
+          <div class="scroll">
+            <table>
+              <thead><tr><th>block</th><th>kind</th><th>key</th><th>value</th></tr></thead>
+              <tbody id="feed"><tr><td colspan="4" class="empty">Pick a processor and press Run.</td></tr></tbody>
+            </table>
+          </div>
+        </div>
+
+        <details class="panel code-panel" id="code-panel">
+          <summary><p class="label">code · <span id="code-origin">src/lib.rs</span><span class="end">
+            <span class="segmented" id="code-language" aria-label="Language"><button type="button" data-language="rust">Rust</button><button type="button" data-language="typescript">TypeScript</button></span>
+            <span id="code-state"></span>
+            <button class="btn small" type="button" id="code-edit">edit a copy</button>
+            <button class="btn small primary" type="button" id="code-build" hidden>Build &amp; run</button></span></p></summary>
+          <div class="editor"><pre class="gutter" id="code-gutter" aria-hidden="true"></pre><div class="code-stack"><pre class="code-view" id="code-view" aria-hidden="true"></pre><textarea id="code" spellcheck="false" wrap="off" aria-label="Processor source; Escape, then Tab, leaves it"></textarea></div></div>
+          <ol class="diagnostics" id="code-diagnostics" aria-live="polite"></ol>
+          <p class="hint" id="code-hint"></p>
+          <p class="code-warning"><strong>Development feature, not for production, off unless the node sets <code>api.allow_wasm_builds = true</code>.</strong> When on, the node compiles this code on its own machine: Rust only for requests from that machine, an SSH tunnel included, as rustc can read the host's files while it compiles; TypeScript for any client. Otherwise, and in production, build modules where you write them, then load the .wasm here or configure the module file.</p>
+        </details>
+
+        <details class="use" open>
+          <summary>use it in your app</summary>
+          <div class="term">
+            <div class="term-bar" role="group" aria-label="Snippets" id="snippet-tabs"></div>
+            <pre><code id="snippet-text"></code></pre>
+          </div>
+        </details>
+      </div>
+    </div>
+  </section>
+
+  <section id="config" role="tabpanel" aria-labelledby="tab-config" hidden>
+    <div class="intro">
+      <span class="eyebrow">Node configuration</span>
+      <h1>Say what you need; <span class="accent">leani writes the config</span>.</h1>
+      <p>State what to index, how much to keep, and what your host can give. leani builds the whole configuration, with the reason for every setting it chose, ready to download and run. Agents get the same builder from <code>leani init</code>.</p>
+    </div>
+    <div class="builder">
+      <div class="builder-main">
+        <div class="panel">
+          <p class="label"><b>01</b>what you need</p>
+          <div class="fields">
+            <label class="field"><span>index</span>
+              <select id="need-processor">
+                <option value="events">contract events</option>
+                <option value="uniswap">Uniswap pools</option>
+                <option value="blocks">block summaries</option>
+                <option value="custom">another processor</option>
+              </select></label>
+            <label class="field" data-for="uniswap"><span>markets</span><input type="text" id="need-markets" value="ETH/USDC"></label>
+            <label class="field span2" data-for="events"><span>contract</span><input type="text" id="need-address" value="0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48" spellcheck="false"></label>
+            <label class="field wide" data-for="events"><span>events, one Solidity signature per line</span><textarea id="need-events" rows="2" spellcheck="false">Transfer(address indexed from, address indexed to, uint256 value)</textarea></label>
+            <label class="field" data-for="custom"><span>processor id</span><input type="text" id="need-id" value="wasm" spellcheck="false"></label>
+            <label class="field" data-for="custom"><span>version</span><input type="text" id="need-version" value="1.0.0" spellcheck="false"></label>
+            <label class="field wide" data-for="custom"><span>settings, as JSON</span><textarea id="need-settings" rows="2" spellcheck="false">{ "module": "processor.wasm", "params": {} }</textarea></label>
+            <div class="field span2"><span>follow</span><div class="segmented" id="need-follow">
+              <button type="button" data-value="head" aria-pressed="true">live head</button>
+              <button type="button" data-value="finalized" aria-pressed="false">finalized</button>
+              <button type="button" data-value="none" aria-pressed="false">none</button>
+            </div></div>
+            <label class="field"><span>history</span>
+              <select id="need-history"><option value="">none</option><option value="days">last days</option><option value="block">from block</option></select></label>
+            <label class="field" id="need-history-field" hidden><span id="need-history-unit">days</span><input type="number" id="need-history-value" min="0" value="7"></label>
+            <label class="field"><span>memory</span>
+              <select id="need-memory"><option value="">no limit</option><option>512MiB</option><option selected>1GiB</option><option>2GiB</option><option>4GiB</option><option>8GiB</option></select></label>
+            <label class="field"><span>disk</span>
+              <select id="need-disk"><option value="">no limit</option><option>10GiB</option><option selected>20GiB</option><option>50GiB</option><option>100GiB</option><option>500GiB</option></select></label>
+            <label class="field"><span>link</span>
+              <select id="need-link"><option value="">no limit</option><option value="50">50 Mbit/s</option><option value="100">100 Mbit/s</option><option value="250">250 Mbit/s</option><option value="500">500 Mbit/s</option><option value="1000" selected>1 Gbit/s</option></select></label>
+          </div>
+          <p class="hint" id="needs-hint"></p>
+        </div>
+        <div class="panel keeps">
+          <p class="label"><b>02</b>how much leani keeps<span class="end" id="keeps-block"></span></p>
+          <p class="keeps-intro">The same blocks arrive in every lane: on the left, what stays in leani for you to query; on the right, what goes to your app. Pick one.</p>
+          <div class="lanes" id="lanes"></div>
+          <p class="legend keeps-legend"><span><i></i>kept, you can query it</span><span><i class="waiting"></i>waiting for your app to confirm</span><span><i class="done"></i>processed, not kept</span><span><i class="none"></i>nothing kept</span></p>
+          <label class="inline" id="window-field">window of <input type="number" id="need-window" min="1" value="30"> days</label>
+        </div>
+        <div class="panel">
+          <p class="label"><b>03</b>tuning · speed, memory, and bandwidth<span class="end"><button class="linkish" type="button" id="tuning-auto">match my limits</button></span></p>
+          <p class="dim">Measured recipes for the whole node; they never change what is kept. Your limits light the ones they call for until you pick your own.</p>
+          <div class="recipes" id="recipes"></div>
+        </div>
+      </div>
+      <div class="panel result">
+        <p class="label"><b>04</b>your leani.toml<span class="end" id="build-state"></span></p>
+        <div class="term">
+          <div class="term-bar"><span class="dots" aria-hidden="true"><i></i><i></i><i></i></span>
+            <button type="button" class="view" id="view-changed" aria-pressed="true">what changed</button><button type="button" class="view" id="view-file" aria-pressed="false">whole file</button>
+            <span class="term-actions"><button class="btn small" type="button" id="download">Download</button><button class="btn small" type="button" data-copy="config-text">Copy</button><button class="btn small primary" type="button" id="check">Check</button></span></div>
+          <pre class="config"><code id="config-changed">Building…</code><code id="config-text" hidden></code></pre>
+        </div>
+        <div class="notes" id="build-notes" aria-live="polite"></div>
+        <div id="check-result" aria-live="polite"></div>
+      </div>
+    </div>
+  </section>
+</main>
+
+<script>
+"use strict";
+const $ = (selector) => document.querySelector(selector);
+const TOKENS = [
+  ["USDC", "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+  ["USDT", "0xdac17f958d2ee523a2206206994597c13d831ec7"],
+  ["WETH", "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"],
+  ["DAI", "0x6b175474e89094c44da98b954eedcf6eac495271"],
+];
+const PRESETS = [
+  ["Uniswap V3 swaps · ETH/USDC", { addresses: ["0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"], events: ["Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"] }],
+  ["Uniswap V2 reserves · USDC/WETH", { addresses: ["0xb4e16d0168e52d35cacd2c6185b44281ec28c9dc"], events: ["Sync(uint112 reserve0, uint112 reserve1)"] }],
+  ["WETH wraps and unwraps", { addresses: ["0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"], events: ["Deposit(address indexed dst, uint256 wad)", "Withdrawal(address indexed src, uint256 wad)"] }],
+  ["USDC transfers and approvals", { addresses: ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"], events: ["Transfer(address indexed from, address indexed to, uint256 value)", "Approval(address indexed owner, address indexed spender, uint256 value)"] }],
+  ["Every ERC-20 transfer", { events: ["Transfer(address indexed from, address indexed to, uint256 value)"] }],
+];
+const EVENT_PRESETS = [
+  ["Transfer", "Transfer(address indexed from, address indexed to, uint256 value)"],
+  ["Approval", "Approval(address indexed owner, address indexed spender, uint256 value)"],
+  ["Uniswap V3 Swap", "Swap(address indexed sender, address indexed recipient, int256 amount0, int256 amount1, uint160 sqrtPriceX96, uint128 liquidity, int24 tick)"],
+  ["Uniswap V2 Sync", "Sync(uint112 reserve0, uint112 reserve1)"],
+  ["WETH Deposit", "Deposit(address indexed dst, uint256 wad)"],
+];
+const FUNCTION_PRESETS = [
+  ["transfer", "transfer(address to, uint256 amount)"],
+  ["approve", "approve(address spender, uint256 amount)"],
+  ["transferFrom", "transferFrom(address from, address to, uint256 amount)"],
+];
+const STARTER_SPEC = { name: "usdc-transfers", data: { kind: "events", contracts: [TOKENS[0][1]], events: [EVENT_PRESETS[0][1]] } };
+const MAX_CELLS = 96;
+const state = {
+  templates: [], selected: null, uploaded: null, watch: null,
+  run: null, runId: null, started: false,
+  ready: null, version: 0, changes: 0,
+  // Each block's changes by block hash, for this version and the one before.
+  current: new Map(), previous: null, previousVersion: 0,
+  diff: null, rerun: null, swapAt: 0, focus: null, snippet: "toml",
+  spec: {
+    name: "usdc-transfers", kind: "events", contracts: [TOKENS[0][1]], events: [EVENT_PRESETS[0][1]],
+    to: [], from: [], functions: [], fields: null, keep: "rows", by: "", sums: [],
+  },
+  available: [],
+  code: { editable: false, language: "rust", diagnostics: [], built: null, building: false, again: false },
+  language: "rust",
+  ownSource: { rust: null, typescript: null },
+};
+// TypeScript unless chosen otherwise when the node is another machine: it
+// builds Rust only for requests from its own.
+const LOCAL_PAGE = ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname);
+try {
+  const chosen = localStorage.getItem("leani-playground-language");
+  if (chosen === "typescript" || (chosen === null && !LOCAL_PAGE)) state.language = "typescript";
+} catch {
+  if (!LOCAL_PAGE) state.language = "typescript";
+}
+const LANGUAGES = {
+  rust: { path: "src/lib.rs", tool: "cargo" },
+  typescript: { path: "assembly/index.ts", tool: "AssemblyScript" },
+};
+
+function headers(json) {
+  const result = {};
+  const token = $("#token").value.trim();
+  if (token) result.authorization = `Bearer ${token}`;
+  if (json) result["content-type"] = "application/json";
+  return result;
+}
+
+const TOKEN_NEEDED = "This node needs an API token: enter it above.";
+
+async function refusal(response) {
+  const reply = await response.json().catch(() => ({}));
+  const message = response.status === 401 ? TOKEN_NEEDED : reply.error?.message || `HTTP ${response.status}`;
+  return Object.assign(new Error(message), { status: response.status, code: reply.error?.code });
+}
+
+// The JSON reply of an API call; a refusal throws.
+async function api(path, method = "GET", body) {
+  const response = await fetch(path, body === undefined
+    ? { method, headers: headers() }
+    : { method, headers: headers(true), body: JSON.stringify(body) });
+  if (!response.ok) throw await refusal(response);
+  return response.json();
+}
+
+function element(tag, properties = {}, children = []) {
+  const node = Object.assign(document.createElement(tag), properties);
+  for (const child of [].concat(children)) node.append(child);
+  return node;
+}
+
+function shorten(text, keep = 6) {
+  return text.length > keep * 2 + 3 ? `${text.slice(0, keep + 2)}…${text.slice(-keep)}` : text;
+}
+
+function milliseconds(value) {
+  return value < 1000 ? `${Math.round(value)} ms` : `${(value / 1000).toFixed(1)} s`;
+}
+
+function banner(message, kind) {
+  const node = $("#banner");
+  node.hidden = !message;
+  node.className = `banner ${kind || ""}`;
+  node.textContent = message || "";
+}
+
+function hint(id, text, kind) {
+  const node = $(id);
+  node.textContent = text || "";
+  node.className = `hint ${kind || ""}`;
+}
+
+function setStatus(text, dot) {
+  $("#s-status").replaceChildren(element("i", { className: `dot ${dot || ""}` }), text);
+}
+
+async function loadTemplates() {
+  try {
+    state.templates = (await api("/v1/wasm/templates")).data;
+  } catch (error) {
+    const message = error.status ? error.message : `Cannot reach the node: ${error.message}`;
+    $("#templates").replaceChildren(element("p", { className: "dim", textContent: message }));
+    return;
+  }
+  renderTemplates();
+  if (!state.selected && state.templates.length) select(state.templates[0].name);
+}
+
+function renderTemplates() {
+  const cards = state.templates.map((template) => {
+    const card = element("button", { className: "card", type: "button" }, [
+      element("strong", { textContent: template.name }),
+      element("small", { textContent: template.description }),
+      element("small", { className: "meta", textContent: `${Math.round(template.moduleBytes / 1024)} KiB · ${shorten(template.moduleHash, 4)}` }),
+    ]);
+    card.setAttribute("aria-pressed", String(state.selected === template.name));
+    card.addEventListener("click", () => select(template.name));
+    return card;
+  });
+  const compose = element("button", { className: "card", type: "button" }, [
+    element("strong", { textContent: "build your own" }),
+    element("small", { textContent: "Pick the onchain data and what to keep: leani writes the processor in Rust or TypeScript, and a node with builds on builds it and runs it here." }),
+  ]);
+  compose.setAttribute("aria-pressed", String(state.selected === "compose"));
+  compose.addEventListener("click", () => select("compose"));
+  const file = element("input", { type: "file", accept: ".wasm,application/wasm" });
+  file.addEventListener("change", async () => {
+    const [chosen] = file.files;
+    if (!chosen) return;
+    state.watch = null;
+    await loadModule(chosen);
+    select("upload");
+  });
+  const uploaded = state.selected === "upload" ? state.uploaded : null;
+  const own = element("div", { className: "card" }, [
+    element("strong", { textContent: uploaded ? uploaded.name : "your own code" }),
+    element("small", {
+      textContent: uploaded
+        ? `${Math.round(uploaded.bytes / 1024)} KiB · ${state.watch ? `watched, loaded ${uploaded.loaded.toLocaleTimeString()}` : `loaded ${uploaded.loaded.toLocaleTimeString()}`}`
+        : "Load a .wasm built with the guest SDK, and a watched file reloads on every build; or write a processor in Rust or TypeScript for a node with builds on to build.",
+    }),
+    element("div", { className: "actions" }, [
+      element("button", { className: "btn small", type: "button", textContent: "edit code", onclick: () => select("code") }),
+      element("label", { className: "btn small", tabIndex: 0 }, ["load .wasm", file]),
+      ...(window.showOpenFilePicker
+        ? [element("button", { className: "btn small", type: "button", textContent: state.watch ? "watch another" : "watch .wasm", onclick: watchFile })]
+        : []),
+    ]),
+  ]);
+  own.setAttribute("aria-pressed", String(state.selected === "code" || state.selected === "upload"));
+  own.addEventListener("click", (event) => {
+    if (!event.target.closest(".actions")) select(state.selected === "upload" ? "upload" : "code");
+  });
+  own.querySelector("label").addEventListener("keydown", (event) => {
+    if (event.key === "Enter" || event.key === " ") file.click();
+  });
+  $("#templates").replaceChildren(compose, ...cards, own);
+}
+
+function select(name) {
+  state.selected = name;
+  hint("#params-hint", "While a run is open, edits apply as you type.");
+  const template = state.templates.find((candidate) => candidate.name === name);
+  const composing = name === "compose";
+  $("#params-panel").hidden = composing;
+  $("#compose-panel").hidden = !composing;
+  $("#code-panel").hidden = name === "upload";
+  if (template) {
+    $("#params").value = JSON.stringify(template.params, null, 2);
+    showTemplateCode(template);
+  } else if (!$("#params").value.trim() || composing) {
+    $("#params").value = "{}";
+  }
+  renderTemplates();
+  if (composing) {
+    $("#code-panel").open = true;
+    syncComposeInputs();
+    composed({ now: true });
+  } else if (name === "code") {
+    $("#code-panel").open = true;
+    openOwnCode();
+  } else {
+    edited({ now: true });
+  }
+}
+
+async function loadModule(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  state.uploaded = {
+    name: file.name,
+    bytes: bytes.length,
+    hex: Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join(""),
+    loaded: new Date(),
+  };
+}
+
+async function watchFile() {
+  let handle;
+  try {
+    [handle] = await window.showOpenFilePicker({ types: [{ description: "Wasm module", accept: { "application/wasm": [".wasm"] } }] });
+  } catch {
+    return;
+  }
+  state.watch = { handle, lastModified: 0 };
+  await pollWatched();
+}
+
+async function pollWatched() {
+  const watch = state.watch;
+  if (!watch) return;
+  let file;
+  try {
+    file = await watch.handle.getFile();
+  } catch (error) {
+    hint("#params-hint", `Cannot read ${watch.handle.name}: ${error.message}`, "bad");
+    return;
+  }
+  if (file.lastModified === watch.lastModified || state.watch !== watch) return;
+  const first = watch.lastModified === 0;
+  watch.lastModified = file.lastModified;
+  await loadModule(file);
+  if (first || state.selected === "upload") {
+    if (!first) hint("#status-line", `${file.name} changed; applying it…`);
+    select("upload");
+  } else {
+    renderTemplates();
+  }
+}
+
+function readParams() {
+  try {
+    const value = JSON.parse($("#params").value || "{}");
+    if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("parameters must be a JSON object");
+    if ($("#params-hint").classList.contains("bad")) hint("#params-hint", "");
+    return value;
+  } catch (error) {
+    hint("#params-hint", error.message, "bad");
+    return null;
+  }
+}
+
+function setParams(params) {
+  $("#params").value = JSON.stringify(params, null, 2);
+  edited({ now: true });
+}
+
+function renderChips() {
+  const params = readParams();
+  if (params && Array.isArray(params.events)) {
+    $("#chips").replaceChildren(...PRESETS.map(([label, preset]) => {
+      const chip = element("button", { className: "chip", type: "button", textContent: label });
+      chip.setAttribute("aria-pressed", String(JSON.stringify(preset) === JSON.stringify(params)));
+      chip.addEventListener("click", () => setParams(preset));
+      return chip;
+    }));
+    return;
+  }
+  const tokens = params && Array.isArray(params.tokens) ? params.tokens.map((token) => String(token).toLowerCase()) : null;
+  $("#chips").replaceChildren(...(tokens === null ? [] : TOKENS.map(([symbol, address]) => {
+    const chip = element("button", { className: "chip", type: "button", textContent: symbol, title: address });
+    chip.setAttribute("aria-pressed", String(tokens.includes(address)));
+    chip.addEventListener("click", () => {
+      const current = readParams();
+      if (!current) return;
+      const list = (current.tokens || []).filter((token) => String(token).toLowerCase() !== address);
+      if (list.length === (current.tokens || []).length) list.push(address);
+      setParams({ ...current, tokens: list });
+    });
+    return chip;
+  })));
+}
+
+let editTimer = 0;
+
+function edited({ now = false } = {}) {
+  renderChips();
+  renderSnippet();
+  if (!state.started) return;
+  clearTimeout(editTimer);
+  editTimer = setTimeout(applyEdit, now ? 0 : 350);
+}
+
+function processorBody() {
+  const params = readParams();
+  if (!params || !state.selected) return null;
+  if (state.selected === "compose" || state.selected === "code") {
+    // Only the module built from the code on show, in its language.
+    const built = state.code.built;
+    if (!built || built.source !== $("#code").value || built.language !== state.code.language) {
+      hint("#code-hint", "Build the code first.", "bad");
+      return null;
+    }
+    return { module: built.hex, params };
+  }
+  if (state.selected !== "upload") return { template: state.selected, params };
+  if (!state.uploaded) {
+    hint("#params-hint", "Choose or watch a .wasm file first.", "bad");
+    return null;
+  }
+  return { module: state.uploaded.hex, params };
+}
+
+async function applyEdit() {
+  const body = processorBody();
+  if (!body) return;
+  // A run that ended takes no swaps: start the next one over the same blocks.
+  // One still starting takes the edit once it is ready.
+  if (!state.runId) {
+    if (state.run) state.pendingEdit = true;
+    else run();
+    return;
+  }
+  state.swapAt = performance.now();
+  hint("#status-line", "Applying…");
+  try {
+    const reply = await api(`/admin/v1/wasm/runs/${state.runId}/processor`, "PUT", body);
+    hint("#params-hint", `Applied as version ${reply.version}.`, "good");
+    hint("#status-line", `Re-running the blocks with version ${reply.version}…`);
+  } catch (error) {
+    if (error.code === "run_not_found") {
+      state.runId = null;
+      run();
+      return;
+    }
+    hint("#params-hint", `Not applied: ${error.message}`, "bad");
+    hint("#status-line", `Still running version ${state.version}.`);
+  }
+}
+
+function lines(text) {
+  return text.split("\n").map((line) => line.trim()).filter(Boolean);
+}
+
+function addresses(text) {
+  return text.split(/[\s,]+/).map((item) => item.trim().toLowerCase()).filter(Boolean);
+}
+
+function chip(label, pressed, onclick, title) {
+  const node = element("button", { className: "chip", type: "button", textContent: label, title: title || "" });
+  node.setAttribute("aria-pressed", String(pressed));
+  node.addEventListener("click", onclick);
+  return node;
+}
+
+function specJson() {
+  const spec = state.spec;
+  const fields = spec.fields || [];
+  const data = spec.kind === "events" ? { kind: "events", contracts: spec.contracts, events: spec.events, fields }
+    : spec.kind === "transactions" ? { kind: "transactions", to: spec.to, from: spec.from, functions: spec.functions, fields }
+    : { kind: "blocks", fields };
+  const keep = spec.keep === "totals" ? { kind: "totals", ...(spec.by ? { by: spec.by } : {}), sum: spec.sums } : { kind: "rows" };
+  return { name: spec.name, data, keep };
+}
+
+function syncComposeInputs() {
+  const spec = state.spec;
+  $("#compose-contracts").value = spec.contracts.join(", ");
+  $("#compose-to").value = spec.to.join(", ");
+  $("#compose-from").value = spec.from.join(", ");
+  $("#compose-events").value = spec.events.join("\n");
+  $("#compose-functions").value = spec.functions.join("\n");
+  $("#compose-name").value = spec.name;
+}
+
+// Other data offers other fields: start over with all of them.
+function resetFields() {
+  Object.assign(state.spec, { fields: null, by: "", sums: [] });
+}
+
+function readComposeInputs() {
+  const spec = state.spec;
+  const events = lines($("#compose-events").value);
+  const functions = lines($("#compose-functions").value);
+  if (events.join("\n") !== spec.events.join("\n") || functions.join("\n") !== spec.functions.join("\n")) resetFields();
+  Object.assign(spec, {
+    contracts: addresses($("#compose-contracts").value),
+    to: addresses($("#compose-to").value),
+    from: addresses($("#compose-from").value),
+    events, functions,
+    name: $("#compose-name").value.trim() || "my-processor",
+  });
+}
+
+function renderCompose() {
+  const spec = state.spec;
+  for (const button of document.querySelectorAll("#compose-kind button")) button.setAttribute("aria-pressed", String(button.dataset.kind === spec.kind));
+  for (const node of document.querySelectorAll("#compose-panel [data-kinds]")) node.hidden = !node.dataset.kinds.split(" ").includes(spec.kind);
+  for (const button of document.querySelectorAll("#compose-keep button")) button.setAttribute("aria-pressed", String(button.dataset.keep === spec.keep));
+  $("#compose-totals").hidden = spec.keep !== "totals";
+  const list = spec.kind === "transactions" ? "to" : "contracts";
+  $("#compose-tokens").replaceChildren(...TOKENS.map(([symbol, address]) => chip(symbol, spec[list].includes(address), () => {
+    spec[list] = spec[list].includes(address) ? spec[list].filter((item) => item !== address) : [...spec[list], address];
+    syncComposeInputs();
+    composed();
+  }, address)));
+  const presets = (key, entries) => entries.map(([label, signature]) => chip(label, spec[key].includes(signature), () => {
+    spec[key] = spec[key].includes(signature) ? spec[key].filter((item) => item !== signature) : [...spec[key], signature];
+    resetFields();
+    syncComposeInputs();
+    composed();
+  }, signature));
+  $("#compose-event-presets").replaceChildren(...presets("events", EVENT_PRESETS));
+  $("#compose-function-presets").replaceChildren(...presets("functions", FUNCTION_PRESETS));
+  renderComposeFields();
+}
+
+function renderComposeFields() {
+  const spec = state.spec;
+  const all = state.available.map((field) => field.name);
+  const kept = (name) => !spec.fields || spec.fields.includes(name);
+  $("#compose-fields").replaceChildren(...state.available.map((field) => chip(field.name, kept(field.name), () => {
+    const current = spec.fields || all;
+    const next = all.filter((name) => (name === field.name ? !current.includes(name) : current.includes(name)));
+    if (!next.length) return;
+    spec.fields = next.length === all.length ? null : next;
+    if (spec.by && !next.includes(spec.by)) spec.by = "";
+    spec.sums = spec.sums.filter((name) => next.includes(name));
+    composed();
+  })));
+  const by = $("#compose-by");
+  by.replaceChildren(element("option", { value: "", textContent: "of everything" }),
+    ...state.available.filter((field) => kept(field.name)).map((field) => element("option", { value: field.name, textContent: field.name })));
+  by.value = spec.by;
+  const sums = state.available.filter((field) => field.unsigned && kept(field.name));
+  $("#compose-sums").replaceChildren(...(sums.length ? sums.map((field) => chip(field.name, spec.sums.includes(field.name), () => {
+    spec.sums = spec.sums.includes(field.name) ? spec.sums.filter((name) => name !== field.name) : [...spec.sums, field.name];
+    composed();
+  })) : [element("span", { className: "dim", textContent: "no unsigned fields" })]));
+}
+
+let composeTimer = 0;
+let composeSerial = 0;
+
+function composed({ now = false } = {}) {
+  renderCompose();
+  clearTimeout(composeTimer);
+  composeTimer = setTimeout(composeNow, now ? 0 : 450);
+}
+
+async function composeNow() {
+  const serial = ++composeSerial;
+  hint("#compose-hint", "Writing the processor…");
+  let reply;
+  try {
+    reply = await api("/v1/wasm/compose", "POST", { ...specJson(), language: state.language });
+  } catch (error) {
+    if (serial === composeSerial) hint("#compose-hint", error.message, "bad");
+    return;
+  }
+  if (serial !== composeSerial || state.selected !== "compose") return;
+  state.available = reply.fields;
+  renderComposeFields();
+  hint("#compose-hint", `${reply.name}: ${reply.files.length} files, the code below.`);
+  setCode(reply.source, { origin: `${reply.name} · ${reply.path}, generated`, editable: false, language: reply.language });
+  buildCode();
+}
+
+function setCode(source, { origin, editable, language = state.language }) {
+  Object.assign(state.code, { editable, language, diagnostics: [] });
+  renderLanguage();
+  const code = $("#code");
+  code.value = source || "";
+  code.readOnly = !editable;
+  code.scrollTop = 0;
+  $("#code-origin").textContent = origin;
+  $("#code-edit").hidden = editable;
+  $("#code-build").hidden = !editable;
+  $("#code-state").textContent = "";
+  hint("#code-hint", "");
+  renderEditor();
+  renderDiagnostics();
+  // The commands to build it where you are, whether or not the node builds.
+  renderSnippet();
+}
+
+function showTemplateCode(template) {
+  const language = state.language;
+  setCode(template.sources[language], { origin: `${template.name} · ${LANGUAGES[language].path}`, editable: false, language });
+  if (language === "typescript") {
+    hint("#code-hint", "The same processor in TypeScript: the run uses the prebuilt Rust module, which publishes exactly the changes this does. Edit a copy to build this one.");
+  }
+}
+
+function renderLanguage() {
+  for (const button of document.querySelectorAll("#code-language button")) {
+    button.setAttribute("aria-pressed", String(button.dataset.language === state.code.language));
+  }
+}
+
+function chooseLanguage(language) {
+  if (language === state.language && language === state.code.language) return;
+  state.language = language;
+  try { localStorage.setItem("leani-playground-language", language); } catch {}
+  const template = state.templates.find((candidate) => candidate.name === state.selected);
+  if (template) showTemplateCode(template);
+  else if (state.selected === "compose") composed({ now: true });
+  else if (state.selected === "code") openOwnCode();
+  else renderLanguage();
+  renderSnippet();
+}
+
+async function openOwnCode() {
+  const language = state.language;
+  const origin = `your code · ${LANGUAGES[language].path}`;
+  if (state.ownSource[language] === null) {
+    setCode("", { origin, editable: true, language });
+    try {
+      state.ownSource[language] = (await api("/v1/wasm/compose", "POST", { ...STARTER_SPEC, language })).source;
+    } catch (error) {
+      hint("#code-hint", `Cannot load the example: ${error.message}`, "bad");
+      return;
+    }
+  }
+  if (state.selected !== "code" || state.language !== language) return;
+  setCode(state.ownSource[language], { origin, editable: true, language });
+  const built = state.code.built;
+  if (built?.source === state.ownSource[language] && built.language === language) edited({ now: true });
+  else hint("#code-hint", `Edit it, then Build & run (⌘/Ctrl+Enter): the node compiles it with ${LANGUAGES[language].tool} and the run takes the new module.`);
+}
+
+function renderEditor() {
+  const code = $("#code");
+  const count = code.value.split("\n").length;
+  const marks = new Map();
+  for (const diagnostic of state.code.diagnostics) {
+    if (diagnostic.line && marks.get(diagnostic.line) !== "bad") marks.set(diagnostic.line, diagnostic.level === "error" ? "bad" : "warn");
+  }
+  $("#code-gutter").replaceChildren(...Array.from({ length: count }, (_, index) =>
+    element("span", { className: marks.get(index + 1) || "", textContent: `${index + 1}\n` })));
+  $("#code-gutter").style.height = `${code.clientHeight}px`;
+  $("#code-view").innerHTML = highlight(code.value, state.code.language, marks);
+  syncScroll();
+}
+
+function syncScroll() {
+  const code = $("#code");
+  $("#code-gutter").scrollTop = code.scrollTop;
+  $("#code-view").scrollTop = code.scrollTop;
+  $("#code-view").scrollLeft = code.scrollLeft;
+}
+
+// Tokens of each language, tried in order at each position: comments,
+// strings, attributes or decorators, numbers, then words.
+const SYNTAX = {
+  rust: {
+    rules: [
+      ["c", /\/\/[^\n]*/y],
+      ["c", /\/\*[\s\S]*?(?:\*\/|$)/y],
+      ["s", /b?r(#*)"[\s\S]*?(?:"\1|$)/y],
+      ["s", /b?"(?:\\[\s\S]|[^"\\])*"?/y],
+      ["s", /b?'(?:\\(?:x[\da-fA-F]{2}|u\{[\da-fA-F]{1,6}\}|[^\n])|[^'\\\n])'/y],
+      ["l", /'[A-Za-z_]\w*/y],
+      ["a", /#!?\[[^\]\n]*\]?/y],
+      ["n", /(?:0x[\da-fA-F_]+|0o[0-7_]+|0b[01_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)(?:[iu](?:8|16|32|64|128|size)|f32|f64)?\b/y],
+      ["w", /[A-Za-z_]\w*!?/y],
+    ],
+    keywords: new Set("as async await break const continue crate dyn else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while".split(" ")),
+    types: new Set("bool char f32 f64 i8 i16 i32 i64 i128 isize str u8 u16 u32 u64 u128 usize".split(" ")),
+  },
+  typescript: {
+    rules: [
+      ["c", /\/\/[^\n]*/y],
+      ["c", /\/\*[\s\S]*?(?:\*\/|$)/y],
+      ["s", /"(?:\\[\s\S]|[^"\\\n])*"?/y],
+      ["s", /'(?:\\[\s\S]|[^'\\\n])*'?/y],
+      ["s", /`(?:\\[\s\S]|[^`\\])*`?/y],
+      ["m", /@[A-Za-z_]\w*/y],
+      ["n", /(?:0x[\da-fA-F_]+|0o[0-7_]+|0b[01_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)n?\b/y],
+      ["w", /[A-Za-z_$][\w$]*/y],
+    ],
+    keywords: new Set("abstract as break case catch class const continue declare default delete do else enum export extends false finally for from function get if implements import in instanceof interface let namespace new null of private protected public readonly return set static super switch this throw true try type typeof var void while".split(" ")),
+    types: new Set("bool f32 f64 i8 i16 i32 i64 isize string u8 u16 u32 u64 usize void".split(" ")),
+  },
+};
+const PLAIN = /[^\w"'`\/#@$]+|[\s\S]/y;
+const SPACES = /\s*/y;
+
+function highlight(source, language, marks) {
+  const syntax = SYNTAX[language] || SYNTAX.rust;
+  const lines = [[]];
+  const push = (kind, part) => part.split("\n").forEach((piece, index) => {
+    if (index > 0) lines.push([]);
+    if (!piece) return;
+    const html = piece.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    lines[lines.length - 1].push(kind ? `<span class="hl-${kind}">${html}</span>` : html);
+  });
+  let index = 0;
+  while (index < source.length) {
+    let kind = null;
+    let token = null;
+    for (const [rule, pattern] of syntax.rules) {
+      pattern.lastIndex = index;
+      const found = pattern.exec(source);
+      if (found && found[0]) {
+        [kind, token] = [rule, found[0]];
+        break;
+      }
+    }
+    if (token === null) {
+      PLAIN.lastIndex = index;
+      token = PLAIN.exec(source)[0];
+    }
+    if (kind === "w") kind = wordKind(token, syntax, source, index + token.length);
+    push(kind, token);
+    index += token.length;
+  }
+  return lines.map((parts, number) => {
+    const mark = marks.get(number + 1);
+    return mark ? `<span class="hl-line hl-${mark}">${parts.join("")}</span>` : parts.join("");
+  }).join("\n") + "\n ";
+}
+
+function wordKind(word, syntax, source, end) {
+  if (word.endsWith("!")) return "m";
+  if (syntax.keywords.has(word)) return "k";
+  if (syntax.types.has(word) || /^[A-Z]/.test(word)) return "t";
+  SPACES.lastIndex = end;
+  SPACES.exec(source);
+  return source[SPACES.lastIndex] === "(" ? "f" : null;
+}
+
+function renderDiagnostics() {
+  $("#code-diagnostics").replaceChildren(...state.code.diagnostics.map((diagnostic) => {
+    const where = diagnostic.line ? `${diagnostic.line}:${diagnostic.column} ` : "";
+    const item = element("li", { className: diagnostic.level, textContent: `${where}${diagnostic.level}: ${diagnostic.message}`, title: diagnostic.rendered || "" });
+    if (diagnostic.line) item.addEventListener("click", () => jumpTo(diagnostic.line, diagnostic.column));
+    return item;
+  }));
+}
+
+function jumpTo(line, column) {
+  const code = $("#code");
+  const offset = code.value.split("\n").slice(0, line - 1).reduce((sum, text) => sum + text.length + 1, 0) + Math.max(0, (column || 1) - 1);
+  code.focus();
+  code.setSelectionRange(offset, offset);
+  code.scrollTop = Math.max(0, (line - 5) * parseFloat(getComputedStyle(code).lineHeight));
+  renderEditor();
+}
+
+async function buildCode() {
+  if (state.code.building) {
+    state.code.again = true;
+    return;
+  }
+  const source = $("#code").value;
+  const language = state.code.language;
+  state.code.building = true;
+  $("#code-build").disabled = true;
+  $("#code-state").textContent = "building…";
+  hint("#code-hint", language === "typescript"
+    ? "The node compiles it with AssemblyScript; a first build also installs the compiler with npm, which takes a while."
+    : "The node compiles it with cargo; a first build also compiles the SDK's dependencies, which takes a while.");
+  let reply;
+  try {
+    reply = await api("/admin/v1/wasm/build", "POST", { source, language });
+  } catch (error) {
+    reply = { built: false, message: error.message, diagnostics: [] };
+  } finally {
+    state.code.building = false;
+    $("#code-build").disabled = false;
+  }
+  // A newer source waits: this result is stale.
+  if (state.code.again) {
+    state.code.again = false;
+    buildCode();
+    return;
+  }
+  if ($("#code").value !== source || state.code.language !== language) return;
+  state.code.diagnostics = reply.diagnostics || [];
+  renderEditor();
+  renderDiagnostics();
+  if (!reply.built) {
+    $("#code-state").textContent = reply.problem === "compile" ? "does not compile" : "not built";
+    hint("#code-hint", reply.message, "bad");
+    const first = state.code.diagnostics.find((diagnostic) => diagnostic.level === "error" && diagnostic.line);
+    if (first && state.code.editable) jumpTo(first.line, first.column);
+    return;
+  }
+  state.code.built = { hex: reply.module, hash: reply.moduleHash, bytes: reply.moduleBytes, source, language };
+  const warnings = state.code.diagnostics.length;
+  $("#code-state").textContent = `built in ${milliseconds(reply.elapsedMs)} · ${Math.round(reply.moduleBytes / 1024)} KiB`;
+  hint("#code-hint", warnings ? `${warnings} warning${warnings === 1 ? "" : "s"}; the module runs.` : "", warnings ? "" : "good");
+  renderSnippet();
+  if (state.started) edited({ now: true });
+  else run();
+}
+
+async function run() {
+  const body = processorBody();
+  if (!body) return;
+  stop(true);
+  Object.assign(body, {
+    blocks: Number($("#blocks").value),
+    follow: $("#follow").checked,
+    maxSeconds: Number($("#seconds").value) || 600,
+  });
+  Object.assign(state, {
+    started: true, runId: null, ready: null, version: 0, changes: 0, pendingEdit: false,
+    current: new Map(), previous: null, previousVersion: 0, diff: null, rerun: null, focus: null,
+  });
+  clearRows("Waiting for the first block…");
+  $("#strip").replaceChildren();
+  ["#s-name", "#s-version", "#s-feed", "#s-window"].forEach((id) => { $(id).textContent = "—"; });
+  $("#s-range").textContent = "window";
+  $("#diff").replaceChildren();
+  updateStats();
+  banner("");
+  hint("#status-line", "");
+  setStatus("starting", "live");
+  const controller = new AbortController();
+  state.run = controller;
+  $("#stop").disabled = false;
+  try {
+    let response;
+    // The run this one replaces may still hold its slot for a moment.
+    for (let attempt = 0; ; attempt += 1) {
+      response = await fetch("/admin/v1/wasm/runs", {
+        method: "POST", headers: headers(true), body: JSON.stringify(body), signal: controller.signal,
+      });
+      if (response.status !== 503 || attempt >= 8) break;
+      await new Promise((resolve) => setTimeout(resolve, 250));
+    }
+    if (!response.ok) throw await refusal(response);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      let end;
+      while ((end = buffer.indexOf("\n\n")) >= 0) {
+        const block = buffer.slice(0, end);
+        buffer = buffer.slice(end + 2);
+        const name = block.match(/^event: ?(.*)$/m)?.[1];
+        const data = block.split("\n").filter((line) => line.startsWith("data:")).map((line) => line.replace(/^data: ?/, "")).join("\n");
+        if (name && data && state.run === controller) handle(name, JSON.parse(data));
+      }
+    }
+    if (state.run === controller && !$("#s-status").textContent.match(/done|failed/)) setStatus("ended", "");
+  } catch (error) {
+    if (error.name !== "AbortError") {
+      banner(error.message, "bad");
+      setStatus("failed", "bad");
+    }
+  } finally {
+    controller.abort();
+    if (state.run === controller) {
+      state.run = null;
+      state.runId = null;
+      $("#stop").disabled = true;
+    }
+  }
+}
+
+function stop(quiet) {
+  if (!state.run) return;
+  state.run.abort();
+  state.run = null;
+  state.runId = null;
+  state.started = false;
+  $("#stop").disabled = true;
+  if (!quiet) setStatus("stopped", "");
+}
+
+function handle(name, data) {
+  switch (name) {
+    case "ready":
+    case "reset":
+      begin(name === "reset", data);
+      break;
+    case "block":
+      addBlock(data);
+      break;
+    case "undo":
+      undoBlock(data);
+      banner(`Reorg: block ${data.number.toLocaleString()} was undone.`);
+      break;
+    case "notice":
+      banner(data.message);
+      break;
+    case "error":
+      banner(data.error.message, "bad");
+      setStatus("failed", "bad");
+      break;
+    case "done":
+      state.runId = null;
+      setStatus(`done · ${milliseconds(data.elapsedMs)}`, "");
+      break;
+  }
+  updateStats();
+}
+
+function begin(swapped, data) {
+  if (swapped) {
+    state.previous = state.current;
+    state.previousVersion = state.version;
+    state.diff = { added: 0, changed: 0, removed: 0, blocks: 0 };
+  } else {
+    banner("");
+  }
+  if (!swapped && state.pendingEdit) {
+    state.pendingEdit = false;
+    setTimeout(applyEdit, 0);
+  }
+  Object.assign(state, { ready: data, runId: data.run, version: data.version, current: new Map(), changes: 0 });
+  state.rerun = { version: data.version, to: data.window.toBlock, blocks: 0, started: swapped ? state.swapAt : performance.now() };
+  clearRows(swapped ? "Re-running…" : "Waiting for the first block…");
+  for (const cell of [...$("#strip").children]) {
+    if (Number(cell.dataset.block) < data.window.fromBlock) cell.remove();
+    else cell.classList.add("stale");
+  }
+  $("#s-name").textContent = data.manifest.name;
+  $("#s-version").textContent = `v${data.version}`;
+  $("#s-feed").textContent = data.feed === "own" ? "own feed" : "live lane";
+  $("#s-feed").title = data.feed === "own"
+    ? "This node's live lane lacks what the module needs: the run fetches its own blocks from P2P peers."
+    : "The node's live lane already holds what the module needs.";
+  const { fromBlock, toBlock } = data.window;
+  $("#s-window").textContent = `${toBlock - fromBlock + 1} blocks`;
+  $("#s-range").textContent = `${fromBlock.toLocaleString()}–${toBlock.toLocaleString()}`;
+  setStatus(data.follow ? "following" : "running", "live");
+  renderDiff();
+  renderSnippet();
+}
+
+function addBlock(data) {
+  const changes = new Map(data.changes.map((change) => [`${change.kind} ${change.key}`, change]));
+  state.current.set(data.hash, { number: data.number, changes });
+  state.changes += data.changes.length;
+  const before = state.previous?.get(data.hash);
+  const marks = new Map();
+  const removed = [];
+  if (before) {
+    for (const [id, change] of changes) {
+      const old = before.changes.get(id);
+      if (!old) marks.set(id, "added");
+      else if (JSON.stringify(old.value) !== JSON.stringify(change.value)) marks.set(id, "changed");
+    }
+    for (const [id, change] of before.changes) if (!changes.has(id)) removed.push(change);
+    if (state.diff && (marks.size || removed.length)) {
+      for (const mark of marks.values()) state.diff[mark] += 1;
+      state.diff.removed += removed.length;
+      state.diff.blocks += 1;
+    }
+  }
+  addRows(data.number, data.changes.map((change) => [change, marks.get(`${change.kind} ${change.key}`) || (change.undo ? "undo" : "")]).concat(removed.map((change) => [change, "removed"])));
+  paintCell(data.number, data.changes.length, marks.size + removed.length > 0);
+  $("#head").textContent = `block ${data.number.toLocaleString()} · ${data.finality} · ${new Date(data.timestamp * 1000).toLocaleTimeString()}`;
+  const rerun = state.rerun;
+  if (rerun) {
+    rerun.blocks += 1;
+    if (data.number >= rerun.to) {
+      state.rerun = null;
+      const took = milliseconds(performance.now() - rerun.started);
+      hint("#status-line", rerun.version === 1
+        ? `Ran ${rerun.blocks} blocks in ${took}. Change the processor to re-run them.`
+        : `Version ${rerun.version} re-ran ${rerun.blocks} blocks in ${took}.`, "good");
+    }
+  }
+  renderDiff();
+}
+
+function undoBlock(data) {
+  state.current.delete(data.hash);
+  addRows(data.number, data.changes.map((change) => [change, "undo"]));
+  const cell = cellFor(data.number);
+  cell.classList.add("undone");
+}
+
+function renderDiff() {
+  const diff = state.diff;
+  if (!diff) {
+    $("#diff").replaceChildren();
+    return;
+  }
+  $("#diff").replaceChildren(
+    element("span", { textContent: `v${state.version} vs v${state.previousVersion}` }),
+    element("span", { className: "added", textContent: `+${diff.added}`, title: "changes the new version adds" }),
+    element("span", { className: "changed", textContent: `~${diff.changed}`, title: "changes whose value differs" }),
+    element("span", { className: "removed", textContent: `−${diff.removed}`, title: "changes the new version drops" }),
+    element("span", { textContent: `${diff.blocks} block${diff.blocks === 1 ? "" : "s"} differ` }),
+  );
+}
+
+const SIGNS = { added: "+", changed: "~", removed: "−", undo: "↶" };
+
+function clearRows(message) {
+  $("#feed").replaceChildren(element("tr", {}, element("td", { colSpan: 4, className: "empty", textContent: message })));
+}
+
+function addRows(number, entries) {
+  const body = $("#feed");
+  if (body.querySelector(".empty")) body.replaceChildren();
+  const rows = entries.map(([change, mark]) => {
+    const value = element("code", { textContent: JSON.stringify(change.value) });
+    value.addEventListener("click", () => {
+      value.classList.toggle("open");
+      value.textContent = value.classList.contains("open") ? JSON.stringify(change.value, null, 2) : JSON.stringify(change.value);
+    });
+    const row = element("tr", { className: `fresh ${mark}` }, [
+      element("td", { className: "n" }, [element("b", { textContent: SIGNS[mark] || "" }), number.toLocaleString()]),
+      element("td", { className: "k", textContent: change.kind }),
+      element("td", { className: "key", textContent: shorten(change.key), title: change.key }),
+      element("td", { className: "v" }, value),
+    ]);
+    row.dataset.block = number;
+    if (mark) row.title = { added: "added by the new version", changed: "value differs from the version before", removed: "dropped by the new version", undo: "undone by a reorg" }[mark];
+    return row;
+  });
+  body.prepend(...rows);
+  while (body.rows.length > 600) body.lastElementChild.remove();
+  applyFocus();
+}
+
+function cellFor(number) {
+  const strip = $("#strip");
+  let cell = strip.querySelector(`[data-block="${number}"]`);
+  if (cell) return cell;
+  cell = element("button", { className: "cell", type: "button" });
+  cell.dataset.block = number;
+  cell.addEventListener("click", () => {
+    state.focus = state.focus === number ? null : number;
+    applyFocus();
+  });
+  const after = [...strip.children].find((other) => Number(other.dataset.block) > number);
+  strip.insertBefore(cell, after || null);
+  while (strip.children.length > MAX_CELLS) strip.firstElementChild.remove();
+  return cell;
+}
+
+function paintCell(number, count, changed) {
+  const cell = cellFor(number);
+  cell.dataset.level = count === 0 ? "0" : count < 3 ? "1" : count < 10 ? "2" : "3";
+  cell.classList.toggle("diff", changed);
+  cell.classList.remove("stale", "undone", "flash");
+  void cell.offsetWidth;
+  cell.classList.add("flash");
+  cell.title = `block ${number.toLocaleString()} · ${count} change${count === 1 ? "" : "s"}${changed ? " · changed by the new version" : ""}`;
+  cell.setAttribute("aria-label", cell.title);
+  const cells = $("#strip").children;
+  $("#strip-range").textContent = cells.length
+    ? `${Number(cells[0].dataset.block).toLocaleString()} → ${Number(cells[cells.length - 1].dataset.block).toLocaleString()}`
+    : "";
+}
+
+function applyFocus() {
+  for (const row of $("#feed").rows) row.hidden = state.focus !== null && Number(row.dataset.block) !== state.focus;
+  for (const cell of $("#strip").children) cell.setAttribute("aria-pressed", String(Number(cell.dataset.block) === state.focus));
+  $("#focus-note").textContent = state.focus === null ? "pick a block to show only its changes" : `showing block ${state.focus.toLocaleString()} · pick it again to show all`;
+}
+
+function updateStats() {
+  $("#s-changes").textContent = state.changes.toLocaleString();
+}
+
+function tomlValue(value) {
+  if (Array.isArray(value)) return `[${value.map(tomlValue).join(", ")}]`;
+  if (value !== null && typeof value === "object") {
+    return `{ ${Object.entries(value).map(([key, item]) => `${tomlKey(key)} = ${tomlValue(item)}`).join(", ")} }`;
+  }
+  return JSON.stringify(value);
+}
+
+function tomlKey(key) {
+  return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
+}
+
+const FINALIZED_NOTE = "# Blocks finalize about 13 minutes after they are produced; pick finalized ones.";
+
+function snippetText() {
+  const params = readParams() || {};
+  const template = state.templates.find((candidate) => candidate.name === state.selected);
+  const built = state.selected === "compose" || state.selected === "code";
+  const crate = state.selected === "compose" ? state.spec.name : "my-processor";
+  const typescript = built && state.code.language === "typescript";
+  const name = template ? template.name : built ? crate : (state.uploaded?.name || "processor.wasm").replace(/\.wasm$/, "");
+  const file = template ? `crates/processor-wasm/modules/${template.name.replaceAll("-", "_")}.wasm`
+    : typescript ? `${crate}/build/${crate}.wasm`
+    : built ? `${crate}/target/wasm32-unknown-unknown/release/${crate.replaceAll("-", "_")}.wasm`
+    : (state.uploaded?.name || "processor.wasm");
+  const instance = (built ? name : `my-${name}`).replace(/[^A-Za-z0-9._-]/g, "-").slice(0, 64);
+  const origin = window.location.origin;
+  const range = state.ready?.window;
+  const from = range ? range.fromBlock : 21000000;
+  const to = range ? range.toBlock : 21000099;
+  // Never the token itself: the snippets read it from the environment.
+  const token = Boolean($("#token").value.trim());
+  switch (state.snippet) {
+    case "toml":
+      return [
+        "# Add to the node's configuration, then restart it.",
+        "[[processors]]",
+        'id = "wasm"',
+        `instance = "${instance}"`,
+        'version = "1.0.0"',
+        'history_mode = "on_demand"',
+        `start_block = ${from}`,
+        'publish = "unattested"',
+        'state = { mode = "durable" }',
+        'output = { mode = "full" }',
+        'delivery = { mode = "window" }',
+        'checkpoint = { mode = "automatic", keep = 3 }',
+        'undo = { mode = "unfinalized", safety_blocks = 256 }',
+        "",
+        "[processors.settings]",
+        `module = "${file}"`,
+        ...(template ? [`blake3 = "${template.moduleHash}"`] : []),
+        "",
+        "[processors.settings.params]",
+        ...Object.entries(params).map(([key, value]) => `${tomlKey(key)} = ${tomlValue(value)}`),
+      ].join("\n");
+    case "run":
+      if (built) {
+        const project = typescript ? "package" : "crate";
+        const flag = typescript ? " --language typescript" : "";
+        return [
+          state.selected === "compose"
+            ? `# Write this processor as a ${project}, then build it and run it over finalized history:`
+            : `# Make a ${project}, save your code as its ${LANGUAGES[state.code.language].path}, then build and run it:`,
+          ...(state.selected === "compose"
+            ? [`leani processor create ${crate}${flag} --spec - <<'EOF'`, JSON.stringify(specJson(), null, 2), "EOF"]
+            : [`leani processor create ${crate}${flag}`]),
+          typescript ? `(cd ${crate} && npm install && npm run build)` : `(cd ${crate} && cargo build --release --target wasm32-unknown-unknown)`,
+          FINALIZED_NOTE,
+          `leani processor run ${file} \\`,
+          [`  --from-block ${from} --to-block ${to}`, ...(Object.keys(params).length ? [`  --params '${JSON.stringify(params)}'`] : [])].join(" \\\n"),
+        ].join("\n");
+      }
+      return [
+        "# Run it over finalized history with this node's sources.",
+        FINALIZED_NOTE,
+        `leani processor run ${template ? `--template ${template.name}` : file} \\`,
+        `  --from-block ${from} --to-block ${to} \\`,
+        `  --params '${JSON.stringify(params)}'`,
+      ].join("\n");
+    case "sdk":
+      return [
+        'import { createLeaniClient } from "@smart-byte/leani-sdk";',
+        "",
+        `const leani = createLeaniClient({ baseUrl: "${origin}"${token ? ", token: process.env.LEANI_TOKEN" : ""} });`,
+        `for await (const change of leani.processors.subscribe("${instance}")) {`,
+        "  // change.operation is \"apply\" or \"undo\"; change.data is the JSON payload.",
+        "  console.log(change.operation, change.data);",
+        "}",
+      ].join("\n");
+    default: {
+      const processor = template ? { template: template.name, params } : { module: "<hex>", params };
+      const settings = { blocks: Number($("#blocks").value) };
+      if ($("#follow").checked) Object.assign(settings, { follow: true, maxSeconds: Number($("#seconds").value) || 600 });
+      const auth = token ? ['  -H "authorization: Bearer $LEANI_TOKEN" \\'] : [];
+      return [
+        "# Stream an ad-hoc run as server-sent events:",
+        `curl -N -X POST ${origin}/admin/v1/wasm/runs \\`,
+        ...auth,
+        "  -H 'content-type: application/json' \\",
+        `  -d '${JSON.stringify({ ...processor, ...settings })}'`,
+        "",
+        "# Then swap in other parameters; the run re-runs its blocks:",
+        `curl -X PUT ${origin}/admin/v1/wasm/runs/${state.runId || "<run>"}/processor \\`,
+        ...auth,
+        "  -H 'content-type: application/json' \\",
+        `  -d '${JSON.stringify(processor)}'`,
+      ].join("\n");
+    }
+  }
+}
+
+function renderSnippet() {
+  const tabs = [["toml", "node config"], ["run", "leani cli"], ["sdk", "typescript sdk"], ["curl", "curl"]];
+  $("#snippet-tabs").replaceChildren(
+    element("span", { className: "dots", ariaHidden: "true" }, [element("i"), element("i"), element("i")]),
+    ...tabs.map(([id, label]) => {
+      const tab = element("button", { className: "view", type: "button", textContent: label });
+      tab.setAttribute("aria-pressed", String(state.snippet === id));
+      tab.addEventListener("click", () => { state.snippet = id; renderSnippet(); });
+      return tab;
+    }),
+    element("button", { className: "btn small", type: "button", textContent: "Copy" }),
+  );
+  $("#snippet-tabs").lastElementChild.dataset.copy = "snippet-text";
+  $("#snippet-text").textContent = snippetText();
+}
+
+const KEEPS = [
+  { name: "everything", says: "keeps everything", keep: "all", deliver: "none", reads: "query the API", footprint: () => "grows with the chain" },
+  { name: "window", says: "keeps a recent window", keep: "window", deliver: "none", reads: "query the API", footprint: () => `the last ${Number($("#need-window").value) || 30} days` },
+  { name: "latest", says: "keeps one value per key", keep: "one", deliver: "none", reads: "query the API", footprint: () => "one row per key" },
+  { name: "result", says: "keeps one result for a range", keep: "none", deliver: "once", reads: "one result", footprint: () => "one result, then reclaimable" },
+  { name: "stream", says: "keeps nothing; your database does", keep: "none", deliver: "acked", reads: "until confirmed", footprint: () => "held until your app confirms" },
+  { name: "live", says: "keeps nothing; streams the head", keep: "none", deliver: "stream", reads: "best effort", footprint: () => "a live buffer of an hour" },
+];
+// The measured recipes of the configuration guide's sizing table; the
+// built configuration shows what each one sets.
+const TUNING = [
+  ["limitedMemory", "Limited memory", "Under 1 GiB: 4 reads and 2 chunks; eraE needs the least memory."],
+  ["fasterErae", "Faster eraE backfills", "A quarter to a half faster, at the same peak memory."],
+  ["lessMemory", "Less memory", "1 to 4 GiB: 4 chunks instead of 8; Xatu backfills hold about half as much."],
+  ["transactionsFromXatu", "Limited bandwidth", "Xatu first on a slow link, for processors that read no logs; only eraE proves logs complete."],
+  ["slowDisk", "Slow disk syncs", "On network-attached volumes, keep commit batches large."],
+];
+const SLOTS = 16;
+const WINDOW_SLOTS = 9;
+const TERMINAL_BLOCKS = 10;
+const STREAM_TICKS = 4;
+const ACK_EVERY = 4;
+const lanes = [];
+let laneBlock = 0;
+// `tuning` is null while the limits choose the recipes.
+const need = { keep: "window", follow: "head", tuning: null };
+let built = null;
+let buildTimer = 0;
+let buildSerial = 0;
+
+function renderKeeps() {
+  lanes.length = 0;
+  $("#lanes").replaceChildren(...KEEPS.map((option) => {
+    const lane = { ...option, cells: [], out: [], hidden: 0, total: 0, phase: 0 };
+    lane.store = element("span", { className: "lane-store" });
+    lane.outbox = element("span", { className: "lane-out" });
+    lane.foot = element("span", { className: "lane-foot", textContent: lane.footprint() });
+    lane.node = element("button", { className: "lane", type: "button" }, [
+      element("span", { className: "lane-name" }, [element("strong", { textContent: lane.name }), element("small", { textContent: lane.says })]),
+      lane.store,
+      element("span", { className: "lane-arrow", textContent: "→" }),
+      lane.outbox,
+      lane.foot,
+    ]);
+    lane.node.addEventListener("click", () => chooseKeep(lane.name));
+    lanes.push(lane);
+    return lane.node;
+  }));
+}
+
+function chooseKeep(name) {
+  need.keep = name;
+  lanes.forEach((lane) => lane.node.setAttribute("aria-pressed", String(lane.name === name)));
+  $("#window-field").hidden = name !== "window";
+  rebuild();
+}
+
+function tickLanes() {
+  laneBlock += 1;
+  for (const lane of lanes) {
+    lane.cells = lane.cells.map((cell) => cell.replace(" new", ""));
+    lane.out = lane.out.map((cell) => ({ ...cell, age: cell.age + 1, kind: cell.kind.replace(" new", "") }));
+    if (lane.deliver === "once") {
+      lane.phase += 1;
+      if (lane.phase <= TERMINAL_BLOCKS) lane.cells.push("done new");
+      if (lane.phase === TERMINAL_BLOCKS) lane.out = [{ kind: "waiting new", age: 0 }];
+      if (lane.phase === TERMINAL_BLOCKS + 2) lane.out = [{ kind: "result new", age: 0 }];
+      if (lane.phase >= TERMINAL_BLOCKS + 5) Object.assign(lane, { phase: 0, cells: [], out: [] });
+      continue;
+    }
+    lane.total += 1;
+    if (lane.keep === "all" || lane.keep === "window") lane.cells.push("kept new");
+    if (lane.keep === "none") lane.cells.push(" new");
+    if (lane.keep === "one") lane.cells = ["kept new"];
+    if (lane.cells.length > SLOTS) {
+      lane.cells.shift();
+      lane.hidden += 1;
+    }
+    if (lane.keep === "window") {
+      lane.cells = lane.cells.map((cell, index) => (index < lane.cells.length - WINDOW_SLOTS ? "" : cell));
+    }
+    if (lane.deliver === "stream") {
+      lane.out.push({ kind: "kept new", age: 0 });
+      lane.out = lane.out.filter((cell) => cell.age < STREAM_TICKS);
+    } else if (lane.deliver === "acked") {
+      lane.out.push({ kind: "waiting new", age: 0 });
+      if (laneBlock % ACK_EVERY === 0) lane.out = [];
+    }
+  }
+  renderLanes();
+}
+
+function renderLanes() {
+  $("#keeps-block").textContent = `block ${laneBlock}`;
+  for (const lane of lanes) {
+    const cells = lane.cells.map((kind) => element("i", { className: `k ${kind}` }));
+    const lead = lane.keep === "all" && lane.hidden ? [element("span", { className: "more", textContent: `+${lane.hidden}` })] : [];
+    const tail = lane.keep === "one" ? [element("span", { className: "one-value", textContent: `${lane.total} blocks folded in` })] : [];
+    lane.store.replaceChildren(...lead, ...cells, ...tail);
+    const out = lane.out.map((cell) => {
+      const node = element("i", { className: `k ${cell.kind}` });
+      if (lane.deliver === "stream") node.style.setProperty("--fade", String(1 - cell.age / STREAM_TICKS));
+      return node;
+    });
+    const caption = lane.deliver === "acked" && laneBlock % ACK_EVERY === 0 ? "confirmed"
+      : lane.deliver === "once" && lane.phase >= TERMINAL_BLOCKS + 2 ? "confirmed" : lane.reads;
+    lane.outbox.replaceChildren(...out, element("span", { className: "out-caption", textContent: caption }));
+    lane.foot.textContent = lane.footprint();
+  }
+}
+
+function requirements() {
+  const kind = $("#need-processor").value;
+  let processor;
+  if (kind === "blocks") processor = { preset: "blocks" };
+  else if (kind === "uniswap") processor = { preset: "uniswap", markets: $("#need-markets").value.split(/[\s,]+/).filter(Boolean) };
+  else if (kind === "events") {
+    processor = { preset: "events", address: $("#need-address").value.trim(), events: $("#need-events").value.split("\n").map((line) => line.trim()).filter(Boolean) };
+  } else {
+    let settings;
+    try { settings = JSON.parse($("#need-settings").value || "{}"); } catch (error) { throw new Error(`settings: ${error.message}`); }
+    processor = { preset: "custom", id: $("#need-id").value.trim(), settings };
+    if ($("#need-version").value.trim()) processor.version = $("#need-version").value.trim();
+  }
+  const body = { processor, keep: need.keep, follow: need.follow };
+  if (need.keep === "window") body.windowDays = Number($("#need-window").value) || 30;
+  const history = $("#need-history").value;
+  const amount = $("#need-history-value").value;
+  if (history === "days" && Number(amount) > 0) body.history = { lastDays: Number(amount) };
+  if (history === "block" && amount !== "") body.history = { fromBlock: Number(amount) };
+  const limits = {};
+  if ($("#need-memory").value) limits.memory = $("#need-memory").value;
+  if ($("#need-disk").value) limits.disk = $("#need-disk").value;
+  if ($("#need-link").value) limits.bandwidthMbit = Number($("#need-link").value);
+  if (Object.keys(limits).length) body.limits = limits;
+  if (need.tuning) body.tuning = need.tuning;
+  return body;
+}
+
+function rebuild() {
+  clearTimeout(buildTimer);
+  buildTimer = setTimeout(buildNow, 250);
+}
+
+async function buildNow() {
+  let body;
+  try {
+    body = requirements();
+  } catch (error) {
+    hint("#needs-hint", error.message, "bad");
+    return;
+  }
+  const serial = ++buildSerial;
+  $("#build-state").textContent = "building…";
+  let reply;
+  try {
+    reply = await api("/admin/v1/config/build", "POST", body);
+  } catch (error) {
+    if (serial !== buildSerial) return;
+    // Nothing to download or check that differs from the needs on show.
+    built = null;
+    $("#download").disabled = $("#check").disabled = true;
+    hint("#needs-hint", error.message, "bad");
+    $("#build-state").textContent = "not built";
+    return;
+  }
+  if (serial !== buildSerial) return;
+  built = reply;
+  hint("#needs-hint", "");
+  renderBuilt();
+}
+
+function renderBuilt() {
+  $("#download").disabled = $("#check").disabled = false;
+  $("#build-state").textContent = `${built.decisions.length} settings from your needs`;
+  $("#config-changed").replaceChildren(...built.decisions.flatMap((decision, index) => [
+    index ? "\n" : "",
+    `${decision.setting} = ${decision.value}\n`,
+    element("span", { className: "d", textContent: `  # ${decision.because}` }),
+  ]));
+  $("#config-text").replaceChildren(...built.toml.split("\n").flatMap((line, index) => {
+    const at = line.indexOf("  # ");
+    const parts = line.startsWith("#") ? [element("span", { className: "c", textContent: line })]
+      : at < 0 ? [line] : [line.slice(0, at + 2), element("span", { className: "d", textContent: line.slice(at + 2) })];
+    return index ? ["\n", ...parts] : parts;
+  }));
+  const notes = [
+    ...built.errors.map((error) => element("p", { className: "bad", textContent: `${error.field}: ${error.message}` })),
+    ...built.warnings.map((warning) => element("p", { className: "warn", textContent: `warning: ${warning}` })),
+    element("p", {}, ["then run ", ...built.next.flatMap((step, index) => [index ? " · " : "", element("code", { textContent: step })])]),
+  ];
+  $("#build-notes").replaceChildren(...notes);
+  $("#check-result").replaceChildren();
+  renderRecipes();
+}
+
+function renderRecipes() {
+  const applied = need.tuning || built?.tuning || [];
+  $("#recipes").replaceChildren(...TUNING.map(([id, title, text]) => {
+    const on = applied.includes(id);
+    const card = element("button", { className: "recipe", type: "button" }, [
+      element("strong", { textContent: title }),
+      element("p", { textContent: text }),
+      element("span", { className: "state", textContent: on ? (need.tuning ? "on" : "on · your limits call for it") : "off" }),
+    ]);
+    card.setAttribute("aria-pressed", String(on));
+    card.addEventListener("click", () => {
+      const current = new Set(need.tuning || built?.tuning || []);
+      if (current.has(id)) current.delete(id); else current.add(id);
+      need.tuning = [...current];
+      renderRecipes();
+      rebuild();
+    });
+    return card;
+  }));
+  $("#tuning-auto").hidden = !need.tuning;
+}
+
+function download() {
+  if (!built) return;
+  const url = URL.createObjectURL(new Blob([built.toml], { type: "application/toml" }));
+  const link = element("a", { href: url, download: "leani.toml" });
+  document.body.append(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function showFields() {
+  const kind = $("#need-processor").value;
+  document.querySelectorAll("[data-for]").forEach((field) => { field.hidden = field.dataset.for !== kind; });
+  const history = $("#need-history").value;
+  $("#need-history-field").hidden = !history;
+  $("#need-history-unit").textContent = history === "block" ? "first block" : "days";
+}
+
+function renderConfig() {
+  renderKeeps();
+  // Start with a few blocks in every lane; without motion, show a fuller frame.
+  const still = matchMedia("(prefers-reduced-motion: reduce)").matches;
+  for (let block = 0; block < (still ? SLOTS : 6); block += 1) tickLanes();
+  if (!still) setInterval(() => { if (!$("#config").hidden && !document.hidden) tickLanes(); }, 1000);
+  for (const field of document.querySelectorAll(".fields input, .fields select, .fields textarea, #need-window")) {
+    field.addEventListener("input", () => { showFields(); rebuild(); });
+  }
+  for (const button of document.querySelectorAll("#need-follow button")) {
+    button.addEventListener("click", () => {
+      need.follow = button.dataset.value;
+      document.querySelectorAll("#need-follow button").forEach((other) => other.setAttribute("aria-pressed", String(other === button)));
+      rebuild();
+    });
+  }
+  $("#tuning-auto").addEventListener("click", () => { need.tuning = null; rebuild(); });
+  for (const [tab, view] of [["#view-changed", "#config-changed"], ["#view-file", "#config-text"]]) {
+    $(tab).addEventListener("click", () => {
+      for (const [otherTab, otherView] of [["#view-changed", "#config-changed"], ["#view-file", "#config-text"]]) {
+        $(otherTab).setAttribute("aria-pressed", String(otherTab === tab));
+        $(otherView).hidden = otherView !== view;
+      }
+    });
+  }
+  $("#download").addEventListener("click", download);
+  showFields();
+  renderRecipes();
+  chooseKeep(need.keep);
+}
+
+async function checkConfiguration() {
+  const result = $("#check-result");
+  if (!built) return;
+  result.replaceChildren(element("p", { className: "hint", textContent: "Checking…" }));
+  try {
+    const report = await api("/admin/v1/config/check", "POST", { toml: built.toml });
+    const lines = [element("p", {
+      className: report.valid ? "hint good" : "hint bad",
+      textContent: report.valid ? `Valid · ${report.chain} · processors: ${(report.processors || []).join(", ") || "none"}` : "Invalid",
+    })];
+    for (const error of report.errors || []) lines.push(element("p", { className: "hint bad", textContent: `${error.field}: ${error.message}` }));
+    for (const warning of report.warnings || []) lines.push(element("p", { className: "hint", textContent: `warning: ${warning}` }));
+    result.replaceChildren(...lines);
+  } catch (error) {
+    result.replaceChildren(element("p", { className: "hint bad", textContent: error.message }));
+  }
+}
+
+function showTab(id) {
+  for (const tab of document.querySelectorAll("[role=tablist] [aria-controls]")) {
+    const selected = tab.getAttribute("aria-controls") === id;
+    tab.setAttribute("aria-selected", String(selected));
+    document.getElementById(tab.getAttribute("aria-controls")).hidden = !selected;
+  }
+}
+
+$("#tab-processors").addEventListener("click", () => showTab("processors"));
+$("#tab-config").addEventListener("click", () => showTab("config"));
+$("#blocks").addEventListener("input", () => { $("#blocks-out").value = $("#blocks").value; renderSnippet(); });
+for (const id of ["#follow", "#seconds"]) $(id).addEventListener("input", renderSnippet);
+$("#params").addEventListener("input", () => edited());
+for (const button of document.querySelectorAll("#compose-kind button")) {
+  button.addEventListener("click", () => {
+    if (state.spec.kind === button.dataset.kind) return;
+    state.spec.kind = button.dataset.kind;
+    resetFields();
+    composed({ now: true });
+  });
+}
+for (const button of document.querySelectorAll("#compose-keep button")) {
+  button.addEventListener("click", () => { state.spec.keep = button.dataset.keep; composed({ now: true }); });
+}
+for (const id of ["#compose-contracts", "#compose-to", "#compose-from", "#compose-events", "#compose-functions", "#compose-name"]) {
+  $(id).addEventListener("input", () => { readComposeInputs(); composed(); });
+}
+$("#compose-by").addEventListener("change", () => { state.spec.by = $("#compose-by").value; composed({ now: true }); });
+let highlightFrame = 0;
+$("#code").addEventListener("input", () => {
+  if (state.selected === "code") state.ownSource[state.code.language] = $("#code").value;
+  cancelAnimationFrame(highlightFrame);
+  highlightFrame = requestAnimationFrame(renderEditor);
+});
+$("#code").addEventListener("scroll", syncScroll);
+for (const button of document.querySelectorAll("#code-language button")) {
+  button.addEventListener("click", (event) => { event.preventDefault(); chooseLanguage(button.dataset.language); });
+}
+// Tab indents, unless it follows Escape, so the keyboard can leave the editor.
+let escaped = false;
+$("#code").addEventListener("keydown", (event) => {
+  if (event.key === "Enter" && (event.metaKey || event.ctrlKey) && state.code.editable) {
+    event.preventDefault();
+    buildCode();
+  } else if (event.key === "Tab" && state.code.editable && !escaped) {
+    event.preventDefault();
+    document.execCommand("insertText", false, "    ");
+  }
+  escaped = event.key === "Escape";
+});
+new ResizeObserver(renderEditor).observe($("#code"));
+$("#code-build").addEventListener("click", (event) => { event.preventDefault(); buildCode(); });
+$("#code-edit").addEventListener("click", (event) => {
+  event.preventDefault();
+  state.ownSource[state.code.language] = $("#code").value;
+  select("code");
+  buildCode();
+});
+$("#run").addEventListener("click", run);
+$("#check").addEventListener("click", checkConfiguration);
+$("#stop").addEventListener("click", () => stop(false));
+document.addEventListener("click", async (event) => {
+  const target = event.target.closest("[data-copy]");
+  if (!target) return;
+  try {
+    const source = document.getElementById(target.dataset.copy);
+    await navigator.clipboard.writeText(source.value ?? source.textContent);
+    target.textContent = "Copied";
+  } catch {
+    target.textContent = "Select and copy";
+  }
+  setTimeout(() => { target.textContent = "Copy"; }, 1400);
+});
+try { $("#token").value = sessionStorage.getItem("leani-token") || ""; } catch {}
+$("#token").addEventListener("change", () => {
+  try { sessionStorage.setItem("leani-token", $("#token").value); } catch {}
+  loadTemplates();
+  rebuild();
+  renderSnippet();
+});
+setInterval(pollWatched, 1000);
+applyFocus();
+renderSnippet();
+renderConfig();
+loadTemplates();
+</script>
+</body>
+</html>

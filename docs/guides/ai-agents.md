@@ -58,10 +58,11 @@ The skill teaches agents to answer an Ethereum data question in this order:
 
 1. Use a built-in processor when one produces the data, such as `evm-events`
    for decoded contract events.
-2. Otherwise write a [custom processor](/docs/guides/custom-processor/). This
-   is the normal way to extend Leani: it is needed for aggregates such as
-   distinct counts or sums, for transaction values rather than logs, and for
-   state across contracts.
+2. Otherwise write a processor: a [Wasm one](/docs/guides/wasm-processors/)
+   runs in the stock binary, and a [native one](/docs/guides/custom-processor/)
+   in a custom node. This is the normal way to extend Leani: it is needed for
+   aggregates such as distinct counts or sums, for transaction values rather
+   than logs, and for state across contracts.
 3. Backfill the range, check coverage, and query the result.
 
 ## Give agents the docs
