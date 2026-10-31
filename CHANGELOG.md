@@ -28,9 +28,10 @@ record, and documented RPC contracts.
   peers number that block from a header checked against the hash. Execution
   P2P accepts Amsterdam receipts, whose header gas counts gas before refunds
   (EIP-7778). Sepolia, past the fork, follows at every level. Consensus P2P
-  finality still stops at Gloas, fail-closed. ERC-20 balances skip the
-  EIP-7708 ETH transfer logs of `0xff…fe` unless `tokens` lists it; blocks
-  before Amsterdam carry none.
+  finality still stops at Gloas, fail-closed. Xatu, whose beacon rows carry
+  no Gloas payload, passes the rest of a gap to the next source from the
+  fork's first day. ERC-20 balances skip the EIP-7708 ETH transfer logs of
+  `0xff…fe` unless `tokens` lists it; blocks before Amsterdam carry none.
 - With the P2P live source, `sources.history` may be empty: execution P2P
   serves finalized history, and no archive reconciliation runs. On-demand
   JSON-RPC history then must be `disabled`.

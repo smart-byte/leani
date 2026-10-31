@@ -777,6 +777,12 @@ fn source_error(error: XatuError, chunk_range: BlockRange) -> SourceError {
             expected: "an object with a strong ETag".to_owned(),
             actual: error.to_string(),
         },
+        // Every later block is of that fork too: the next source keeps the
+        // rest of the gap.
+        XatuError::UnsupportedFork(version) => SourceError::SchemaDrift {
+            expected: "Xatu beacon blocks up to Fulu".to_owned(),
+            actual: format!("a {version} block"),
+        },
         other => SourceError::Protocol(other.to_string()),
     }
 }
@@ -1199,6 +1205,7 @@ mod tests {
                 table: XatuTable::CanonicalExecutionBlock,
                 missing: vec!["block_hash".to_owned()],
             },
+            XatuError::UnsupportedFork("gloas".to_owned()),
         ];
         for drift in drifts {
             let error = source_error(drift, BlockRange::single(BlockNumber(20_000_000)));
