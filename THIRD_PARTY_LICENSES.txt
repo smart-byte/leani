@@ -4744,7 +4744,7 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-sha2 0.11.0 — https://github.com/RustCrypto/hashes
+sha2 0.11.1 — https://github.com/RustCrypto/hashes
 
 Copyright (c) 2016-2026 The RustCrypto Project Developers
 Copyright (c) 2016 Artyom Pavlov
