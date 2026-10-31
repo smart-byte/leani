@@ -106,6 +106,31 @@ or shell should consistently use a configuration elsewhere. An explicit
 default operational tuning but never the chain identity, checkpoint trust
 root, or selected processor targets. Advanced documents keep every choice explicit.
 
+## Build a configuration from requirements
+
+Instead of copying a profile and editing it, state what the application needs
+and let `init` build a complete advanced document:
+
+```bash
+leani init uniswap-v3 ETH/USDC --keep window --window-days 30 \
+  --follow finalized --memory 1GiB --disk 20GiB --bandwidth 100
+```
+
+`--keep` is `everything`, `window`, `latest`, `result`, `stream`, or `live`;
+`--follow` is `head`, `finalized`, or `none`, which builds a history-only node
+without a live lane or finality; `--history-from-block` starts a backfill;
+`--memory`, `--disk`, and `--bandwidth` (Mbit/s) state the host's limits; and
+`--tuning` replaces the recipes the limits call for. `--requirements FILE`
+takes the same needs as JSON for any processor, including contract events and
+Wasm or custom processors. The builder writes every setting and comments each
+one it derived with the reason, using only the shipped profiles' storage
+settings and the measured recipes of
+[Sizing for bandwidth, memory, and disk](#sizing-for-bandwidth-memory-and-disk).
+`--json` prints the configuration, the derived settings with their reasons,
+warnings, and next steps. `leani guide config` describes the requirements, and
+a running node builds the same document at `POST /admin/v1/config/build`,
+which its `/playground` uses.
+
 ## Advanced root fields
 
 | Field | Type | Meaning |
@@ -288,11 +313,12 @@ validation.
 A backfill splits its range into gaps of missing coverage and tries the
 configured history sources for each gap in `priority` order, lowest first. A
 source that fails on part of a gap passes only those blocks to the next
-source: the blocks a dataset hole names, or the chunk whose read failed. It
-keeps the blocks before them, and the first source takes the gap back after
-them. A source that has not published the blocks, whose schema changed, or
-that fails again before committing a block passes the rest of the gap instead,
-and one that cannot fill the processor's field groups is skipped for the job.
+source: a dataset hole, from its first to its last block in the chunk read, or
+the chunk whose read failed. It keeps the blocks before them, and the first
+source takes the gap back after them. A source that has not published the
+blocks, whose schema changed, or that fails again before committing a block
+passes the rest of the gap instead, and one that cannot fill the processor's
+field groups is skipped for the job.
 Each backfill retries up to three times the number of sources, at least five
 times, before it fails. When every history source fails and the live source is execution
 P2P, P2P can serve the gap within `sources.live.history_fallback_blocks`.
@@ -622,6 +648,13 @@ limit: `max_blocks`, `max_age`, `max_rows`, or `max_bytes`. Validation
 refuses `[processors.output] finalized_only`, which was never applied; to
 publish only finalized blocks, set `publish = "finalized"`.
 
+How much `latest` keeps depends on the processor's keys, not on the mode: an
+ordered aggregate such as `transaction-stats` writes one key and keeps one
+row, a per-pool processor keeps one row per pool, and a block-local processor
+such as `evm-events` usually writes new keys every block, one per event, so
+under `latest` its output grows as under `full`. `leani doctor` warns about
+`latest` on a block-local processor; use `window` to bound such output.
+
 ### Delivery
 
 `[processors.delivery] mode` is `best_effort`, `window`, or
@@ -779,6 +812,22 @@ start on an empty store. Move the old state, or set an absolute path to
 select the intended store. When both locations hold state, it uses the one
 beside the configuration and warns, naming both. Equivalent paths and
 symlink aliases of the same directory count as one.
+
+### Node-side Wasm builds
+
+`api.allow_wasm_builds = true` lets the node compile processor source sent to
+`POST /admin/v1/wasm/build`, which the playground's editor uses; the compact
+profile takes it under `[api]` too. It is off by default and a development
+feature, not for production: rustc can read the host's files while it
+compiles, and only a denylist of source constructs guards it. With it on,
+the node builds Rust only for requests from its own machine, an SSH tunnel
+included, and TypeScript for any client the API admits; it logs a warning
+when it starts, and `leani doctor` reports one. A request relayed with a
+`Forwarded`, `X-Forwarded-For`, `X-Forwarded-Host`, or `X-Real-IP` header, or
+addressed to another host name, is not the node's own, but behind a reverse
+proxy on the same machine that sets none of them, a remote client's request
+looks local. In production, build modules where you write them, or in CI, and
+configure the module file with its `blake3` hash.
 
 ### Historical CLI and node backfill
 

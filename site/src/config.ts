@@ -9,7 +9,7 @@ export const INSTALL_URL = '/docs/getting-started/install/';
 export const EVIDENCE_URL = '/docs/contributing/manual-verification/#real-source-delivery-benchmark';
 export const BLOBS_MONEY_URL = 'https://blobs.money';
 
-// The published preview's install command, as docs/getting-started/install.mdx documents it.
+// The published release's install command, as docs/getting-started/install.mdx documents it.
 export const HOMEBREW_INSTALL = 'brew install smart-byte/tap/leani';
 // The agent skill's install command, as docs/guides/ai-agents.md documents it.
 export const AGENT_SKILL_INSTALL = 'npx skills add smart-byte/leani -g';

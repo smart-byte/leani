@@ -7,6 +7,7 @@
 
 mod header_rules;
 mod live_head;
+mod live_material;
 mod peer_store;
 
 use header_rules::{HeaderRules, HeaderVerdict, blob_gas_matches};
@@ -108,6 +109,10 @@ const MAX_HISTORY_HEADER_REQUEST_BLOCKS: u64 = 1_024;
 // bounded source chunks instead of one potentially multi-gigabyte gap. Each
 // open still uses smaller fixed-range ETH requests internally.
 const MAX_HISTORY_OPEN_BLOCKS: u64 = 256;
+// A history proof keeps the hashes of at least this many blocks from its first
+// (4 MiB). Backfill detours ask for ranges a little above earlier ones and
+// reuse it; a request further up downloads the chain to the anchor again.
+const RETAINED_PROOF_BLOCKS: u64 = 131_072;
 // Fetch enough blocks per verified material window to keep several peers busy,
 // while retaining the ETH response-size-safe body/receipt sub-batches below.
 const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
@@ -705,6 +710,10 @@ pub struct RethP2pSource {
     /// The live lane includes no block above the newest, and none without
     /// them.
     attested_heads: Option<AttestedHeadReceiver>,
+    /// The verified bodies and receipts that this source's live
+    /// subscriptions download for one another.
+    live_bodies: Arc<live_material::SharedMaterial<BlockBody>>,
+    live_receipts: Arc<live_material::SharedMaterial<Vec<Receipt>>>,
 }
 
 /// Consensus-verified execution anchor used to prove a historical P2P suffix.
@@ -4094,6 +4103,8 @@ impl RethP2pSource {
             network,
             request_metrics: P2pRequestMetrics::default(),
             attested_heads: None,
+            live_bodies: Arc::default(),
+            live_receipts: Arc::default(),
         })
     }
 
@@ -4699,7 +4710,8 @@ impl RethP2pSource {
     }
 
     /// Bodies and receipts of validated live `headers`, which `header_peer`
-    /// served, normalized into frames, with the peers that served them.
+    /// served, normalized into frames, with the peers that served the
+    /// material this subscription downloaded itself.
     async fn fetch_verified_material(
         &self,
         session: &P2pSession,
@@ -4716,62 +4728,120 @@ impl RethP2pSource {
             concurrency: budget.max_in_flight_requests,
             priority: Priority::High,
         };
-        let (body_peers, bodies) = if let ([header], [hash]) = (headers, hashes.as_slice()) {
+        let response_peers = std::sync::Mutex::new(HashSet::new());
+        let bodies = self
+            .live_bodies
+            .get_or_fetch(&hashes, cancellation, |indices| {
+                let (headers, hashes) = (pick(headers, &indices), pick(&hashes, &indices));
+                let response_peers = &response_peers;
+                async move {
+                    let (peers, bodies) = self
+                        .fetch_live_bodies(
+                            session,
+                            &headers,
+                            &hashes,
+                            Some(header_peer),
+                            false,
+                            material_policy,
+                            cancellation,
+                        )
+                        .await?;
+                    lock(response_peers).extend(peers);
+                    Ok(bodies)
+                }
+            })
+            .await?;
+        // A body another subscription downloaded names no peer of this one.
+        let preferred_receipt_peer = lock(&response_peers)
+            .iter()
+            .next()
+            .copied()
+            .unwrap_or(header_peer);
+        session.set_phase(NetworkPhase::FetchingReceipts);
+        let receipts = self
+            .live_receipts
+            .get_or_fetch(&hashes, cancellation, |indices| {
+                let (headers, bodies, hashes) = (
+                    pick(headers, &indices),
+                    pick(&bodies, &indices),
+                    pick(&hashes, &indices),
+                );
+                let response_peers = &response_peers;
+                async move {
+                    let (peers, receipts) = if let ([header], [body], [hash]) =
+                        (headers.as_slice(), bodies.as_slice(), hashes.as_slice())
+                    {
+                        self.fetch_live_receipts_from_untried_peers(
+                            session,
+                            LiveReceiptMaterial {
+                                header,
+                                body,
+                                hash: *hash,
+                                header_peer,
+                                preferred_peer: preferred_receipt_peer,
+                            },
+                            material_policy,
+                            cancellation,
+                        )
+                        .await
+                        .map(|(peer, block_receipts)| {
+                            (peer.into_iter().collect(), vec![block_receipts])
+                        })?
+                    } else {
+                        self.fetch_receipts_batched(
+                            session,
+                            &headers,
+                            &bodies,
+                            &hashes,
+                            material_policy,
+                            cancellation,
+                        )
+                        .await?
+                    };
+                    lock(response_peers).extend(peers);
+                    Ok(receipts)
+                }
+            })
+            .await?;
+        // Receipts another subscription downloaded may have been checked
+        // against their root alone.
+        for ((header, body), block_receipts) in headers.iter().zip(&bodies).zip(&receipts) {
+            validate_body_receipts(header, body, block_receipts)?;
+        }
+        let frames = normalize_verified(headers, &bodies, &receipts, budget)?;
+        Ok((frames, lock(&response_peers).clone()))
+    }
+
+    /// The verified bodies of live `headers`, whose hashes are `hashes`, and
+    /// the peers that served them. A single body is asked of
+    /// `preferred_peer` first.
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_live_bodies(
+        &self,
+        session: &P2pSession,
+        headers: &[Header],
+        hashes: &[B256],
+        preferred_peer: Option<B512>,
+        unanchored: bool,
+        policy: MaterialRequestPolicy,
+        cancellation: &CancellationToken,
+    ) -> Result<(HashSet<B512>, Vec<BlockBody>), P2pError> {
+        if let ([header], [hash]) = (headers, hashes) {
             self.fetch_live_body_from_untried_peers(
                 session,
                 header,
                 *hash,
-                Some(header_peer),
-                false,
-                material_policy,
+                preferred_peer,
+                unanchored,
+                policy,
                 cancellation,
             )
             .await
-            .map(|(peer, body)| (HashSet::from([peer]), vec![body]))?
+            .map(|(peer, body)| (HashSet::from([peer]), vec![body]))
         } else {
-            self.fetch_bodies_batched(
-                &session.fetch,
-                headers,
-                &hashes,
-                material_policy,
-                cancellation,
-            )
-            .await?
-        };
-        let preferred_receipt_peer = body_peers.iter().next().copied();
-        session.set_phase(NetworkPhase::FetchingReceipts);
-        let (receipt_peers, receipts) = if let ([header], [body], [hash]) =
-            (headers, bodies.as_slice(), hashes.as_slice())
-        {
-            self.fetch_live_receipts_from_untried_peers(
-                session,
-                LiveReceiptMaterial {
-                    header,
-                    body,
-                    hash: *hash,
-                    header_peer,
-                    preferred_peer: preferred_receipt_peer.expect("one live body response peer"),
-                },
-                material_policy,
-                cancellation,
-            )
-            .await
-            .map(|(peer, block_receipts)| (peer.into_iter().collect(), vec![block_receipts]))?
-        } else {
-            self.fetch_receipts_batched(
-                session,
-                headers,
-                &bodies,
-                &hashes,
-                material_policy,
-                cancellation,
-            )
-            .await?
-        };
-        let frames = normalize_verified(headers, &bodies, &receipts, budget)?;
-        let mut response_peers = body_peers;
-        response_peers.extend(receipt_peers);
-        Ok((frames, response_peers))
+            self.fetch_bodies_batched(&session.fetch, headers, hashes, policy, cancellation)
+                .await
+        }
     }
 
     async fn fetch_requested_live_range(
@@ -4893,24 +4963,31 @@ impl RethP2pSource {
             concurrency: budget.max_in_flight_requests,
             priority: Priority::High,
         };
-        let (body_peers, bodies) = if let ([header], [hash]) = (headers, hashes.as_slice()) {
-            self.fetch_live_body_from_untried_peers(
-                session,
-                header,
-                *hash,
-                preferred_peer,
-                unanchored,
-                policy,
-                cancellation,
-            )
-            .await
-            .map(|(peer, body)| (HashSet::from([peer]), vec![body]))?
-        } else {
-            self.fetch_bodies_batched(&session.fetch, headers, &hashes, policy, cancellation)
-                .await?
-        };
+        let body_peers = std::sync::Mutex::new(HashSet::new());
+        let bodies = self
+            .live_bodies
+            .get_or_fetch(&hashes, cancellation, |indices| {
+                let (headers, hashes) = (pick(headers, &indices), pick(&hashes, &indices));
+                let body_peers = &body_peers;
+                async move {
+                    let (peers, bodies) = self
+                        .fetch_live_bodies(
+                            session,
+                            &headers,
+                            &hashes,
+                            preferred_peer,
+                            unanchored,
+                            policy,
+                            cancellation,
+                        )
+                        .await?;
+                    lock(body_peers).extend(peers);
+                    Ok(bodies)
+                }
+            })
+            .await?;
         let frames = normalize_verified_bodies(headers, &bodies, budget)?;
-        Ok((frames, body_peers))
+        Ok((frames, lock(&body_peers).clone()))
     }
 
     async fn fetch_sparse_live_frames(
@@ -5003,10 +5080,23 @@ impl RethP2pSource {
         cancellation: &CancellationToken,
     ) -> Result<Vec<Vec<Receipt>>, P2pError> {
         loop {
-            match self
-                .fetch_sparse_receipts_batched(session, headers, hashes, policy, cancellation)
-                .await
-            {
+            let receipts = self
+                .live_receipts
+                .get_or_fetch(hashes, cancellation, |indices| {
+                    let (headers, hashes) = (pick(headers, &indices), pick(hashes, &indices));
+                    async move {
+                        self.fetch_sparse_receipts_batched(
+                            session,
+                            &headers,
+                            &hashes,
+                            policy,
+                            cancellation,
+                        )
+                        .await
+                    }
+                })
+                .await;
+            match receipts {
                 Ok(receipts) => return Ok(receipts),
                 Err(error) => {
                     self.end_live_material_wave(bound, error, cancellation)
@@ -5133,7 +5223,6 @@ impl RethP2pSource {
             session.set_phase(NetworkPhase::FollowingHead);
             return Ok(frames.pop());
         }
-        let hash = header.hash_slow();
         if sparse_log_scope(request).is_some()
             && !request
                 .log_fields
@@ -5152,55 +5241,10 @@ impl RethP2pSource {
             self.complete_header_serve(session, header_serve).await;
             return Ok(frame);
         }
-        session.set_phase(NetworkPhase::FetchingBodies);
-        let material_policy = MaterialRequestPolicy {
-            concurrency: budget.max_in_flight_requests,
-            priority: Priority::High,
-        };
-        let (body_peer, body) = match self
-            .fetch_live_body_from_untried_peers(
-                session,
-                &header,
-                hash,
-                Some(header_peer),
-                false,
-                material_policy,
-                cancellation,
-            )
+        let (mut frames, _) = self
+            .fetch_verified_material(session, &[header], header_peer, budget, cancellation)
             .await
-        {
-            Ok(body) => body,
-            Err(error) => {
-                session.record_error(&error);
-                return Err(error);
-            }
-        };
-        session.set_phase(NetworkPhase::FetchingReceipts);
-        let (_, block_receipts) = match self
-            .fetch_live_receipts_from_untried_peers(
-                session,
-                LiveReceiptMaterial {
-                    header: &header,
-                    body: &body,
-                    hash,
-                    header_peer,
-                    preferred_peer: body_peer,
-                },
-                material_policy,
-                cancellation,
-            )
-            .await
-        {
-            Ok(receipts) => receipts,
-            Err(error) => {
-                session.record_error(&error);
-                return Err(error);
-            }
-        };
-        let headers = [header];
-        let bodies = [body];
-        let receipts = [block_receipts];
-        let mut frames = normalize_verified(&headers, &bodies, &receipts, budget)?;
+            .inspect_err(|error| session.record_error(error))?;
         self.complete_header_serve(session, header_serve).await;
         session.clear_error();
         session.observe_head(next);
@@ -7489,10 +7533,16 @@ impl RethP2pHistorySource {
                 .as_ref()
                 .is_none_or(|cached| !cached.covers(proof, retained))
             {
+                let kept_end = proof_start
+                    .0
+                    .saturating_add(RETAINED_PROOF_BLOCKS - 1)
+                    .clamp(material_end.0, proof.end().0);
+                let kept = BlockRange::new(proof_start, BlockNumber(kept_end))
+                    .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
                 let (session, assembled) = self
                     .connect_and_fetch_anchored_headers(
                         proof,
-                        retained,
+                        kept,
                         budget.max_in_flight_requests,
                         &cancellation,
                     )
@@ -11363,6 +11413,16 @@ fn requested_material(request: Option<&DataRequest>, capability: Capability) -> 
             _ => request.required.contains(capability),
         }
     })
+}
+
+fn pick<T: Clone>(items: &[T], indices: &[usize]) -> Vec<T> {
+    indices.iter().map(|index| items[*index].clone()).collect()
+}
+
+fn lock<T>(mutex: &std::sync::Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 fn header_only_request(request: &DataRequest) -> bool {

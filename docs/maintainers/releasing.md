@@ -305,7 +305,10 @@ The release and publish actions promote the site through `site-promote.yml`,
 then wait up to 20 minutes until leani.dev serves the release: production
 documentation edit links name the release tag. A run that times out leaves
 `site-production` promoted; check the Pages deployment, then dispatch the same
-action again.
+action again. Like the tap, the site follows the newest prerelease only until
+the first stable release. After that, the coordinator leaves the site on the
+stable release when it publishes a prerelease; to show one anyway, promote it
+by hand.
 
 To promote by hand, dispatch `site-promote.yml` from the release tag. Its first
 job checks that the release is published and builds the production site with

@@ -784,17 +784,17 @@ fn finish_subscription(outcome: Result<Exit>) -> Result<Exit> {
 /// Stdout was closed by its reader.
 #[derive(Debug, thiserror::Error)]
 #[error("stdout was closed by its reader")]
-struct StdoutClosed;
+pub(crate) struct StdoutClosed;
 
 /// Print one stdout row. `println!` panics once the reader has gone; this
 /// reports [`StdoutClosed`] instead.
 #[cfg(not(test))]
-fn print_row(row: &str) -> Result<()> {
+pub(crate) fn print_row(row: &str) -> Result<()> {
     write_row(&mut io::stdout().lock(), row)
 }
 
 #[cfg(test)]
-fn print_row(row: &str) -> Result<()> {
+pub(crate) fn print_row(row: &str) -> Result<()> {
     tests::capture_row(row).unwrap_or_else(|| write_row(&mut io::stdout().lock(), row))
 }
 

@@ -41,6 +41,7 @@ class Preparation(unittest.TestCase):
             "docs/operations/upgrade.md": 'The rc.1 store has schema 21.\nbun add @smart-byte/leani-sdk@0.1.0-rc.1\n',
             "docs/adr/history.md": 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n',
             "skills/leani/references/processors.md": '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.1/examples/node.toml`\nfor 0.1.0-rc.1).\n',
+            "examples/fixture-quickstart/snippets.sh": 'git clone --branch v0.1.0-rc.1 https://github.com/smart-byte/leani.git\n',
             "THIRD_PARTY_LICENSES.txt": 'leani 0.1.0-rc.1 — https://github.com/smart-byte/leani\nleani-primitives 0.1.0-rc.1 — https://github.com/smart-byte/leani\n'
                                         'external 0.1.0-rc.1 — https://example.invalid/external\n',
             "CHANGELOG.md": '# Changelog\n\n## [Unreleased]\n\n### Upgrading from 0.1.0-rc.1\n\nBack up schema 21 before upgrading to 23.\nbun add @smart-byte/leani-sdk@<version>\n\n## [0.1.0-rc.1]\n\nOriginal release.\n',
@@ -82,6 +83,9 @@ class Preparation(unittest.TestCase):
         self.assertEqual((self.root / "docs/adr/history.md").read_text(), 'Version 0.1.0-rc.1 used schema 21; the migration goes to schema 23.\n')
         self.assertEqual((self.root / "skills/leani/references/processors.md").read_text(),
                          '(`https://raw.githubusercontent.com/smart-byte/leani/v0.1.0-rc.2/examples/node.toml`\nfor 0.1.0-rc.2).\n')
+        self.assertEqual((self.root / "examples/fixture-quickstart/snippets.sh").read_text(),
+                         'git clone --branch v0.1.0-rc.2 https://github.com/smart-byte/leani.git\n')
+        self.assertIn("Status: release candidate (`v0.1.0-rc.2`).", (self.root / "README.md").read_text())
         # The license notices name every workspace crate with its version; CI regenerates them from Cargo.lock.
         self.assertEqual((self.root / "THIRD_PARTY_LICENSES.txt").read_text(),
                          'leani 0.1.0-rc.2 — https://github.com/smart-byte/leani\nleani-primitives 0.1.0-rc.2 — https://github.com/smart-byte/leani\n'
@@ -103,6 +107,10 @@ class Preparation(unittest.TestCase):
         readme = (self.root / "README.md").read_text()
         self.assertIn("Status: stable release (`v0.1.1`).", readme)
         self.assertIn("Previously previewed as `v0.1.0-rc.1`.", readme)
+        self.run_git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qam", "patch")
+        result = self.prepare("0.2.0-rc.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Status: release candidate (`v0.2.0-rc.1`).", (self.root / "README.md").read_text())
 
     def test_preparation_error_leaves_every_tracked_file_unchanged(self):
         (self.root / "CHANGELOG.md").write_text("Missing unreleased heading\n")
@@ -120,6 +128,25 @@ class Preparation(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("must be newer", result.stderr)
                 self.assertEqual(self.run_git("diff", "--name-only"), "")
+
+    def test_keeps_workspace_roots_and_crates_with_their_own_version(self):
+        files = {
+            "examples/wasm-processors/Cargo.toml": '[workspace]\nmembers = ["block-gas"]\n[workspace.package]\nversion = "0.1.0"\n',
+            "examples/wasm-processors/block-gas/Cargo.toml": '[package]\nname = "block-gas"\nversion.workspace = true\n',
+            "crates/wasm-guest/Cargo.toml": '[package]\nname = "leani-wasm-guest"\nversion = "0.1.0"\n',
+        }
+        for name, contents in files.items():
+            (self.root / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.root / name).write_text(contents)
+        with (self.root / "Cargo.lock").open("a") as stream:
+            stream.write('\n[[package]]\nname = "leani-wasm-guest"\nversion = "0.1.0"\n')
+        self.run_git("add", ".")
+        self.run_git("-c", "user.name=Release fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "own versions")
+        result = self.prepare("0.1.0-rc.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        packages = tomllib.loads((self.root / "Cargo.lock").read_text())["package"]
+        self.assertEqual(next(item["version"] for item in packages if item["name"] == "leani-wasm-guest"), "0.1.0")
+        self.assertEqual(self.run_git("diff", "--name-only", "--", "examples/wasm-processors", "crates/wasm-guest"), "")
 
 
 class Publication(unittest.TestCase):
@@ -146,6 +173,7 @@ class Publication(unittest.TestCase):
         self.sdk_lag = 0
         self.site_commit = None
         self.cloudflare_builds = True
+        self.stable_release = None
         self.tap_version = "0.0.1-rc.1"
         self.tap_writes = []
         self.tap_denied = False
@@ -213,6 +241,8 @@ class Publication(unittest.TestCase):
             return {"object": {"type": "commit", "sha": "c" * 40 if self.moved_tag else self.sha}}
         if path == "git/ref/heads/site-production":
             return {"object": {"sha": self.site_commit}} if self.site_commit else None
+        if path == "releases/latest":
+            return {"tag_name": f"v{self.stable_release}"} if self.stable_release else None
         if path == "releases?per_page=100":
             record = self.github_release()
             return [record] if record else []
@@ -339,6 +369,15 @@ class Publication(unittest.TestCase):
         self.assertEqual(self.tap_writes, [])
         self.assertIn("open a tap PR by hand", coordinator.messages[0])
         self.assertEqual(coordinator.messages[1], "homebrew: tap already serves v0.2.0-rc.2")
+
+    def test_site_keeps_a_stable_release(self):
+        with self.services() as coordinator:
+            self.assertTrue(coordinator.site_follows("0.1.0-rc.2"))
+            self.stable_release = "0.1.0"
+            self.assertTrue(coordinator.site_follows("0.1.1"))
+            self.assertFalse(coordinator.site_follows("0.2.0-rc.1"))
+        self.assertEqual(coordinator.messages,
+                         ["site: https://leani.dev follows stable v0.1.0; dispatch site-promote.yml from v0.2.0-rc.1 to show it"])
 
     def test_tap_without_write_access_names_the_token_after_the_site_is_live(self):
         self.tap_denied = True

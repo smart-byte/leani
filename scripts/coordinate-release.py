@@ -425,7 +425,7 @@ class Coordinator:
                 else:
                     raise ReleaseError(f"{stage} publication finished but the verified artifacts are not available")
                 self.report(f"{stage}: published and verified")
-            if promote_site:
+            if promote_site and self.site_follows(release):
                 branch = self.gh.api("git/ref/heads/site-production", missing=True)
                 if branch and branch["object"]["sha"] == commit:
                     self.report("site: already promoted to the release commit")
@@ -450,6 +450,14 @@ class Coordinator:
             # public now, and the verified formula points at them.
             self.homebrew_pr(release, (root / "binaries" / f"leani-release-candidate-v{release}" / "leani.rb").read_text())
         self.report(f"Release v{release} is fully published")
+
+    def site_follows(self, release):
+        # The tap's rule: the site documents the newest prerelease only until the
+        # first stable release, so docs never run ahead of what installs give users.
+        stable = "-rc." in release and self.gh.api("releases/latest", missing=True)
+        if stable:
+            self.report(f"site: {SITE_URL} follows stable {stable['tag_name']}; dispatch site-promote.yml from v{release} to show it")
+        return not stable
 
     def homebrew_pr(self, release, formula):
         # The tap stays a reviewed PR, so its install tests run before users get it.
@@ -495,7 +503,8 @@ class Coordinator:
         for name, contents in files.items():
             if (not isinstance(contents, str) or name.startswith("/") or ".." in Path(name).parts
                     or not (name in ("Cargo.toml", "Cargo.lock", "CHANGELOG.md", "README.md", "packages/sdk/package.json", "packages/sdk/src/index.ts",
-                                     "packages/sdk/README.md", "skills/leani/references/processors.md", "THIRD_PARTY_LICENSES.txt")
+                                     "packages/sdk/README.md", "skills/leani/references/processors.md", "THIRD_PARTY_LICENSES.txt",
+                                     "examples/fixture-quickstart/snippets.sh")
                             or re.fullmatch(r"crates/[^/]+/Cargo.toml", name) or re.fullmatch(r"examples/[^/]+/Cargo.toml", name)
                             or re.fullmatch(r"docs/[\w./-]+\.mdx?", name))):
                 raise ReleaseError("unexpected file in the release preparation")

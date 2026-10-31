@@ -1,6 +1,6 @@
 ---
 title: Processor extension contract
-description: Understand the native processor factory, settings, map/reduce, query extension, generic API, and future Wasm boundary.
+description: Understand the native processor factory, settings, map/reduce, query extension, generic API, and the Wasm processor boundary.
 section: contributing
 order: 20
 audience:
@@ -13,13 +13,13 @@ The node is an embeddable Rust library as well as a standard binary. Downstream
 projects can register application-specific native processors and compile their
 own binary without forking or modifying node assembly.
 
-This is the first extension model. It is also the host boundary for a future
-sandboxed Wasm package runtime:
+The same boundary hosts sandboxed Wasm modules, which the standard binary
+loads at runtime through its `wasm` factory:
 
 ```text
 ProcessorRegistry
-    +-- native ProcessorFactory
-    +-- future WasmProcessorFactory
+    +-- native ProcessorFactory (one per built-in or downstream processor)
+    +-- WasmProcessorFactory   (`id = "wasm"`, one instance per configured module)
 ```
 
 The source planner, historical/live runtimes, SQLite reducer, undo journal,
@@ -39,7 +39,7 @@ run_with_registry(processors).await?;
 ```
 
 `ProcessorRegistry::standard()` includes the checked-in blobs.money, ERC-20,
-and Uniswap factories. `ProcessorRegistry::new()` starts empty, allowing a
+Uniswap, and Wasm factories. `ProcessorRegistry::new()` starts empty, allowing a
 product-specific binary with no built-in application processor.
 Package loaders can register discovered `Arc<dyn ProcessorFactory>` values
 through `register_shared`.
@@ -67,8 +67,8 @@ pub trait ProcessorFactory: Send + Sync {
 processor-owned `QueryExtension`. Returning them together prevents query
 routes from being registered for a different processor instance.
 
-Construction is deterministic and performs no file or network I/O. The
-registry rejects:
+Construction is deterministic and performs no network I/O; only the `wasm`
+factory reads a file, its module. The registry rejects:
 
 - unknown or duplicate processor IDs;
 - invalid processor-owned settings;
@@ -342,30 +342,52 @@ and unsandboxed, and loading them would undermine the workspace's
 
 The supported choices are:
 
-1. statically linked native Rust processors now; and
-2. versioned, metered, sandboxed Wasm packages later.
+1. statically linked native Rust processors; and
+2. sandboxed, metered Wasm modules loaded by the standard binary.
 
-## Wasm product path
+## Wasm processors
 
-A hosted product can implement `WasmProcessorFactory` over this registry. A
-package will need:
+`crates/processor-wasm` implements `Processor` over a Wasm module run by the
+[wasmi](https://github.com/wasmi-labs/wasmi) interpreter;
+`crates/wasm-guest` and `packages/wasm-guest` are the Rust and TypeScript
+SDKs for writing one. The [Wasm processors guide](/docs/guides/wasm-processors/)
+covers authoring, `leani processor run`, the playground, configuration,
+limits, and measured performance, and `crates/wasm-guest/src/ffi.rs` documents
+the ABI. What the host guarantees, so the runtime and store need no Wasm
+special cases:
 
-- a signed/versioned manifest and content-addressed artifact;
-- declared capabilities, filters, start point, schemas, publication, and
-  retention;
-- a stable component ABI for map/reduce/state/change operations;
-- deterministic execution without ambient network, filesystem, clock, or
-  randomness;
-- memory, instruction/fuel, mutation, delta, and emitted-byte limits;
-- schema-aware JSON/Protobuf rendering;
-- package/version migrations and reproducible rebuilds; and
-- per-tenant resource accounting and observability.
+- **Identity.** `code_hash` is the module's BLAKE3 hash and `config_hash`
+  covers the canonical parameters, so the store's drift check refuses a
+  changed module or parameters under an existing instance. An optional
+  `settings.blake3` pin refuses other module bytes at load.
+- **Determinism.** Every describe, map, and reduce call runs in a fresh
+  instance. The guest sees only the materials and field groups its manifest
+  requires, reduced to its filter the way sources apply it, so every source
+  maps a block alike, and never the block's finality, so the default
+  exact-checksum `finality_variant_checksums` is correct. Floats follow the
+  Wasm deterministic profile; no clock, randomness, network, filesystem, or
+  WASI import exists.
+- **Reduction.** `block_local` modules cannot read state, which keeps the
+  block-versioned delivery contract honest; `ordered` modules read through
+  the same `ReducerTransaction`, suspending the interpreter for each read.
+  Writes queue in the host and apply in order before the next read and at the
+  end, and the host publishes one change per key, the last emitted.
+- **Outputs.** Entities and change payloads must be JSON, so
+  `entity_json`/`change_json` render them without schemas; private state is
+  opaque bytes.
+- **Limits.** Module size, instance memory, fuel per call, value size,
+  changes per block, and state accesses per block fail the call as a native
+  bug would; the lane halts visibly rather than skip a block.
 
-The first Wasm release should support one map/reduce processor per package.
-Module DAG composition and restricted event-only Substreams package import can
-follow after the package ABI and storage behavior are proven.
+The `wasm` factory reads its module file during construction; the file is a
+pinned local artifact, resolved relative to the configuration file, so
+construction stays deterministic.
 
-General Substreams compatibility is not implied. Packages requiring calls,
-traces, state diffs, arbitrary host functions, or retained Firehose history
-must fail capability negotiation when the configured node sources cannot
-supply those inputs.
+Not supported:
+
+- adding or removing a persistent Wasm instance on a running node: a
+  configuration change and a restart do it, and ad-hoc runs need neither;
+- a JIT engine, such as wasmtime, or pooled instances;
+- the component-model ABI;
+- module composition and Substreams packages;
+- signed packages and per-tenant resource accounting.
