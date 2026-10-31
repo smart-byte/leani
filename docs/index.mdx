@@ -20,7 +20,7 @@ application needs. Start with one small example:
 
 <CardGrid>
   <Card title="Run Leani" icon="rocket">
-    [Install the alpha](/docs/getting-started/install/), then
+    [Install Leani](/docs/getting-started/install/), then
     [follow an Ethereum block](/docs/getting-started/) or
     [index contract events](/docs/getting-started/bounded-mainnet/).
   </Card>
@@ -28,19 +28,20 @@ application needs. Start with one small example:
     [Query and subscribe with TypeScript](/docs/guides/query-then-follow/),
     then [persist changes to PostgreSQL](/docs/guides/postgres-consumer/).
   </Card>
-  <Card title="Build with the Rust library" icon="puzzle">
-    [Register your own processor, build a custom node, and query its output.](/docs/guides/custom-processor/)
+  <Card title="Write your own processor" icon="puzzle">
+    [Run it as Wasm in the stock binary](/docs/guides/wasm-processors/), or
+    [register it in a custom node with the Rust library](/docs/guides/custom-processor/).
   </Card>
 </CardGrid>
 
 Each tutorial includes a matching configuration, commands, and expected output.
-The tutorials use a source checkout; the preview is also published as release
+The tutorials use a source checkout; Leani is also published as release
 archives, a Homebrew formula, and the npm SDK (see
 [published releases](/docs/getting-started/install/#published-releases)).
 
 Leani does not maintain EVM state. Arbitrary `eth_call`, native account balances,
 and transaction simulation need an execution provider. Read
-[alpha limitations](/docs/operations/preview-limitations/) before connecting a
+[known limitations](/docs/operations/preview-limitations/) before connecting a
 production application.
 
 The expandable sidebar groups hold detailed concepts, API and configuration

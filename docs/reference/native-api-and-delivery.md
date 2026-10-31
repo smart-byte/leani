@@ -110,6 +110,10 @@ GET  /v1/q/blobs/transactions/{hash}
 GET  /v1/q/blobs/schedule
 GET  /v1/q/erc20/balances/{token}/{address}
 GET  /v1/q/uniswap/pools/{address}
+
+GET  /v1/wasm/templates
+POST /v1/wasm/compose
+GET  /playground
 ```
 
 Health distinguishes process/store liveness from required live/finality
@@ -152,7 +156,17 @@ DELETE /admin/v1/raw-history-jobs/{id}
 POST /admin/v1/processors/{processor}/lanes/live/reset
 DELETE /admin/v1/processors/{processor}/artifacts
 POST /admin/v1/processors/{processor}/artifacts/replay
+POST /admin/v1/wasm/runs
+PUT  /admin/v1/wasm/runs/{run}/processor
+POST /admin/v1/wasm/build
+POST /admin/v1/config/check
+POST /admin/v1/config/build
 ```
+
+The Wasm routes run modules ad hoc, as the
+[Wasm processors guide](/docs/guides/wasm-processors/#try-it-on-live-blocks)
+describes; `/playground` is a static page that calls them with the token its
+visitor enters, so it needs no token itself.
 
 There is no route that rebuilds a processor instance in place. A processor
 whose coverage contradicts the canonical chain is rebuilt as a replacement

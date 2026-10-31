@@ -146,6 +146,7 @@ describe('canned data', () => {
       'transaction-stats',
       'uniswap-latest',
       'uniswap-observations',
+      'wasm',
     ]);
   });
 });

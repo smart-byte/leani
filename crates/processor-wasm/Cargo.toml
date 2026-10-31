@@ -1,0 +1,35 @@
+[package]
+name = "leani-processor-wasm"
+description = "Sandboxed, metered Leani processors loaded from Wasm modules"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+blake3.workspace = true
+leani-primitives = { path = "../primitives" }
+leani-processor-api = { path = "../processor-api" }
+leani-wasm-guest = { path = "../wasm-guest" }
+postcard.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+wasmi.workspace = true
+
+[dev-dependencies]
+leani-processor-evm-events = { path = "../processor-evm-events" }
+leani-store-sqlite = { path = "../store-sqlite" }
+leani-testkit = { path = "../testkit" }
+tempfile.workspace = true
+wat.workspace = true
+
+[lints]
+workspace = true

@@ -9,8 +9,8 @@ Lean, state-minimized Ethereum indexing node. Leani backfills application
 data from public datasets, follows the chain head over native Ethereum P2P,
 and keeps no raw history. No API key, no archive node.
 
-Status: pre-release preview (`v0.1.0-rc.9`). Read the
-[preview limitations](docs/operations/preview-limitations.md) before deploying.
+Status: stable release (`v0.1.1`). Read the
+[known limitations](docs/operations/preview-limitations.md) before deploying.
 
 ## Install
 
@@ -20,7 +20,7 @@ brew install smart-byte/tap/leani
 
 Or take a checksummed archive from
 [GitHub releases](https://github.com/smart-byte/leani/releases), run the
-container image `ghcr.io/smart-byte/leani:v0.1.0-rc.9`, or build from source:
+container image `ghcr.io/smart-byte/leani:v0.1.1`, or build from source:
 
 ```bash
 git clone https://github.com/smart-byte/leani.git && cd leani
@@ -154,7 +154,7 @@ Install the SDK version that matches your node release; npm's `latest` tag
 can lag behind a prerelease node:
 
 ```bash
-bun add @smart-byte/leani-sdk@0.1.0-rc.9
+bun add @smart-byte/leani-sdk@0.1.1
 ```
 
 ```ts
@@ -180,11 +180,14 @@ the Leani cursor inside your own database transaction.
 ## Your own processor
 
 When no built-in processor produces the data you need, write your own; that is
-the intended way to extend Leani. Processors are Rust.
-[`examples/custom-node`](examples/custom-node) adds a
-native processor and a query extension to the stock node through
-`leani::run_with_registry`, without forking it. See the
-[processor-author guide](https://leani.dev/docs/guides/custom-processor/).
+the intended way to extend Leani. A
+[Wasm processor](https://leani.dev/docs/guides/wasm-processors/), in Rust or
+TypeScript, runs in the stock binary without rebuilding it, and
+`leani processor create` writes one from a description of the data to keep. A
+native Rust processor runs fastest and can add typed query routes:
+[`examples/custom-node`](examples/custom-node) adds one and a query extension
+to the stock node through `leani::run_with_registry`, without forking it. See
+the [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
 
 ## How it works
 

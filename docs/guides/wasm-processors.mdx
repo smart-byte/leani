@@ -1,0 +1,417 @@
+---
+title: Run your own processor as Wasm
+description: Write a processor in Rust or TypeScript, compile it to Wasm, and run it ad hoc or permanently in a stock Leani node, without rebuilding the node.
+section: guides
+order: 9
+audience:
+  - processor-author
+  - app-developer
+status: preview
+---
+
+import { Aside } from '@astrojs/starlight/components';
+
+A Wasm processor is a module you build with the guest SDK, in Rust with the
+`leani-wasm-guest` crate or in [TypeScript](#write-it-in-typescript). The
+standard `leani` binary loads it at runtime:
+
+- `leani processor run` runs it once over finalized history and prints its
+  changes;
+- the node's [playground](#try-it-on-live-blocks) and `POST /admin/v1/wasm/runs`
+  run it on recent and live blocks without persisting anything;
+- a `wasm` processor entry in the configuration keeps it running, with the
+  same durable state, coverage, finality, reorg handling, generic API, and SDK
+  subscriptions as a built-in processor.
+
+A Wasm processor implements the same `Processor` contract as a native one, so
+both kinds run side by side in one node and share its sources. Choose by the
+trade-off:
+
+| | Wasm module | [Native processor](/docs/guides/custom-processor/) |
+|---|---|---|
+| Ships with | any stock `leani` binary | your own node binary |
+| Change it | rebuild the module, restart or rerun | rebuild the node |
+| Runs | sandboxed, metered, deterministic interpreter | trusted native code |
+| Speed | map ~3.5–5×, reduce ~8× native; see [Performance](#performance) | fastest |
+| Outputs | JSON entities and changes | any encoding, typed query extensions |
+
+Start in Wasm; move a processor to native when it is proven and its compute
+matters. The descriptor contract is the same, so the move is a rebuild under a
+new instance.
+
+## Try a template
+
+The binary embeds four templates: `block-gas`, the gas and base fee of every
+block, from headers alone; `erc20-transfers`, transfers of chosen tokens at or
+above a minimum value; `token-volume`, a running transfer count and volume per
+token, in ordered state; and `event-decoder`, any contract's events, decoded
+from Solidity signatures given as parameters. Run one over twelve Mainnet
+blocks with a configuration whose history sources reach them, such as the one
+`leani init blocks` writes:
+
+```bash
+leani processor run --template erc20-transfers \
+  --from-block 19426589 --to-block 19426600 \
+  --params '{"tokens":["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"]}'
+```
+
+Every change prints as one JSON line; progress and the backfill report go to
+stderr:
+
+```json
+{"block":19426589,"blockHash":"0xa291…3791","direction":"apply","key":"0x1c02…0038","kind":"erc20.transfer","operation":"upsert","value":{"blockNumber":19426589,"from":"0xfe0d…43d2","logIndex":56,"timestamp":1710338159,"to":"0x0b8a…66dc","token":"0xa0b8…eb48","transactionHash":"0x1c02…10a3","value":"58295353165"}}
+```
+
+The event decoder answers "what did this contract emit" for any finalized
+range, with no code to write:
+
+```bash
+leani processor run --template event-decoder \
+  --from-block 19426589 --to-block 19426600 \
+  --params '{"addresses":["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],"events":["Transfer(address indexed from, address indexed to, uint256 value)"]}'
+```
+
+`leani processor run` is an ordinary on-demand backfill of a temporary `wasm`
+instance into a throwaway data directory: it uses the configuration's sources,
+trust, and finality, ignores its processors, and never touches its data
+directory. Give it a module file instead of `--template` to run your own, and
+`--param key=value` to set single parameters.
+
+## Write a processor
+
+`leani processor create` writes a processor crate for you. Describe the onchain
+data and what to keep, and it generates the code:
+
+```bash
+cat > spec.json <<'EOF'
+{
+  "data": {
+    "kind": "events",
+    "contracts": ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+    "events": ["Transfer(address indexed from, address indexed to, uint256 value)"]
+  },
+  "keep": { "kind": "totals", "by": "to", "sum": ["value"] }
+}
+EOF
+leani processor create usdc-volume --spec spec.json
+(cd usdc-volume && cargo build --release --target wasm32-unknown-unknown)
+leani processor run usdc-volume/target/wasm32-unknown-unknown/release/usdc_volume.wasm \
+  --from-block 19426589 --to-block 19426600
+```
+
+`data.kind` is `events` (`contracts`, `events`), `transactions` (`to`, `from`,
+and `functions`, whose calls it decodes), or `blocks` (header fields); each
+takes `fields` to keep, all by default. `keep.kind` is `rows`, one entity per
+match, or `totals`, a running count and sums of unsigned fields per value of
+`by`, or of everything. `--template event-decoder`, or another template,
+starts from that template's source instead, and without either
+`leani processor create` writes a USDC transfer decoder to start from. The
+crate carries the `leani-wasm-guest` SDK of the installed binary, its build
+settings, and a lockfile, so it builds against exactly the ABI that binary
+runs. Building needs the Wasm target once:
+`rustup target add wasm32-unknown-unknown`.
+
+Edit `src/lib.rs` where a spec falls short. A processor declares what it
+needs, maps one block to a delta, and reduces the delta into state and
+changes:
+
+```rust
+use leani_wasm_guest::{
+    Block, BlockRef, Capability, Error, Manifest, Processor, Store, export_processor,
+};
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct Params {
+    #[serde(default)]
+    min_gas_used: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+struct Busy {
+    gas_used: u64,
+    gas_limit: u64,
+}
+
+struct BusyBlocks;
+
+impl Processor for BusyBlocks {
+    type Params = Params;
+    type Delta = Option<Busy>;
+
+    fn manifest(_: &Params) -> Result<Manifest, Error> {
+        Ok(Manifest::new("busy-blocks").require(Capability::Header))
+    }
+
+    fn map(params: &Params, block: &Block) -> Result<Option<Busy>, Error> {
+        let header = block.header.as_ref().ok_or("the header is required")?;
+        let (Some(gas_used), Some(gas_limit)) = (header.gas_used, header.gas_limit) else {
+            return Ok(None);
+        };
+        Ok((gas_used >= params.min_gas_used).then_some(Busy { gas_used, gas_limit }))
+    }
+
+    fn reduce(_: &Params, block: &BlockRef, busy: Option<Busy>, store: &mut Store) -> Result<(), Error> {
+        match busy {
+            Some(busy) => store.upsert("busy", "busy.block", &block.number.to_be_bytes(), &busy),
+            None => Ok(()),
+        }
+    }
+}
+
+export_processor!(BusyBlocks);
+```
+
+The SDK's `solidity` module parses Solidity signatures and decodes event and
+call arguments, and `U256` holds 256-bit amounts. The templates' sources in
+`examples/wasm-processors` show log filters, ERC-20 decoding, and ordered
+state.
+
+## Write it in TypeScript
+
+The same processors can be written in TypeScript, as
+[AssemblyScript](https://www.assemblyscript.org) compiles it: TypeScript's
+syntax with Wasm's types, such as `u64` and `u32`, and without `any`, union
+types other than `| null`, or closures that capture variables. With the spec
+above:
+
+```bash
+leani processor create usdc-volume-ts --language typescript --spec spec.json
+(cd usdc-volume-ts && npm install && npm run build)
+leani processor run usdc-volume-ts/build/usdc-volume-ts.wasm \
+  --from-block 19426589 --to-block 19426600
+```
+
+A spec, a template (`--template event-decoder --language typescript`), and
+the starter generate the same processor as in Rust: the same manifest, rows,
+and totals. The package carries the TypeScript SDK of the installed binary in
+`assembly/leani/` and a lockfile pinning the AssemblyScript compiler; building
+needs Node.js 20 or later. Every template has a TypeScript twin beside its
+Rust source, `examples/wasm-processors/<name>/assembly/index.ts`.
+
+Where Rust and TypeScript differ:
+
+| Rust | TypeScript |
+|---|---|
+| `impl Processor for X` and `export_processor!(X)` | `class X extends Processor`, `register(new X())`, and `export * from "./leani/exports"` |
+| `type Params`, decoded by serde | `params: Json`: `get`, `field`, `asString`, `asU64`; `only` refuses unknown keys |
+| `type Delta`, encoded by serde | `map` writes the delta with a `Writer`; `reduce` reads it back in the same order with a `Reader` |
+| `Manifest` filters by transaction type and names its schemas | `Manifest` does neither |
+| `Option<u64>` | `Some<u64> \| null`; hashes, addresses, and `U256` are `null` when missing |
+| `[u8; 20]`, `[u8; 32]`, `Vec<u8>` | `Uint8Array` |
+| `#[derive(Serialize)]` entities; `put` takes JSON bytes | `Json.object().set(key, value)`: bytes as `0x` hex, `U256` as a decimal string; `put` takes the `Json` |
+| `return Err(...)` | `throw new Error(...)` fails the call with its message |
+| `solidity::Signature` | `import { Signature } from "./leani/solidity"` |
+
+A TypeScript module is about a fifth the size of its Rust twin. Its `map` runs
+about as fast, and its `reduce` 2–3× slower, so a whole block with the SQLite
+store takes about 1.1× the Rust module's time.
+
+## Try it on live blocks
+
+`GET /playground` on a running node serves a playground. Pick a template, your
+module, or **build your own**: pick events, transactions, or blocks, the
+fields, and rows or totals, and the node writes the code. Choose how many
+recent blocks to run over and whether to follow new ones, and watch each
+block's changes arrive. Each edit to the parameters, each other template, and
+each new build of your module reruns the same blocks, and the playground marks
+the changes the new version adds, alters, or drops before it follows new
+blocks with it. In a Chromium browser, **watch .wasm** reloads your module
+whenever a build rewrites it. The playground also writes the configuration
+entry, `leani processor` commands, SDK subscription, and `curl` call for what
+you run, and its **node configuration** tab [builds a node
+configuration](/docs/operations/configuration-guide/#build-a-configuration-from-requirements)
+from what you need.
+
+With `api.allow_wasm_builds = true`, the playground's editor compiles the
+code on the node and swaps the new module into the run; compiler errors point
+at their lines. Rust builds need cargo and the Wasm target on the node's host,
+TypeScript builds Node.js 20 or later.
+
+<Aside type="danger" title="Node-side builds are a development feature">
+  The node then compiles source sent to its API: Rust only for requests from
+  its own machine, as rustc can read the host's files while it compiles, and
+  TypeScript for any client the API admits. Do not turn builds on for people
+  you do not trust, or in production: build modules where you write them, or
+  in CI, and [pin them by hash](#keep-it-running). The [configuration
+  guide](/docs/operations/configuration-guide/#node-side-wasm-builds) has the
+  details.
+</Aside>
+
+The playground calls `POST /admin/v1/wasm/runs`, which you can call directly
+with a `template` name or the module as hex in `module`:
+
+```bash
+curl -N -X POST http://127.0.0.1:8080/admin/v1/wasm/runs \
+  -H 'content-type: application/json' \
+  -d '{"template":"erc20-transfers","params":{"minValue":"1000000000"},"blocks":32,"follow":true}'
+```
+
+The response is a stream of server-sent events: `ready` with the run's id,
+then one `block` per applied block with its changes, and `undo` for each block
+a reorg reverts. A run covers the newest `blocks` retained blocks, 16 by
+default and at most 1,024, then follows new ones for `maxSeconds`, 600 by
+default and at most 3,600. It reduces into a throwaway store, so its changes
+are what a configured instance would publish, but nothing is kept. While it
+runs, `PUT /admin/v1/wasm/runs/{run}/processor` gives it another module or
+other parameters: it reruns the blocks it holds and follows on. A node runs
+two runs at a time, of modules up to 4 MiB, with a quarter of the default
+fuel per call. `api/openapi.yaml` describes every event and refusal.
+
+A run first uses the node's retained blocks. When those lack material the
+module requires, such as logs of contracts no configured processor reads, the
+run fetches its own from the node's P2P peers: up to 64 recent blocks, then
+each new one. That feed fetches every log or receipt of the kinds the module
+requires, so a processor swapped in with another filter reruns the blocks
+without downloading them again, and the run and the live lane download a
+block they both need once.
+
+## Keep it running
+
+Add a `wasm` processor to the configuration. `settings.module` is relative to
+the configuration file, and `settings.params` is passed to the module as JSON:
+
+```toml
+[[processors]]
+id = "wasm"
+instance = "usdc-transfers"
+version = "1.0.0"
+history_mode = "on_demand"
+start_block = 19426589
+publish = "unattested"
+
+[processors.state]
+mode = "durable"
+
+[processors.output]
+mode = "full"
+
+[processors.delivery]
+mode = "window"
+
+[processors.checkpoint]
+mode = "automatic"
+keep = 3
+
+[processors.undo]
+mode = "unfinalized"
+safety_blocks = 256
+
+[processors.settings]
+module = "processors/erc20_transfers.wasm"
+# Refuse any other module bytes: `b3sum` prints the hash, as does the
+# `moduleHash` of a run's `ready` event.
+# blake3 = "0x<64 hex digits>"
+
+[processors.settings.params]
+tokens = ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"]
+minValue = "1000000000"
+
+# Optional overrides of the defaults below.
+[processors.settings.limits]
+fuel = 2000000000
+```
+
+`leani doctor` loads and describes the module, so a missing file, a stale pin,
+invalid parameters, or a bad manifest fail before `serve`. The instance then
+behaves like any other: `leani backfill --processor usdc-transfers
+--from-block N --to-block M`, the generic `/v1/processors/usdc-transfers/…`
+routes, entity queries by collection, and SDK subscriptions with
+`leani.processors.subscribe("usdc-transfers")`.
+
+The processor's code hash is the module's BLAKE3 hash, and its configuration
+hash covers the parameters. The store refuses a changed module or changed
+parameters under an existing instance, so a new module version runs as a new
+instance, as a [processor rebuild](/docs/operations/runbook/#processor-rebuild-or-rollback)
+does.
+
+## The contract
+
+**Manifest.** `manifest(params)` returns the processor's name, its
+`reduction`, and its requirements: capabilities (`header`, `body`,
+`transactions`, `calldata`, `senders`, `blob_fields`, `block_size`,
+`receipts`, `receipt_outcome`, `logs`, `withdrawals`), an optional filter
+(`addresses`, `topics`, `senders`, `recipients`, `transaction_types`), and
+whether logs need their transaction hashes. Sources fetch only that.
+
+**What `map` sees.** Exactly the required materials and field groups, reduced
+to the filter, whatever the source delivered: a filtered archive and a full
+P2P block map alike. A log is kept when its transaction matches the
+transaction filters and the log matches the address and topic filters. The
+block's finality is never visible, so a delta never depends on it.
+
+**Reduction.** `block_local` processors reduce each block alone: they cannot
+read state, and their keys must not repeat across blocks. `ordered`
+processors reduce in chain order and may read what earlier blocks wrote; their
+live lane waits for their history.
+
+**State.** Public collections hold JSON entities served by the API:
+`get`/`put`/`delete`/`scan_prefix`, plus `index_put`/`index_delete`. Private
+state namespaces hold any bytes and are never exposed. Reads see the block's
+own earlier writes. The node captures undo and commits state, coverage,
+cursor, and changes atomically.
+
+**Changes.** Publish with `emit_upsert`/`emit_delete`, or `upsert`/`remove` to
+write and publish together. A block publishes at most one change per key; the
+host keeps the last one emitted. An upsert of an existing key must carry the
+key's final value.
+
+**Failures.** A guest error or panic fails the block with its message; the node
+retries and halts the lane rather than skip the block. Skip input that does
+not decode, such as an ERC-721 log under the ERC-20 signature, instead of
+failing.
+
+**Sandbox.** A module has no clock, randomness, network, filesystem, or WASI:
+the node refuses any import outside the `leani` ABI. Every call runs in a
+fresh instance of the [wasmi](https://github.com/wasmi-labs/wasmi)
+interpreter, so nothing leaks from one block to the next, and floats follow
+Wasm's deterministic profile. `map` is a pure function of the module, its
+parameters, and the block.
+
+## Limits
+
+Defaults, overridable per instance in `[processors.settings.limits]`:
+
+| Limit | Default | Exceeded when |
+|---|---|---|
+| `module_bytes` | 16 MiB | the module file is larger |
+| `memory_bytes` | 64 MiB | an instance grows its memory past it |
+| `fuel` | 1,000,000,000 | one describe, map, or reduce call runs about that many instructions, or copies that many bytes through the host |
+| `value_bytes` | 8 MiB | a delta, entity, state value, change payload, or hash input is larger |
+| `changes` | 100,000 | one block emits more changes |
+| `host_calls` | 1,000,000 | one block's reduce makes more state accesses and emits |
+
+Fixed for every module: names of collections, namespaces, indexes, and change
+kinds up to 128 bytes; keys up to 64 KiB; at most 10,000 entries per scan;
+16 KiB of log output and a 4 KiB failure message per call; 64 MiB of changes
+per call; and a function table of at most 10,000 elements.
+
+## Performance
+
+Measured in release on an Apple Silicon laptop with the same ERC-20 decoding
+done by the native `evm-events` processor and by the `erc20-transfers`
+template, per block:
+
+| Transfers per block | Native map | Wasm map | Native reduce | Wasm reduce | Map + apply with the SQLite store, native / Wasm |
+|---:|---:|---:|---:|---:|---:|
+| 0 | 1.5 µs | 19 µs | 1.6 µs | 8 µs | 0.38 / 0.41 ms |
+| 10 | 12 µs | 54 µs | 14 µs | 119 µs | 1.3 / 1.4 ms |
+| 100 | 91 µs | 342 µs | 130 µs | 1.1 ms | 8.3 / 12 ms |
+| 1,000 | 0.9 ms | 3.1 ms | 1.5 ms | 11 ms | 114 / 121 ms |
+
+Each call pays about 10–20 µs to start a fresh instance; beyond that, `map`
+runs 3.5–5× and `reduce`, where building JSON dominates, about 8× slower than
+native. Maps run on the blocking thread pool, so concurrent maps use several
+cores, and with storage and sources in the loop the difference shrinks: source
+throughput usually bounds a backfill before either does. Filter in the
+manifest rather than in `map`, and prefer typed `#[derive(Serialize)]`
+entities to `serde_json::Value`.
+
+## ABI
+
+A module is a core Wasm module (`wasm32`), ABI version 1.
+`crates/wasm-guest/src/ffi.rs` documents its exports and its imports from
+module `leani`, and `abi.rs` beside it the inputs and outputs with their
+postcard and JSON encodings. Another language implements the ABI by decoding
+postcard and exporting the same functions, as the TypeScript SDK does.

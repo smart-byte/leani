@@ -1,0 +1,7 @@
+[build]
+target = "wasm32-unknown-unknown"
+
+# A fresh instance per call allocates its initial memory every time; a
+# 256 KiB stack instead of Rust's 1 MiB default keeps that small.
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "link-arg=-zstack-size=262144"]

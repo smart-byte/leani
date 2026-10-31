@@ -32,6 +32,10 @@
     {
       "id": "uniswap-observations",
       "description": "Append-only Uniswap V2/V3 pool observations"
+    },
+    {
+      "id": "wasm",
+      "description": "A sandboxed Wasm module from settings.module, metered and deterministic, built with leani-wasm-guest"
     }
   ]
 }

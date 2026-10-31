@@ -1,5 +1,5 @@
 ---
-title: Preview limitations
+title: Known limitations
 description: Know Leani's current production boundaries, unsupported behavior, and explicit operator obligations before deploying it.
 section: operations
 order: 0
@@ -14,9 +14,9 @@ sidebar:
     variant: caution
 ---
 
-Leani is pre-release software. The first public preview is intended for
-evaluation, processor development, reproducible backfills, and guarded
-application integrations with an independent fallback.
+The current release is intended for evaluation, processor development,
+reproducible backfills, and guarded application integrations with an
+independent fallback.
 
 - It is not a complete Ethereum archive node and does not maintain EVM state.
   Arbitrary `eth_call`, balances, storage, proofs, tracing, and state-diff RPC
@@ -41,4 +41,4 @@ application integrations with an independent fallback.
   expose admin/debug endpoints publicly.
 
 Treat this page and the [release process](https://leani.dev/docs/contributing/releasing/) as the public scope
-boundary for the current preview.
+boundary for the current release.

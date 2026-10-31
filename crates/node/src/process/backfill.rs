@@ -310,7 +310,6 @@ async fn remote_with_interrupts(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 async fn standalone(
     config_path: &Path,
     processor_id: &str,
@@ -318,15 +317,30 @@ async fn standalone(
     to: u64,
     registry: &ProcessorRegistry,
 ) -> Result<Exit> {
-    use leani_primitives::{BlockNumber, BlockRange, ChainId};
-    use leani_runtime::{BackfillJob, HistoricalRuntime};
-    use leani_store_sqlite::SqliteStore;
-
     let config = Config::load(config_path)
         .with_context(|| format!("load configuration {}", config_path.display()))?
         .validate()
         .map_err(|errors| anyhow::anyhow!(errors))?
         .into_inner();
+    let report = Box::pin(run_standalone(config, processor_id, from, to, registry)).await?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(Exit::Success)
+}
+
+/// Backfill one configured processor in this process: the pipeline both
+/// `leani backfill` and `leani processor run` use.
+#[allow(clippy::too_many_lines)]
+pub(super) async fn run_standalone(
+    config: Config,
+    processor_id: &str,
+    from: u64,
+    to: u64,
+    registry: &ProcessorRegistry,
+) -> Result<leani_runtime::BackfillReport> {
+    use leani_primitives::{BlockNumber, BlockRange, ChainId};
+    use leani_runtime::{BackfillJob, HistoricalRuntime};
+    use leani_store_sqlite::SqliteStore;
+
     let configured = backfill_processor_config(&config, processor_id)?;
     let processor = registry.instantiate(configured, config.chain.chain_id)?;
     let range = BlockRange::new(BlockNumber(from), BlockNumber(to))?;
@@ -558,8 +572,7 @@ async fn standalone(
             "flushed CLI backfill artifacts to segments"
         );
     }
-    println!("{}", serde_json::to_string_pretty(&report)?);
-    Ok(Exit::Success)
+    Ok(report)
 }
 
 #[cfg(test)]
