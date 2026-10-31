@@ -1,7 +1,7 @@
 # Base images are pinned to multi-architecture index digests, which
 # Dependabot refreshes. The Rust tag must name the rust-toolchain.toml version;
 # scripts/check-container-toolchain.rb enforces this in CI.
-FROM rust:1.99.1-bookworm@sha256:e12566d5abc17a0da741628782cdb504b68b8961f5bfcf677936bf3e8b32de29 AS builder
+FROM rust:1.99.1-bookworm@sha256:48b7f435b8fc6378ce43b44f15e3a47fd8919b2825f835c39bd4bd3da50af5b8 AS builder
 
 ARG LEANI_GIT_COMMIT=unknown
 WORKDIR /source
@@ -14,7 +14,7 @@ ENV CFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 ENV CXXFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 RUN cargo build --locked --release -p leani
 
-FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587 AS runtime
+FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
 
 LABEL org.opencontainers.image.title="leani" \
       org.opencontainers.image.source="https://github.com/smart-byte/leani" \
