@@ -9,7 +9,6 @@ use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
     ops::Range,
-    str::FromStr,
     sync::{
         Arc, PoisonError,
         atomic::{AtomicBool, Ordering},
@@ -40,7 +39,6 @@ use leani_source_api::{
     SourceError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -74,8 +72,6 @@ pub use http::{
 };
 
 pub use leani_primitives::MAINNET_GENESIS_TIME;
-pub const MAINNET_GENESIS_ROOT: B256 =
-    alloy_primitives::b256!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95");
 const MAX_UPDATES_PER_REQUEST: u64 = 128;
 use leani_chain::{BeaconNetwork, Chain};
 const SLOTS_PER_EPOCH: u64 = 32;
@@ -83,10 +79,6 @@ const SLOTS_PER_EPOCH: u64 = 32;
 const CLOCK_SKEW_SLOTS: u64 = 1;
 /// How long a poll waits after the first verified endpoint for the others.
 const AGREEMENT_GRACE: Duration = Duration::from_secs(2);
-const FULU_FORK_EPOCH: u64 = 411_392;
-const ELECTRA_FORK_EPOCH: u64 = 364_032;
-const MAX_BLOBS_PER_BLOCK_ELECTRA: u64 = 9;
-const MAINNET_BLOB_SCHEDULE: [(u64, u64); 2] = [(412_672, 15), (419_072, 21)];
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_hours(336);
 /// Members of the Ethereum mainnet sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -100,72 +92,6 @@ pub const HELIOS_REVISION: &str = "2af9b41887e069144ee56cd710f3ddca195473f8";
 /// Recent execution block numbers kept by hash, so a Gloas header's block is
 /// looked up once rather than at every poll.
 const RECENT_EXECUTION_NUMBERS: usize = 64;
-
-/// Compute the four-byte mainnet fork digest for a beacon slot.
-#[must_use]
-pub fn mainnet_fork_digest(slot: u64) -> [u8; 4] {
-    let epoch = slot / 32;
-    let version = if epoch >= FULU_FORK_EPOCH {
-        [0x06, 0, 0, 0]
-    } else if epoch >= ELECTRA_FORK_EPOCH {
-        [0x05, 0, 0, 0]
-    } else if epoch >= 269_568 {
-        [0x04, 0, 0, 0]
-    } else if epoch >= 194_048 {
-        [0x03, 0, 0, 0]
-    } else if epoch >= 144_896 {
-        [0x02, 0, 0, 0]
-    } else if epoch >= 74_240 {
-        [0x01, 0, 0, 0]
-    } else {
-        [0; 4]
-    };
-    let mut fork_data = [0_u8; 64];
-    fork_data[..4].copy_from_slice(&version);
-    fork_data[32..].copy_from_slice(MAINNET_GENESIS_ROOT.as_slice());
-    let mut digest = Sha256::digest(fork_data);
-    if epoch >= FULU_FORK_EPOCH {
-        // EIP-7892 folds the active blob parameters into the P2P digest so
-        // blob-parameter-only forks separate gossip and req/resp traffic
-        // without changing the consensus fork version.
-        let (parameter_epoch, maximum_blobs) = MAINNET_BLOB_SCHEDULE
-            .iter()
-            .rev()
-            .copied()
-            .find(|(activation, _)| epoch >= *activation)
-            .unwrap_or((ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA));
-        let mut parameters = [0_u8; 16];
-        parameters[..8].copy_from_slice(&parameter_epoch.to_le_bytes());
-        parameters[8..].copy_from_slice(&maximum_blobs.to_le_bytes());
-        let mask = Sha256::digest(parameters);
-        for (byte, mask) in digest.iter_mut().zip(mask) {
-            *byte ^= mask;
-        }
-    }
-    [digest[0], digest[1], digest[2], digest[3]]
-}
-
-/// Every fork digest mainnet uses under the schedule this release knows,
-/// its consensus forks and its blob-parameter-only forks. A peer on any
-/// other digest is on a fork this release cannot verify.
-#[must_use]
-pub fn known_mainnet_fork_digests() -> Vec<[u8; 4]> {
-    let forks = mainnet_forks();
-    [
-        forks.genesis,
-        forks.altair,
-        forks.bellatrix,
-        forks.capella,
-        forks.deneb,
-        forks.electra,
-        forks.fulu,
-    ]
-    .iter()
-    .map(|fork| fork.epoch)
-    .chain(MAINNET_BLOB_SCHEDULE.iter().map(|(epoch, _)| *epoch))
-    .map(|epoch| mainnet_fork_digest(epoch * SLOTS_PER_EPOCH))
-    .collect()
-}
 
 /// Consensus fork names whose light-client data this release verifies.
 const KNOWN_FORK_NAMES: [&str; 8] = [
@@ -1690,26 +1616,6 @@ pub fn helios_forks(network: &BeaconNetwork) -> Forks {
     }
 }
 
-pub fn mainnet_forks() -> Forks {
-    Forks {
-        genesis: fork(0, "00000000"),
-        altair: fork(74_240, "01000000"),
-        bellatrix: fork(144_896, "02000000"),
-        capella: fork(194_048, "03000000"),
-        deneb: fork(269_568, "04000000"),
-        electra: fork(364_032, "05000000"),
-        fulu: fork(411_392, "06000000"),
-        gloas: fork(u64::MAX, "07000000"),
-    }
-}
-
-fn fork(epoch: u64, version: &str) -> Fork {
-    Fork {
-        epoch,
-        fork_version: FixedBytes::<4>::from_str(version).expect("static fork version is valid hex"),
-    }
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(bound = "S: ConsensusSpec")]
 struct BootstrapResponse<S: ConsensusSpec> {
@@ -1968,7 +1874,7 @@ mod tests {
                 serde_json::json!({
                     "data": {
                         "genesis_time": MAINNET_GENESIS_TIME.to_string(),
-                        "genesis_validators_root": format!("{MAINNET_GENESIS_ROOT:#x}"),
+                        "genesis_validators_root": format!("{:#x}", mainnet().genesis_validators_root),
                         "genesis_fork_version": "0x00000000"
                     }
                 })
@@ -3675,19 +3581,20 @@ mod tests {
 
     #[test]
     fn genesis_identity_decodes_the_standard_beacon_response() {
+        let root = mainnet().genesis_validators_root;
         let response: GenesisResponse = serde_json::from_value(serde_json::json!({
             "data": {
                 "genesis_time": MAINNET_GENESIS_TIME.to_string(),
-                "genesis_validators_root": format!("{MAINNET_GENESIS_ROOT:#x}"),
+                "genesis_validators_root": format!("{root:#x}"),
                 "genesis_fork_version": "0x00000000"
             }
         }))
         .expect("standard genesis response");
-        assert_eq!(response.data.genesis_validators_root, MAINNET_GENESIS_ROOT);
+        assert_eq!(response.data.genesis_validators_root, root);
     }
 
     #[test]
-    fn an_unknown_fork_is_named_and_known_digests_cover_the_schedule() {
+    fn an_unknown_fork_is_named() {
         assert_eq!(
             unsupported_fork(br#"{"version":"heze","data":{}}"#),
             Some("heze".to_owned())
@@ -3698,29 +3605,6 @@ mod tests {
             Some("heze".to_owned())
         );
         assert_eq!(unsupported_fork(b"not json"), None);
-        let known = known_mainnet_fork_digests();
-        for slot in [0, FULU_FORK_EPOCH * 32, MAINNET_BLOB_SCHEDULE[1].0 * 32 + 1] {
-            assert!(known.contains(&mainnet_fork_digest(slot)), "slot {slot}");
-        }
-        assert!(!known.contains(&[0xde, 0xad, 0xbe, 0xef]));
-    }
-
-    #[test]
-    fn mainnet_fork_digests_include_blob_parameter_forks() {
-        assert_eq!(mainnet_fork_digest(0), [0xb5, 0x30, 0x3f, 0x2a]);
-        assert_eq!(mainnet_fork_digest(269_568 * 32), [0x6a, 0x95, 0xa1, 0xa9]);
-        assert_eq!(
-            mainnet_fork_digest(FULU_FORK_EPOCH * 32),
-            [0xcc, 0x2c, 0x5c, 0xdb]
-        );
-        assert_eq!(
-            mainnet_fork_digest(MAINNET_BLOB_SCHEDULE[0].0 * 32),
-            [0xcb, 0x0d, 0x1a, 0xcc]
-        );
-        assert_eq!(
-            mainnet_fork_digest(MAINNET_BLOB_SCHEDULE[1].0 * 32),
-            [0x8c, 0x9f, 0x62, 0xfe]
-        );
     }
 
     const SEPOLIA_BOOTSTRAP_JSON: &str =

@@ -26,11 +26,12 @@ use helios_consensus_core::{
     consensus_spec::MainnetConsensusSpec,
     types::{Bootstrap, FinalityUpdate, OptimisticUpdate, Update},
 };
+use leani_chain::{BeaconNetwork, SLOTS_PER_EPOCH};
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
     HELIOS_REVISION, HeaderAnchor, LightClientVerifier, StartAnchor, TrustedCheckpoint,
-    VerifiedFinalityAnchor, current_slot, known_mainnet_fork_digests, mainnet_fork_digest,
-    resolve_start_anchor, signed_implausibly_ahead, until_next_attested_poll, verification_slot,
+    VerifiedFinalityAnchor, current_slot, resolve_start_anchor, signed_implausibly_ahead,
+    until_next_attested_poll, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -1067,6 +1068,31 @@ impl ConsensusPeers for Libp2pPeers {
     }
 }
 
+/// Consensus forks whose light-client messages this crate decodes.
+const DECODED_FORKS: [&str; 7] = [
+    "phase0",
+    "altair",
+    "bellatrix",
+    "capella",
+    "deneb",
+    "electra",
+    "fulu",
+];
+
+/// Every fork digest of `network`'s schedule through the last fork this crate
+/// decodes: its consensus forks and its blob-parameter-only forks. A peer on
+/// any other digest is on a fork this release cannot verify.
+fn known_fork_digests(network: &BeaconNetwork) -> Vec<[u8; 4]> {
+    network
+        .forks
+        .iter()
+        .map(|fork| fork.epoch)
+        .chain(network.blob_schedule.iter().map(|(epoch, _)| *epoch))
+        .filter(|epoch| DECODED_FORKS.contains(&network.fork_at_epoch(*epoch).name.as_str()))
+        .map(|epoch| network.fork_digest(epoch.saturating_mul(SLOTS_PER_EPOCH)))
+        .collect()
+}
+
 /// Decode a peer's SSZ reply to `request` and check its fork-digest
 /// `context` against the slot of the header it carries. Undecodable or
 /// wrong-fork material is invalid: its peer is banned. A digest of no fork
@@ -1078,7 +1104,7 @@ fn decode_light_client_response(
     context: Option<[u8; 4]>,
 ) -> Result<LightClientResponse, PeerFailure> {
     if let Some(received) = context
-        && !known_mainnet_fork_digests().contains(&received)
+        && !known_fork_digests(&MAINNET_BEACON).contains(&received)
     {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -1477,7 +1503,7 @@ fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), String> {
 
 fn validate_context(context: Option<[u8; 4]>, slot: u64) -> Result<(), String> {
     let received = context.ok_or_else(|| "response omitted fork context".to_owned())?;
-    let expected = mainnet_fork_digest(slot);
+    let expected = MAINNET_BEACON.fork_digest(slot);
     if received != expected {
         return Err(format!(
             "response fork digest {received:02x?} does not match slot {slot} digest {expected:02x?}"
@@ -1492,7 +1518,7 @@ fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64, current_slot: 
     let finalized_epoch = checkpoint_slot.div_ceil(32);
     let head_slot = checkpoint_slot.max(finalized_epoch.saturating_mul(32));
     let mut status = Vec::with_capacity(STATUS_BYTES);
-    status.extend_from_slice(&mainnet_fork_digest(current_slot));
+    status.extend_from_slice(&MAINNET_BEACON.fork_digest(current_slot));
     // The weak-subjectivity checkpoint is locally trusted before bootstrap
     // verification and is therefore the only internally consistent chain
     // position this outbound light client can advertise. Advertising a zero
@@ -1512,7 +1538,7 @@ fn validate_peer_status(status: &[u8], current_slot: u64) -> Result<(), String> 
             status.len()
         ));
     }
-    let expected = mainnet_fork_digest(current_slot);
+    let expected = MAINNET_BEACON.fork_digest(current_slot);
     if status[..4] != expected {
         return Err(format!(
             "peer status fork digest {:02x?} differs from expected {expected:02x?}",
@@ -1577,7 +1603,7 @@ async fn discover_mainnet_peers(
         }
     }
     enrs.extend(discovery.table_entries_enr());
-    let expected_digest = mainnet_fork_digest(current_slot);
+    let expected_digest = MAINNET_BEACON.fork_digest(current_slot);
     let mut digest_counts = BTreeMap::<[u8; 4], usize>::new();
     let mut configured_preferred = BTreeSet::new();
     let mut preferred = BTreeSet::new();
@@ -2576,7 +2602,7 @@ mod tests {
     #[test]
     fn optimistic_updates_decode_from_peer_ssz_with_their_fork_context() {
         let encoded = optimistic_ssz(&fixture_optimistic(Behaviour::Honest));
-        let context = Some(mainnet_fork_digest(ATTESTED_SLOT));
+        let context = Some(MAINNET_BEACON.fork_digest(ATTESTED_SLOT));
         let decoded =
             decode_light_client_response(LightClientRequest::Optimistic, &encoded, context)
                 .map_err(|error| error.to_string())
@@ -2614,7 +2640,7 @@ mod tests {
         );
         // The wrong fork digest, or none, is invalid material, as is a
         // payload shorter than the container's fixed part.
-        for context in [Some(mainnet_fork_digest(0)), None] {
+        for context in [Some(MAINNET_BEACON.fork_digest(0)), None] {
             assert!(matches!(
                 decode_light_client_response(LightClientRequest::Optimistic, &encoded, context),
                 Err(PeerFailure::Invalid(_))
@@ -2937,14 +2963,41 @@ mod tests {
     }
 
     #[test]
+    fn known_fork_digests_end_with_the_last_fork_this_crate_decodes() {
+        let known = known_fork_digests(&MAINNET_BEACON);
+        let fulu = MAINNET_BEACON.fork("fulu").expect("fulu").epoch;
+        let (last_blob_fork, _) = *MAINNET_BEACON.blob_schedule.last().expect("blob forks");
+        for slot in [
+            0,
+            fulu * SLOTS_PER_EPOCH,
+            last_blob_fork * SLOTS_PER_EPOCH + 1,
+        ] {
+            assert!(
+                known.contains(&MAINNET_BEACON.fork_digest(slot)),
+                "slot {slot}"
+            );
+        }
+        assert!(!known.contains(&[0xde, 0xad, 0xbe, 0xef]));
+        // Once a schedule names Gloas, as Sepolia's does, its peers answer
+        // with material this crate cannot decode: unavailable, not banned.
+        let sepolia = leani_chain::ChainRegistry::standard()
+            .get("sepolia")
+            .expect("sepolia");
+        let sepolia = sepolia.beacon().expect("sepolia beacon");
+        let gloas = sepolia.fork("gloas").expect("gloas").epoch * SLOTS_PER_EPOCH;
+        let known = known_fork_digests(sepolia);
+        assert!(known.contains(&sepolia.fork_digest(gloas - 1)));
+        assert!(!known.contains(&sepolia.fork_digest(gloas)));
+    }
+
+    #[test]
     fn response_parser_requires_code_and_context() {
         assert!(decode_peer_response(&[], true).is_err());
         let payload = encode_snappy_payload(b"ok").expect("frame");
         let mut wire = vec![0];
-        wire.extend_from_slice(&mainnet_fork_digest(current_slot(
-            &MAINNET_BEACON,
-            SystemTime::now(),
-        )));
+        wire.extend_from_slice(
+            &MAINNET_BEACON.fork_digest(current_slot(&MAINNET_BEACON, SystemTime::now())),
+        );
         wire.extend_from_slice(&payload);
         let decoded = decode_peer_response(&wire, true).expect("response");
         assert_eq!(decoded.payload, b"ok");

@@ -46,6 +46,22 @@ fn mainnet_entry_matches_its_beacon_chain() {
     );
     assert_eq!(beacon.blob_schedule, [(412_672, 15), (419_072, 21)]);
     assert_eq!(beacon.fork_digest(0), [0xb5, 0x30, 0x3f, 0x2a]);
+    assert_eq!(
+        beacon.fork_digest(269_568 * SLOTS_PER_EPOCH),
+        [0x6a, 0x95, 0xa1, 0xa9]
+    );
+    assert_eq!(
+        beacon.fork_digest(411_392 * SLOTS_PER_EPOCH),
+        [0xcc, 0x2c, 0x5c, 0xdb]
+    );
+    assert_eq!(
+        beacon.fork_digest(412_672 * SLOTS_PER_EPOCH),
+        [0xcb, 0x0d, 0x1a, 0xcc]
+    );
+    assert_eq!(
+        beacon.fork_digest(419_072 * SLOTS_PER_EPOCH),
+        [0x8c, 0x9f, 0x62, 0xfe]
+    );
     assert_eq!(beacon.slot_starting_at(1_606_824_023 + 24), Some(2));
     assert_eq!(beacon.slot_starting_at(1_606_824_023 + 25), None);
 }
