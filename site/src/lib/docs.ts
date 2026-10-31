@@ -9,7 +9,7 @@ export const DOC_SECTIONS = [
 
 export type DocSection = (typeof DOC_SECTIONS)[number];
 
-// The alpha's default learning path. Other pages remain available in the
+// The default learning path. Other pages remain available in the
 // expandable reference groups and search.
 export const DOC_STARTER_PAGES = [
   { id: 'docs', label: 'Overview' },
@@ -19,7 +19,7 @@ export const DOC_STARTER_PAGES = [
   { id: 'docs/guides/query-then-follow', label: 'Use the TypeScript SDK' },
   { id: 'docs/guides/postgres-consumer', label: 'Persist to PostgreSQL' },
   { id: 'docs/guides/custom-processor', label: 'Build a custom node in Rust' },
-  { id: 'docs/operations/preview-limitations', label: 'Alpha limitations' },
+  { id: 'docs/operations/preview-limitations', label: 'Known limitations' },
 ] as const;
 
 export const DOC_SECTION_LABELS: Record<DocSection, string> = {

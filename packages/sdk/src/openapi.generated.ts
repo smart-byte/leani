@@ -1185,6 +1185,163 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/playground": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Render the Wasm processor and configuration playground */
+        get: operations["getPlayground"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/wasm/templates": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** List the bundled Wasm processor templates */
+        get: operations["listWasmTemplates"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/v1/wasm/compose": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Generate a Wasm processor's source from a spec
+         * @description Takes a spec of the onchain data to keep (`name`; `language`, `rust` by default or `typescript`; `data` with `kind` `events`, `transactions`, or `blocks`, their filters, signatures, and `fields`; `keep` with `kind` `rows` or `totals`, `by`, and `sum`), as `leani processor create --help` describes, and returns the processor's source, written against the guest SDK of this node. Both languages keep the same rows and totals. Reads and writes nothing.
+         */
+        post: operations["composeWasmProcessor"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/wasm/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Build a Wasm processor's source on the node's host
+         * @description Compiles `source` in its `language`: `rust` (the default), a processor's `src/lib.rs`, with the host's cargo; or `typescript`, an `assembly/index.ts`, with the AssemblyScript compiler the SDK pins, which npm installs on the first build. Either builds against this node's guest SDK, in a project under the data directory that rebuilds incrementally. Builds run one at a time. Rust that would read files or the environment while it compiles (`include!`, `include_str!`, `include_bytes!`, `env!`, `option_env!`, `#[path]`, or a module in another file) is refused; the TypeScript compiler is served only the processor and the SDK. Needs Rust and its `wasm32-unknown-unknown` target, or Node.js 20 or later with npm, on the host. Pass the module to `POST /admin/v1/wasm/runs` or `PUT /admin/v1/wasm/runs/{run}/processor`. A development feature, not for production, off unless the node's configuration sets `api.allow_wasm_builds = true`: rustc reads any file the source names while it compiles, and the guard is a denylist, so the node builds Rust only for requests from its own machine (a loopback peer, addressed to a loopback host, not relayed by a proxy) and TypeScript for any client the API admits. Without builds, build the module where the source is written and pass it.
+         */
+        post: operations["buildWasmModule"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/config/check": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Check a configuration document as `leani doctor --json` does
+         * @description Validates a posted TOML configuration without starting anything. Its relative paths resolve in a throwaway directory, and Wasm modules are not read; check those with `leani doctor` where they are installed.
+         */
+        post: operations["checkConfiguration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/config/build": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Build a node configuration from requirements
+         * @description Takes what an application needs (the processor, `keep`, `windowDays`, `follow`, `history`, `limits`, and optional `tuning`, as `leani guide config` describes) and returns a complete configuration with every setting written out, each derived one commented with its reason. History in days counts back from the newest block the node retains, and a configuration that follows the chain reuses this node's finality checkpoint.
+         */
+        post: operations["buildConfiguration"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/wasm/runs": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Run a Wasm processor over recent and live blocks
+         * @description Runs a bundled `template` or an uploaded `module` (hex), with its `params`, over the node's newest `blocks` retained recent canonical blocks (1 to 1,024, 16 by default), then, with `follow`, follows the live chain for `maxSeconds` (1 to 3,600, 600 by default). When those blocks lack material the module requires, the run fetches its own from the node's P2P peers instead: at most the last 64 blocks, then each new block, with all of each block's material of the kinds the module requires, unfiltered, so that another filter needs no new download. Nothing is persisted. At most two runs at a time and 4 MiB modules.
+         */
+        post: operations["createWasmRun"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/admin/v1/wasm/runs/{run}/processor": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The `run` id of the run's `ready` event. */
+                run: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Give a running Wasm run another processor
+         * @description Takes `module` (hex) or `template`, and `params`, as creating a run does. The run takes the newest processor it was given: it reruns the blocks it holds with it, announced by a `reset` event on its stream, and follows on with it. A processor that requires material those blocks lack makes the run open a feed of its own.
+         */
+        put: operations["swapWasmRunProcessor"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/v1/q/blobs/blocks": {
         parameters: {
             query?: never;
@@ -2041,8 +2198,8 @@ export interface components {
         ConsumerCredential: string;
         /**
          * @description Marks a mutating request without a JSON body as sent by a Leani
-         *     client. A POST or DELETE needs `content-type: application/json` or
-         *     this header, and gets HTTP 415 otherwise.
+         *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+         *     or this header, and gets HTTP 415 otherwise.
          */
         LeaniRequest: "1";
         Subscription: string;
@@ -2523,8 +2680,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -2577,8 +2734,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -2710,8 +2867,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -2815,8 +2972,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -2856,8 +3013,8 @@ export interface operations {
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3118,8 +3275,8 @@ export interface operations {
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3157,8 +3314,8 @@ export interface operations {
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3295,8 +3452,8 @@ export interface operations {
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3334,8 +3491,8 @@ export interface operations {
                 "x-leani-consumer-credential"?: components["parameters"]["ConsumerCredential"];
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3363,8 +3520,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3406,8 +3563,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3529,8 +3686,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3557,8 +3714,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3587,8 +3744,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3684,8 +3841,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3712,8 +3869,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3801,8 +3958,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3829,8 +3986,8 @@ export interface operations {
             header?: {
                 /**
                  * @description Marks a mutating request without a JSON body as sent by a Leani
-                 *     client. A POST or DELETE needs `content-type: application/json` or
-                 *     this header, and gets HTTP 415 otherwise.
+                 *     client. A POST, PUT, or DELETE needs `content-type: application/json`
+                 *     or this header, and gets HTTP 415 otherwise.
                  */
                 "x-leani-request"?: components["parameters"]["LeaniRequest"];
             };
@@ -3881,6 +4038,240 @@ export interface operations {
         responses: {
             /** @description Operational HTML network dashboard. */
             200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    getPlayground: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Operational HTML playground; its runs call the authenticated API with the visitor's token. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    listWasmTemplates: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `data`, one entry per template: its `name`, `description`, example `params`, `moduleHash` (BLAKE3) and `moduleBytes`, and the processor's `sources`: `rust`, which the module is built from, and `typescript`, the same processor in TypeScript, which publishes the same changes. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    composeWasmProcessor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description The project `name`, its `language`, the processor's `source` and its `path` (`src/lib.rs` or `assembly/index.ts`), the project's `files`, and every field the data offers (`fields`, each with `name` and whether it is `unsigned`). */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The spec is invalid; the message names the field, signature, or address. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    buildWasmModule: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `built`; when true, the `module` as hex, its `moduleHash` and `moduleBytes`; when false, the `problem` (`compile`, `toolchain`, `cargo`, `compiler`, or `timeout`) and a `message`. Either way the compiler's `diagnostics` for the source (`level`, `message`, `line`, `column`, `rendered`) and `elapsedMs`. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The source is refused; the message names the construct. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description A Rust build requested from another machine. */
+            403: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `wasm_builds_disabled`: `api.allow_wasm_builds` is off on this node. */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    checkConfiguration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `valid`, `errors`, `warnings`, the chain, and the processor instances. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `config_check_unavailable`: this server checks no configurations. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    buildConfiguration: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `toml`, `decisions` (`setting`, `value`, `because`), the `tuning` recipes applied, `warnings`, validation `errors`, and `next` commands. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The requirements cannot be met; the message says why. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `config_build_unavailable`: this server builds no configurations. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    createWasmRun: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Server-sent events: `ready` (the `run` id, `version` 1, the `manifest`, the `moduleHash`, the `window` of blocks, `fromBlock` and `toBlock`, and `feed`, `lane` or `own`), then one `block` per applied block with its changes and finality, `undo` for each reverted block, `attested` with the block (`throughBlock`, `hash`) through which applied blocks are attested, `notice`, and finally `done` with the run's summary, or `error` shaped like an error response, with code `wasm_run_failed` and the summary as its `details`. Each processor swapped in starts with `reset`, shaped like `ready`, followed by the blocks it reruns. */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "text/event-stream": string;
+                };
+            };
+            /** @description `wasm_run_capacity`: two runs are already active; retry when one ends. */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            default: components["responses"]["Error"];
+        };
+    };
+    swapWasmRunProcessor: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description The `run` id of the run's `ready` event. */
+                run: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description `version`: the run's version once it takes this processor. */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description The template, module, or its parameters are invalid; the run keeps its processor. */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `run_not_found`: no running run has this id, so start a new run. */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description `wasm_swap_capacity`: two swaps are already compiling; retry when one ends. */
+            503: {
                 headers: {
                     [name: string]: unknown;
                 };

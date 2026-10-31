@@ -3,6 +3,7 @@
 use std::{path::PathBuf, time::Duration};
 
 use clap::{Parser, Subcommand, ValueEnum};
+use serde::{Deserialize, Serialize};
 
 /// Low-storage, source-interchangeable Ethereum indexing node.
 #[derive(Clone, Debug, Parser)]
@@ -42,6 +43,7 @@ pub enum Command {
     #[command(after_help = "Examples:
   leani guide
   leani guide processors
+  leani guide config
 
 Written for agents and scripts. For tutorials and guides, see https://leani.dev/docs/.")]
     Guide {
@@ -49,16 +51,24 @@ Written for agents and scripts. For tutorials and guides, see https://leani.dev/
         #[arg(value_enum)]
         topic: Option<GuideTopic>,
     },
-    /// Create a compact configuration for a built-in processor.
+    /// Create a configuration.
+    ///
+    /// A compact one for a built-in processor; with any requirement flag,
+    /// --requirements, or --json, a full one built for what you need, each
+    /// derived setting commented with why.
     #[command(after_help = "Examples:
   leani init blocks
   leani init uniswap-v3 ETH/USDC --data-dir data
+  leani init uniswap-v3 ETH/USDC --keep window --window-days 30 --memory 1GiB --bandwidth 100
+  leani init --requirements requirements.json --json
+  leani init blocks --keep result --follow none --history-from-block 20000000
 
-Without a terminal, pass --yes only after the user has approved the checkpoint providers.")]
+`leani guide config` documents the requirements. Without a terminal, pass --yes only
+after the user has approved the checkpoint providers.")]
     Init {
-        /// Processor preset to configure.
-        #[arg(value_enum)]
-        protocol: SubscribeProtocol,
+        /// Processor preset to configure; --requirements names its own.
+        #[arg(value_enum, required_unless_present = "requirements")]
+        protocol: Option<SubscribeProtocol>,
         /// Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
@@ -84,6 +94,43 @@ Without a terminal, pass --yes only after the user has approved the checkpoint p
         /// Accept a new checkpoint provider quorum without interactive confirmation.
         #[arg(long)]
         yes: bool,
+        /// How much to keep for queries or your app.
+        #[arg(long, value_enum)]
+        keep: Option<Keep>,
+        /// Days `--keep window` keeps [default: 30].
+        #[arg(long, value_name = "DAYS")]
+        window_days: Option<u64>,
+        /// Which blocks to follow as they arrive.
+        #[arg(long, value_enum)]
+        follow: Option<Follow>,
+        /// First block to backfill.
+        #[arg(long, value_name = "BLOCK")]
+        history_from_block: Option<u64>,
+        /// Memory the node may use, such as `1GiB`.
+        #[arg(long, value_name = "BYTES")]
+        memory: Option<crate::config::HumanBytes>,
+        /// Disk the node may use, such as `20GiB`.
+        #[arg(long, value_name = "BYTES")]
+        disk: Option<crate::config::HumanBytes>,
+        /// The host's link, in megabits per second.
+        #[arg(long, value_name = "MBIT")]
+        bandwidth: Option<u64>,
+        /// Tuning recipes to apply instead of the ones the limits call for
+        /// (comma-delimited).
+        #[arg(long, value_enum, value_delimiter = ',')]
+        tuning: Vec<Recipe>,
+        /// Requirements as JSON, as `leani guide config` describes, from a
+        /// file or `-` for stdin. They replace the preset and the requirement
+        /// flags.
+        #[arg(long, value_name = "FILE", conflicts_with_all = [
+            "protocol", "targets", "keep", "window_days", "follow",
+            "history_from_block", "memory", "disk", "bandwidth", "tuning",
+        ])]
+        requirements: Option<PathBuf>,
+        /// Print what was built as JSON: the configuration, the settings it
+        /// derived and why, warnings, and next steps.
+        #[arg(long)]
+        json: bool,
     },
     /// Stream live processor output from an embedded runtime or a running node.
     #[command(after_help = "Examples:
@@ -183,6 +230,11 @@ satisfied, 130 interrupted before --once was satisfied.")]
         /// Bearer token for a running node.
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
+    },
+    /// Create Wasm processors and run them over finalized history.
+    Processor {
+        #[command(subcommand)]
+        command: ProcessorCommand,
     },
     /// Inspect or probe configured data sources.
     Source {
@@ -338,11 +390,147 @@ fn parse_duration(value: &str) -> Result<Duration, humantime::DurationError> {
     )
 }
 
+#[derive(Clone, Debug, Subcommand)]
+pub enum ProcessorCommand {
+    /// Create a Wasm processor as a Rust crate or a TypeScript package.
+    ///
+    /// The processor is generated from a spec of the onchain data to keep,
+    /// copied from a template's source, or the starter.
+    #[command(after_help = "Examples:
+  leani processor create usdc-transfers
+  leani processor create usdc-transfers --language typescript
+  leani processor create usdc-volume --spec spec.json
+  leani processor create my-decoder --template event-decoder --language typescript
+  echo '{\"data\":{\"kind\":\"blocks\"}}' | leani processor create gas --spec - --json
+
+A spec names the data and what to keep of it:
+
+  {\"name\": \"usdc-volume\",
+   \"data\": {\"kind\": \"events\", \"contracts\": [\"0xa0b8...\"],
+            \"events\": [\"Transfer(address indexed from, address indexed to, uint256 value)\"]},
+   \"keep\": {\"kind\": \"totals\", \"by\": \"to\", \"sum\": [\"value\"]}}
+
+data.kind is events, transactions (to, from, functions), or blocks; each takes
+fields to keep, all by default. keep.kind is rows or totals. The project
+carries the guest SDK of this binary: Rust builds with cargo, TypeScript (as
+AssemblyScript compiles it) with npm. `leani guide processors` describes specs
+and the processor contract.")]
+    Create {
+        /// Directory to create; its last component names the project.
+        directory: PathBuf,
+        /// The spec as JSON, or `-` for standard input.
+        #[arg(long, conflicts_with = "template")]
+        spec: Option<PathBuf>,
+        /// Start from a bundled template's source instead.
+        #[arg(long)]
+        template: Option<String>,
+        /// The language to write it in; a spec may name one.
+        #[arg(long, value_enum)]
+        language: Option<ProcessorLanguage>,
+        /// Print the result as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run a Wasm processor over finalized history and print its changes.
+    #[command(after_help = "Examples:
+  leani processor run transfers.wasm --from-block 21000000 --to-block 21000099
+  leani processor run transfers.wasm --from-block 21000000 --to-block 21000099 --param minValue=1000000000
+  leani processor run --template event-decoder --from 21000000 --to 21000009 \\
+    --params '{\"events\":[\"Transfer(address indexed from, address indexed to, uint256 value)\"]}'
+
+Each change prints as one JSON line on stdout; progress and the report go to
+stderr. Sources, chain, and finality come from the configuration file; its
+processors are ignored. Build modules with the leani-wasm-guest crate, or run
+a bundled template: block-gas, erc20-transfers, token-volume, event-decoder.")]
+    Run {
+        /// Wasm module built with leani-wasm-guest.
+        #[arg(required_unless_present = "template")]
+        module: Option<PathBuf>,
+        /// A bundled template instead of a module file; without parameters
+        /// it runs with its example parameters.
+        #[arg(long, conflicts_with = "module")]
+        template: Option<String>,
+        /// First block of the range, inclusive.
+        #[arg(long, visible_alias = "from")]
+        from_block: u64,
+        /// Last block of the range, inclusive.
+        #[arg(long, visible_alias = "to")]
+        to_block: u64,
+        /// One parameter, as KEY=VALUE (repeatable); VALUE is read as JSON when it parses, else as a string, as are integers past 2^63.
+        #[arg(long = "param", value_name = "KEY=VALUE")]
+        params: Vec<String>,
+        /// Every parameter as one JSON object; --param entries override its keys.
+        #[arg(long = "params", value_name = "JSON")]
+        params_json: Option<String>,
+        /// Keep the run's state here instead of in a temporary directory; a
+        /// later run there must use the same module, parameters, and
+        /// --from-block.
+        #[arg(long)]
+        data_dir: Option<PathBuf>,
+    },
+}
+
+/// The language `leani processor create` writes a processor in.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ProcessorLanguage {
+    /// A crate that cargo builds.
+    Rust,
+    /// A package that npm builds with the `assemblyscript` compiler.
+    Typescript,
+}
+
 /// Sections of `leani guide` beyond the overview.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum GuideTopic {
     /// Built-in processors, event decoding, backfills, and custom processors.
     Processors,
+    /// Building a node configuration from requirements with `leani init`.
+    Config,
+}
+
+/// How much a built configuration keeps.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Keep {
+    /// Everything the processor writes, for queries.
+    #[default]
+    Everything,
+    /// The last `--window-days` days, for queries.
+    Window,
+    /// The current value of each key.
+    Latest,
+    /// One result for a finite range, handed to your app.
+    Result,
+    /// Nothing to query: every change waits until your app's database
+    /// confirms it.
+    Stream,
+    /// Nothing to query: a short best-effort stream of the live head.
+    Live,
+}
+
+/// Which blocks a built configuration follows.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum Follow {
+    /// The live head, undoing blocks a reorg replaces.
+    #[default]
+    Head,
+    /// Finalized blocks only.
+    Finalized,
+    /// No live blocks: history only.
+    None,
+}
+
+/// A measured tuning recipe from the configuration guide; requirements
+/// spell it in camel case, such as `lessMemory`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize, ValueEnum)]
+#[serde(rename_all = "camelCase")]
+pub enum Recipe {
+    LimitedMemory,
+    FasterErae,
+    LessMemory,
+    TransactionsFromXatu,
+    SlowDisk,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -964,7 +1152,7 @@ mod tests {
         else {
             panic!("expected init command");
         };
-        assert_eq!(protocol, SubscribeProtocol::UniswapV3);
+        assert_eq!(protocol, Some(SubscribeProtocol::UniswapV3));
         assert_eq!(targets, ["ETH/USDC", "ETH/USDT"]);
         assert!(yes);
     }
@@ -976,6 +1164,184 @@ mod tests {
             panic!("subscribe command");
         };
         assert_eq!(finality, SubscribeFinality::Unattested);
+    }
+
+    #[test]
+    fn processor_create_takes_a_spec_or_a_template() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "processor",
+            "create",
+            "volume",
+            "--spec",
+            "-",
+            "--language",
+            "typescript",
+            "--json",
+        ])
+        .expect("CLI parses");
+        let Command::Processor {
+            command:
+                ProcessorCommand::Create {
+                    directory,
+                    spec,
+                    template,
+                    language,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected processor create command");
+        };
+        assert_eq!(directory, PathBuf::from("volume"));
+        assert_eq!(spec, Some(PathBuf::from("-")));
+        assert_eq!(template, None);
+        assert_eq!(language, Some(ProcessorLanguage::Typescript));
+        assert!(json);
+        assert!(
+            Cli::try_parse_from([
+                "leani",
+                "processor",
+                "create",
+                "x",
+                "--spec",
+                "s.json",
+                "--template",
+                "block-gas"
+            ])
+            .is_err(),
+            "a spec or a template"
+        );
+    }
+
+    #[test]
+    fn processor_run_takes_a_module_or_a_template() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "processor",
+            "run",
+            "--template",
+            "block-gas",
+            "--from",
+            "1",
+            "--to",
+            "2",
+        ])
+        .expect("CLI parses");
+        let Command::Processor {
+            command:
+                ProcessorCommand::Run {
+                    module,
+                    template,
+                    from_block,
+                    to_block,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected processor run command");
+        };
+        assert_eq!(module, None);
+        assert_eq!(template.as_deref(), Some("block-gas"));
+        assert_eq!((from_block, to_block), (1, 2));
+        assert!(
+            Cli::try_parse_from(["leani", "processor", "run", "--from", "1", "--to", "2"]).is_err(),
+            "a module or a template"
+        );
+    }
+
+    #[test]
+    fn processor_run_help_names_every_bundled_template() {
+        let mut command = <Cli as clap::CommandFactory>::command();
+        let help = command
+            .find_subcommand_mut("processor")
+            .and_then(|processor| processor.find_subcommand_mut("run"))
+            .and_then(|run| run.get_after_help().map(ToString::to_string))
+            .expect("run help");
+        let names = leani_processor_wasm::TEMPLATES
+            .map(|template| template.name)
+            .join(", ");
+        assert!(
+            help.contains(&format!("a bundled template: {names}.")),
+            "{help}"
+        );
+    }
+
+    #[test]
+    fn init_takes_requirement_flags_or_a_requirements_file() {
+        let cli = Cli::try_parse_from([
+            "leani",
+            "init",
+            "uniswap-v3",
+            "ETH/USDC",
+            "--keep",
+            "window",
+            "--window-days",
+            "30",
+            "--follow",
+            "finalized",
+            "--memory",
+            "1GiB",
+            "--bandwidth",
+            "100",
+            "--tuning",
+            "less-memory,slow-disk",
+            "--json",
+        ])
+        .expect("CLI parses");
+        let Command::Init {
+            keep,
+            window_days,
+            follow,
+            memory,
+            bandwidth,
+            tuning,
+            json,
+            ..
+        } = cli.command
+        else {
+            panic!("expected init command");
+        };
+        assert_eq!(keep, Some(Keep::Window));
+        assert_eq!(window_days, Some(30));
+        assert_eq!(follow, Some(Follow::Finalized));
+        assert_eq!(memory.map(crate::config::HumanBytes::bytes), Some(1 << 30));
+        assert_eq!(bandwidth, Some(100));
+        assert_eq!(tuning, [Recipe::LessMemory, Recipe::SlowDisk]);
+        assert!(json);
+
+        let file = Cli::try_parse_from(["leani", "init", "--requirements", "-", "--json"])
+            .expect("a requirements file needs no preset");
+        assert!(matches!(file.command, Command::Init { protocol: None, .. }));
+        assert!(
+            Cli::try_parse_from([
+                "leani",
+                "init",
+                "--requirements",
+                "r.json",
+                "--keep",
+                "live"
+            ])
+            .is_err(),
+            "the file replaces the flags"
+        );
+        assert!(
+            Cli::try_parse_from(["leani", "init"]).is_err(),
+            "a preset or a file"
+        );
+    }
+
+    #[test]
+    fn init_sizes_take_a_byte_count_or_a_unit() {
+        for (given, bytes) in [("1073741824", 1 << 30), ("512MiB", 512 << 20)] {
+            let cli =
+                Cli::try_parse_from(["leani", "init", "blocks", "--memory", given]).expect(given);
+            let Command::Init { memory, .. } = cli.command else {
+                panic!("expected init command");
+            };
+            assert_eq!(memory.map(crate::config::HumanBytes::bytes), Some(bytes));
+        }
+        assert!(Cli::try_parse_from(["leani", "init", "blocks", "--disk", "lots"]).is_err());
     }
 
     #[test]
@@ -1005,7 +1371,7 @@ mod tests {
         else {
             panic!("expected init command");
         };
-        assert_eq!(protocol, SubscribeProtocol::Blocks);
+        assert_eq!(protocol, Some(SubscribeProtocol::Blocks));
         assert!(targets.is_empty());
     }
 

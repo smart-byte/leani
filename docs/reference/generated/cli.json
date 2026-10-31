@@ -217,7 +217,8 @@
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
-              "processors"
+              "processors",
+              "config"
             ]
           },
           {
@@ -280,15 +281,15 @@
       },
       {
         "name": "init",
-        "about": "Create a compact configuration for a built-in processor",
-        "usage": "Usage: leani init [OPTIONS] <PROTOCOL> [TARGET]...",
+        "about": "Create a configuration",
+        "usage": "Usage: leani init [OPTIONS] [PROTOCOL] [TARGET]...",
         "arguments": [
           {
             "id": "protocol",
             "long": null,
             "short": null,
-            "help": "Processor preset to configure",
-            "required": true,
+            "help": "Processor preset to configure; --requirements names its own",
+            "required": false,
             "action": "Set",
             "defaultValues": [],
             "possibleValues": [
@@ -347,6 +348,128 @@
             "long": "yes",
             "short": null,
             "help": "Accept a new checkpoint provider quorum without interactive confirmation",
+            "required": false,
+            "action": "SetTrue",
+            "defaultValues": [
+              "false"
+            ],
+            "possibleValues": [
+              "true",
+              "false"
+            ]
+          },
+          {
+            "id": "keep",
+            "long": "keep",
+            "short": null,
+            "help": "How much to keep for queries or your app",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "everything",
+              "window",
+              "latest",
+              "result",
+              "stream",
+              "live"
+            ]
+          },
+          {
+            "id": "window_days",
+            "long": "window-days",
+            "short": null,
+            "help": "Days `--keep window` keeps [default: 30]",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "follow",
+            "long": "follow",
+            "short": null,
+            "help": "Which blocks to follow as they arrive",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": [
+              "head",
+              "finalized",
+              "none"
+            ]
+          },
+          {
+            "id": "history_from_block",
+            "long": "history-from-block",
+            "short": null,
+            "help": "First block to backfill",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "memory",
+            "long": "memory",
+            "short": null,
+            "help": "Memory the node may use, such as `1GiB`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "disk",
+            "long": "disk",
+            "short": null,
+            "help": "Disk the node may use, such as `20GiB`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "bandwidth",
+            "long": "bandwidth",
+            "short": null,
+            "help": "The host's link, in megabits per second",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "tuning",
+            "long": "tuning",
+            "short": null,
+            "help": "Tuning recipes to apply instead of the ones the limits call for (comma-delimited)",
+            "required": false,
+            "action": "Append",
+            "defaultValues": [],
+            "possibleValues": [
+              "limited-memory",
+              "faster-erae",
+              "less-memory",
+              "transactions-from-xatu",
+              "slow-disk"
+            ]
+          },
+          {
+            "id": "requirements",
+            "long": "requirements",
+            "short": null,
+            "help": "Requirements as JSON, as `leani guide config` describes, from a file or `-` for stdin. They replace the preset and the requirement flags",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "json",
+            "long": "json",
+            "short": null,
+            "help": "Print what was built as JSON: the configuration, the settings it derived and why, warnings, and next steps",
             "required": false,
             "action": "SetTrue",
             "defaultValues": [
@@ -1106,6 +1229,353 @@
           }
         ],
         "subcommands": []
+      },
+      {
+        "name": "processor",
+        "about": "Create Wasm processors and run them over finalized history",
+        "usage": "Usage: leani processor [OPTIONS] <COMMAND>",
+        "arguments": [
+          {
+            "id": "config",
+            "long": "config",
+            "short": null,
+            "help": "Path to the versioned TOML configuration",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "log_format",
+            "long": "log-format",
+            "short": null,
+            "help": "Log rendering format",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "pretty"
+            ],
+            "possibleValues": [
+              "pretty",
+              "json"
+            ]
+          },
+          {
+            "id": "log_filter",
+            "long": "log-filter",
+            "short": null,
+            "help": "Tracing filter, e.g. `info,leani=debug`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "help",
+            "long": "help",
+            "short": "h",
+            "help": "Print help (see more with '--help')",
+            "required": false,
+            "action": "Help",
+            "defaultValues": [],
+            "possibleValues": []
+          },
+          {
+            "id": "version",
+            "long": "version",
+            "short": "V",
+            "help": "Print version",
+            "required": false,
+            "action": "Version",
+            "defaultValues": [],
+            "possibleValues": []
+          }
+        ],
+        "subcommands": [
+          {
+            "name": "create",
+            "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+            "usage": "Usage: leani processor create [OPTIONS] <DIRECTORY>",
+            "arguments": [
+              {
+                "id": "directory",
+                "long": null,
+                "short": null,
+                "help": "Directory to create; its last component names the project",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "spec",
+                "long": "spec",
+                "short": null,
+                "help": "The spec as JSON, or `-` for standard input",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "template",
+                "long": "template",
+                "short": null,
+                "help": "Start from a bundled template's source instead",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "language",
+                "long": "language",
+                "short": null,
+                "help": "The language to write it in; a spec may name one",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": [
+                  "rust",
+                  "typescript"
+                ]
+              },
+              {
+                "id": "json",
+                "long": "json",
+                "short": null,
+                "help": "Print the result as JSON",
+                "required": false,
+                "action": "SetTrue",
+                "defaultValues": [
+                  "false"
+                ],
+                "possibleValues": [
+                  "true",
+                  "false"
+                ]
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "run",
+            "about": "Run a Wasm processor over finalized history and print its changes",
+            "usage": "Usage: leani processor run [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK> [MODULE]",
+            "arguments": [
+              {
+                "id": "module",
+                "long": null,
+                "short": null,
+                "help": "Wasm module built with leani-wasm-guest",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "template",
+                "long": "template",
+                "short": null,
+                "help": "A bundled template instead of a module file; without parameters it runs with its example parameters",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "from_block",
+                "long": "from-block",
+                "short": null,
+                "help": "First block of the range, inclusive",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "to_block",
+                "long": "to-block",
+                "short": null,
+                "help": "Last block of the range, inclusive",
+                "required": true,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "params",
+                "long": "param",
+                "short": null,
+                "help": "One parameter, as KEY=VALUE (repeatable); VALUE is read as JSON when it parses, else as a string, as are integers past 2^63",
+                "required": false,
+                "action": "Append",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "params_json",
+                "long": "params",
+                "short": null,
+                "help": "Every parameter as one JSON object; --param entries override its keys",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "data_dir",
+                "long": "data-dir",
+                "short": null,
+                "help": "Keep the run's state here instead of in a temporary directory; a later run there must use the same module, parameters, and --from-block",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "config",
+                "long": "config",
+                "short": null,
+                "help": "Path to the versioned TOML configuration",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "log_format",
+                "long": "log-format",
+                "short": null,
+                "help": "Log rendering format",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [
+                  "pretty"
+                ],
+                "possibleValues": [
+                  "pretty",
+                  "json"
+                ]
+              },
+              {
+                "id": "log_filter",
+                "long": "log-filter",
+                "short": null,
+                "help": "Tracing filter, e.g. `info,leani=debug`",
+                "required": false,
+                "action": "Set",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "help",
+                "long": "help",
+                "short": "h",
+                "help": "Print help (see more with '--help')",
+                "required": false,
+                "action": "Help",
+                "defaultValues": [],
+                "possibleValues": []
+              },
+              {
+                "id": "version",
+                "long": "version",
+                "short": "V",
+                "help": "Print version",
+                "required": false,
+                "action": "Version",
+                "defaultValues": [],
+                "possibleValues": []
+              }
+            ],
+            "subcommands": []
+          },
+          {
+            "name": "help",
+            "about": "Print this message or the help of the given subcommand(s)",
+            "usage": "Usage: leani processor help [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+                "usage": "Usage: leani processor help create",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "run",
+                "about": "Run a Wasm processor over finalized history and print its changes",
+                "usage": "Usage: leani processor help run",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "help",
+                "about": "Print this message or the help of the given subcommand(s)",
+                "usage": "Usage: leani processor help help",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
+          }
+        ]
       },
       {
         "name": "source",
@@ -4143,7 +4613,7 @@
           },
           {
             "name": "init",
-            "about": "Create a compact configuration for a built-in processor",
+            "about": "Create a configuration",
             "usage": "Usage: leani help init",
             "arguments": [],
             "subcommands": []
@@ -4183,6 +4653,28 @@
             "usage": "Usage: leani help backfill",
             "arguments": [],
             "subcommands": []
+          },
+          {
+            "name": "processor",
+            "about": "Create Wasm processors and run them over finalized history",
+            "usage": "Usage: leani help processor [COMMAND]",
+            "arguments": [],
+            "subcommands": [
+              {
+                "name": "create",
+                "about": "Create a Wasm processor as a Rust crate or a TypeScript package",
+                "usage": "Usage: leani help processor create",
+                "arguments": [],
+                "subcommands": []
+              },
+              {
+                "name": "run",
+                "about": "Run a Wasm processor over finalized history and print its changes",
+                "usage": "Usage: leani help processor run",
+                "arguments": [],
+                "subcommands": []
+              }
+            ]
           },
           {
             "name": "source",

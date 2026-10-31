@@ -11,7 +11,9 @@ The release-candidate libraries use matching, exact dependency versions.
 See [build a custom node](https://leani.dev/docs/guides/custom-processor/) for
 the implementation contract and a complete integration example. Running a
 custom native processor currently requires compiling it into a custom Leani
-node; this crate does not provide dynamic loading into the prebuilt binary.
+node; this crate does not provide dynamic loading into the prebuilt binary. To
+run your own processor in the prebuilt binary, write it as a sandboxed Wasm
+module instead: see [Wasm processors](https://leani.dev/docs/guides/wasm-processors/).
 
 ## Changes and mutations
 

@@ -1,6 +1,6 @@
 ---
 name: leani
-description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing a custom Rust processor when none fits, which is the normal way to get data the built-ins do not provide.
+description: Runs, queries, and extends leani (leani.dev), a self-hosted Ethereum indexing node and CLI. It follows Mainnet blocks over P2P with no API key, backfills historical ranges, and turns blocks, transactions, and logs into application data through processors, served over a local HTTP API, TypeScript SDK, and JSON-RPC subset. Use this skill whenever a task mentions leani, the `leani` command, a leani.toml, leani.dev, or @smart-byte/leani-sdk, or asks to answer a question from live or historical Ethereum data without a hosted RPC provider. Covers choosing a built-in processor and writing your own processor, as Wasm or native Rust, when none fits, which is the normal way to get data the built-ins do not provide.
 license: MIT
 ---
 
@@ -10,7 +10,7 @@ Leani is an Ethereum Mainnet indexing node you run yourself. It verifies
 consensus with a light client, reads execution data from P2P peers or public
 datasets, runs *processors* that turn blocks into application data, and keeps
 only their results. One binary provides the CLI, the node (`leani serve`), a
-native HTTP API with streaming, and a JSON-RPC subset. It is alpha software.
+native HTTP API with streaming, and a JSON-RPC subset.
 
 The binary carries this guide for its own release: `leani guide` prints it and
 `leani guide processors` prints the processor reference. A skill copy can be
@@ -42,8 +42,10 @@ keeps only the result the question needs. Work in this order:
      such `log0` data only raw);
    - a typed query route of its own.
 
-   Start from the maintained example, as section 4 of the processor
-   reference describes.
+   `leani processor create --spec` generates a Wasm processor from a spec of the
+   data to keep, in Rust or, with `--language typescript`, TypeScript, which the
+   stock binary runs; a native Rust processor starts from the maintained
+   example. Section 4 of the processor reference describes both.
 3. **Backfill the range, serve, and query.** Check coverage before you report
    a number.
 
@@ -125,6 +127,17 @@ Index contract events or another historical range: read
 first. It covers choosing a built-in processor, the event-decoding
 configuration and its limits, backfills, coverage checks, and custom Rust
 processors.
+
+Configure a node for stated needs, such as "keep 30 days of these events on a
+1 GiB host": let `leani init` build the configuration from requirements, with
+flags or JSON for any processor, rather than editing settings by hand.
+[references/configuration.md](references/configuration.md)
+(`leani guide config`) describes the requirements and the report `--json`
+prints:
+
+```bash
+leani init uniswap-v3 ETH/USDC --keep window --window-days 30 --memory 1GiB --yes --json
+```
 
 ## HTTP API and SDK
 

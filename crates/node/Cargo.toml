@@ -34,6 +34,7 @@ leani-processor-evm-events = { path = "../processor-evm-events" }
 leani-processor-rollup-txs = { path = "../processor-rollup-txs" }
 leani-processor-transaction-stats = { path = "../processor-transaction-stats" }
 leani-processor-uniswap = { path = "../processor-uniswap" }
+leani-processor-wasm = { path = "../processor-wasm" }
 leani-rpc = { path = "../rpc" }
 leani-runtime = { path = "../runtime" }
 leani-source-api = { path = "../source-api" }
@@ -48,15 +49,20 @@ leani-testkit = { path = "../testkit" }
 postcard.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 serde.workspace = true
+semver.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["process"] }
 tokio-util.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+# Ends a Wasm build's whole process group: cargo's rustc, npm's scripts.
+rustix = { version = "1.1.4", features = ["process"] }
 
 [dev-dependencies]
 jsonschema = { version = "0.59.0", default-features = false }

@@ -21,7 +21,7 @@ export interface ExampleDefinition {
 export const examples = [
   {
     id: 'source-install',
-    title: 'Build the alpha from source',
+    title: 'Build from source',
     description: 'Build the pinned workspace and use its binary in this terminal.',
     language: 'shell',
     source: { file: 'examples/fixture-quickstart/snippets.sh', region: 'source-install' },

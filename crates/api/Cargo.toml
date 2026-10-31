@@ -23,12 +23,15 @@ leani-processor-block-summary = { path = "../processor-block-summary" }
 leani-processor-blobs = { path = "../processor-blobs" }
 leani-processor-erc20 = { path = "../processor-erc20" }
 leani-processor-uniswap = { path = "../processor-uniswap" }
+leani-processor-wasm = { path = "../processor-wasm" }
 leani-source-api = { path = "../source-api" }
 leani-store-history = { path = "../store-history" }
 leani-store-sqlite = { path = "../store-sqlite" }
 postcard.workspace = true
+semver.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tempfile.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
@@ -36,7 +39,6 @@ tracing.workspace = true
 
 [dev-dependencies]
 leani-testkit = { path = "../testkit" }
-tempfile.workspace = true
 tower.workspace = true
 
 [lints]

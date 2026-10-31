@@ -1445,6 +1445,7 @@ fn normalize_generic_frames(
     }
     let effective = inputs.filters.effective_scope();
     let mut frames = Vec::with_capacity(expected);
+    let mut hole = None;
     for number in inputs.range.iter() {
         let execution = inputs
             .execution_blocks
@@ -1495,12 +1496,15 @@ fn normalize_generic_frames(
                 Material::Missing(MissingReason::NotRequested),
             ),
             GenericProjectionKind::Transactions => {
-                validate_row_indices(
+                if let Err(error) = validate_row_indices(
                     XatuTable::CanonicalExecutionTransaction,
                     number,
                     inputs.row_indices.remove(&number.0).unwrap_or_default(),
                     Some(beacon.transaction_count),
-                )?;
+                ) {
+                    hole = Some(extend_hole(hole, error)?);
+                    continue;
+                }
                 // Each selected transaction is one of those rows.
                 let mut values = inputs.transactions.remove(&number.0).unwrap_or_default();
                 values.sort_by_key(|transaction| transaction.index);
@@ -1540,16 +1544,23 @@ fn normalize_generic_frames(
             }
             GenericProjectionKind::Logs => {
                 let indices = inputs.row_indices.remove(&number.0).unwrap_or_default();
-                if indices.is_empty() && beacon.transaction_count >= LOGLESS_BLOCK_TRANSACTIONS {
-                    return Err(XatuError::IncompleteLogs {
+                let complete = if indices.is_empty()
+                    && beacon.transaction_count >= LOGLESS_BLOCK_TRANSACTIONS
+                {
+                    Err(XatuError::IncompleteLogs {
                         range: BlockRange::single(number),
                         detail: format!(
                             "block {number} holds {} transactions but no log row",
                             beacon.transaction_count
                         ),
-                    });
+                    })
+                } else {
+                    validate_row_indices(XatuTable::CanonicalExecutionLogs, number, indices, None)
+                };
+                if let Err(error) = complete {
+                    hole = Some(extend_hole(hole, error)?);
+                    continue;
                 }
-                validate_row_indices(XatuTable::CanonicalExecutionLogs, number, indices, None)?;
                 let mut values = inputs.logs.remove(&number.0).unwrap_or_default();
                 values.sort_by_key(|log| log.log_index);
                 (
@@ -1584,7 +1595,44 @@ fn normalize_generic_frames(
             verification: VerificationReport::default(),
         });
     }
-    Ok(frames)
+    hole.map_or(Ok(frames), Err)
+}
+
+/// Extend `hole`, a chunk's first block that misses rows, through `next`, a
+/// later one. Normalization checks every block of the chunk, so the error
+/// names a whole hole and the next source serves it in one pass. Any other
+/// error is returned as is.
+fn extend_hole(hole: Option<XatuError>, next: XatuError) -> Result<XatuError, XatuError> {
+    let (end, more_expected, more_actual) = match &next {
+        XatuError::IncompleteRange {
+            range,
+            expected,
+            actual,
+            ..
+        } => (range.end(), *expected, *actual),
+        XatuError::IncompleteLogs { range, .. } => (range.end(), 0, 0),
+        _ => return Err(next),
+    };
+    let through = |range: BlockRange| BlockRange::new(range.start(), end).unwrap_or(range);
+    Ok(match hole {
+        None => next,
+        Some(XatuError::IncompleteRange {
+            table,
+            range,
+            expected,
+            actual,
+        }) => XatuError::IncompleteRange {
+            table,
+            range: through(range),
+            expected: expected.saturating_add(more_expected),
+            actual: actual.saturating_add(more_actual),
+        },
+        Some(XatuError::IncompleteLogs { range, detail }) => XatuError::IncompleteLogs {
+            range: through(range),
+            detail,
+        },
+        Some(other) => other,
+    })
 }
 
 /// Check the indices of every row a block's `table` holds, read before any
@@ -2028,6 +2076,7 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
         ..FilterScope::default()
     };
     let mut frames = Vec::with_capacity(expected);
+    let mut hole = None;
     for number in range.iter() {
         let execution = execution_blocks
             .get(&number.0)
@@ -2060,12 +2109,14 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
             .filter(|transaction| execution_transactions.contains_key(&transaction.hash))
             .count();
         if joined != block_transactions.len() {
-            return Err(XatuError::IncompleteRange {
+            let missing = XatuError::IncompleteRange {
                 table: XatuTable::CanonicalExecutionTransaction,
                 range: BlockRange::single(number),
                 expected: block_transactions.len(),
                 actual: joined,
-            });
+            };
+            hole = Some(extend_hole(hole, missing)?);
+            continue;
         }
         let mut transactions = Vec::with_capacity(block_transactions.len());
         let mut receipts = Vec::with_capacity(block_transactions.len());
@@ -2184,6 +2235,9 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
             provenance: provenance.to_vec(),
             verification: VerificationReport::default(),
         });
+    }
+    if let Some(hole) = hole {
+        return Err(hole);
     }
     if !transactions_by_slot.is_empty() {
         return Err(XatuError::Data(
@@ -3206,6 +3260,100 @@ mod tests {
             generic_transaction_frames(&senders, 2, &[2], &[2]).is_err(),
             "an index outside the payload"
         );
+    }
+
+    /// Normalize a chunk from block 40: block `40 + i` holds `blocks[i].0`
+    /// payload transactions and rows at `blocks[i].1`.
+    fn generic_chunk_frames(
+        kind: GenericProjectionKind,
+        blocks: &[(u32, &[u32])],
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let numbers = (40_u64..).zip(blocks);
+        let hash = |number| BlockHash::new([u8::try_from(number).unwrap_or(u8::MAX); 32]);
+        let last = numbers.clone().last().map_or(40, |(number, _)| number);
+        normalize_generic_frames(GenericNormalizationInputs {
+            range: BlockRange::new(BlockNumber(40), BlockNumber(last)).expect("range"),
+            kind,
+            include_header: false,
+            filters: &FilterSet::default(),
+            execution_blocks: &numbers
+                .clone()
+                .map(|(number, _)| {
+                    let row = GenericExecutionBlockRow {
+                        hash: hash(number),
+                        timestamp: 1_700_000_000,
+                    };
+                    (number, row)
+                })
+                .collect(),
+            beacon_blocks: &numbers
+                .clone()
+                .map(|(number, (transaction_count, _))| {
+                    let row = GenericBeaconBlockRow {
+                        hash: hash(number),
+                        parent_hash: BlockHash::ZERO,
+                        timestamp: 1_700_000_000,
+                        transaction_count: *transaction_count,
+                        gas_limit: 30_000_000,
+                        gas_used: 21_000,
+                        base_fee_per_gas: quantity_from_u64(7),
+                        blob_gas_used: None,
+                        excess_blob_gas: None,
+                    };
+                    (number, row)
+                })
+                .collect(),
+            row_indices: numbers
+                .map(|(number, (_, rows))| (number, rows.to_vec()))
+                .collect(),
+            transactions: BTreeMap::new(),
+            receipts: None,
+            logs: BTreeMap::new(),
+            provenance: &[],
+        })
+    }
+
+    #[test]
+    fn a_hole_names_every_block_from_its_first_to_its_last() {
+        let range =
+            |start, end| BlockRange::new(BlockNumber(start), BlockNumber(end)).expect("range");
+        let missing_transactions = |range, expected, actual| XatuError::IncompleteRange {
+            table: XatuTable::CanonicalExecutionTransaction,
+            range,
+            expected,
+            actual,
+        };
+        let (full, none): (&[u32], &[u32]) = (&[0, 1], &[]);
+        for (blocks, hole) in [
+            (
+                [(2, full), (2, none), (2, none), (2, full)],
+                missing_transactions(range(41, 42), 4, 0),
+            ),
+            (
+                [(2, full), (2, full), (2, none), (2, none)],
+                missing_transactions(range(42, 43), 4, 0),
+            ),
+            // Complete blocks between incomplete ones.
+            (
+                [(2, none), (2, full), (2, &[1][..]), (2, full)],
+                missing_transactions(range(40, 42), 4, 1),
+            ),
+        ] {
+            assert_eq!(
+                generic_chunk_frames(GenericProjectionKind::Transactions, &blocks).err(),
+                Some(hole),
+                "{blocks:?}"
+            );
+        }
+        // A block without log rows, then one with a gap in them.
+        let many = LOGLESS_BLOCK_TRANSACTIONS;
+        assert!(matches!(
+            generic_chunk_frames(
+                GenericProjectionKind::Logs,
+                &[(many, full), (many, none), (many, &[0, 2]), (many, full)],
+            ),
+            Err(XatuError::IncompleteLogs { range: hole, .. }) if hole == range(41, 42)
+        ));
     }
 
     /// Parse `batch` for block 42, whose payload holds three transactions,
@@ -4286,6 +4434,104 @@ mod tests {
             ))),
             provenance: &[],
         })
+    }
+
+    /// Normalize `blocks` blocks from Dencun block 19,426,589, each with one
+    /// blob transaction and a full withdrawal payload; the transactions of
+    /// the blocks at offsets in `missing` lack their execution row.
+    fn blob_chunk_frames(blocks: u64, missing: &[u64]) -> Result<Vec<BlockFrame>, XatuError> {
+        let mut execution_blocks = BTreeMap::new();
+        let mut beacon_blocks = BTreeMap::new();
+        let mut beacon_transactions = Vec::new();
+        let mut transaction_sizes = BTreeMap::new();
+        let mut withdrawals = BTreeMap::new();
+        let mut execution_transactions = BTreeMap::new();
+        for offset in 0..blocks {
+            let number = DENCUN_BLOCK + offset;
+            let slot = DENCUN_SLOT + offset;
+            let byte = u8::try_from(offset).expect("offset");
+            let (mut execution, mut beacon) = dencun_blocks(BlockHash::new([byte; 32]));
+            execution.number = number;
+            beacon.number = number;
+            beacon.slot = slot;
+            beacon.transaction_count = 1;
+            beacon.transactions_total_bytes = 150;
+            execution_blocks.insert(number, execution);
+            beacon_blocks.insert(number, beacon);
+            let hash = TransactionHash::new([0x30 + byte; 32]);
+            beacon_transactions.push(BeaconTransactionRow {
+                slot,
+                index: 0,
+                hash,
+                from: Address::new([0x44; 20]),
+                to: Some(Address::new([0x55; 20])),
+                gas_limit: 21_000,
+                size_bytes: 150,
+                blob_gas: 131_072,
+                max_fee_per_blob_gas: quantity_from_u64(1),
+                blob_hashes: vec![BlockHash::new([0x66; 32])],
+            });
+            transaction_sizes.insert(
+                slot,
+                vec![TransactionSizeRow {
+                    transaction_type: 3,
+                    size_bytes: 150,
+                }],
+            );
+            let payload = dencun_withdrawals(16)
+                .into_iter()
+                .map(|row| WithdrawalRow {
+                    index: row.index + 16 * offset,
+                    ..row
+                })
+                .collect::<Vec<_>>();
+            withdrawals.insert(slot, payload);
+            if !missing.contains(&offset) {
+                let row = ExecutionTransactionRow {
+                    block_number: number,
+                    index: 0,
+                    hash,
+                    nonce: 7,
+                    value: quantity_from_u64(0),
+                    gas_used: 21_000,
+                    gas_price: quantity_from_u64(1),
+                    success: true,
+                };
+                execution_transactions.insert(hash, row);
+            }
+        }
+        normalize_frames(NormalizationInputs {
+            range: BlockRange::new(
+                BlockNumber(DENCUN_BLOCK),
+                BlockNumber(DENCUN_BLOCK + blocks - 1),
+            )
+            .expect("range"),
+            execution_blocks: &execution_blocks,
+            beacon_blocks: &beacon_blocks,
+            beacon_transactions,
+            transaction_sizes: &transaction_sizes,
+            withdrawals: &withdrawals,
+            execution_transactions: &execution_transactions,
+            provenance: &[],
+        })
+    }
+
+    #[test]
+    fn a_blob_hole_names_every_block_from_its_first_to_its_last() {
+        assert_eq!(blob_chunk_frames(4, &[]).map(|frames| frames.len()), Ok(4));
+        let block = |offset| BlockNumber(DENCUN_BLOCK + offset);
+        for (missing, first, last) in [(&[1, 2], 1, 2), (&[2, 3], 2, 3)] {
+            assert_eq!(
+                blob_chunk_frames(4, missing).err(),
+                Some(XatuError::IncompleteRange {
+                    table: XatuTable::CanonicalExecutionTransaction,
+                    range: BlockRange::new(block(first), block(last)).expect("range"),
+                    expected: 2,
+                    actual: 0,
+                }),
+                "{missing:?}"
+            );
+        }
     }
 
     #[test]
