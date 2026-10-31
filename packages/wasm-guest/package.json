@@ -1,0 +1,15 @@
+{
+  "name": "@smart-byte/leani-wasm-guest",
+  "version": "0.1.0",
+  "description": "Write Leani processors in TypeScript (AssemblyScript) and run them as sandboxed Wasm modules",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "files": ["assembly", "build.mjs", "README.md", "LICENSE"],
+  "devDependencies": {
+    "assemblyscript": "0.28.20"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

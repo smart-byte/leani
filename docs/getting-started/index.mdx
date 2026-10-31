@@ -1,6 +1,6 @@
 ---
 title: Follow your first Ethereum block
-description: Install the alpha, read a real Ethereum block, and prepare a node for your application.
+description: Install Leani, read a real Ethereum block, and prepare a node for your application.
 section: getting-started
 order: 10
 audience:
@@ -12,7 +12,7 @@ status: preview
 import { Aside } from '@astrojs/starlight/components';
 import CodeExample from '@docs/components/docs/CodeExample.astro';
 
-[Install the current alpha](/docs/getting-started/install/) first. This example
+[Install the current release](/docs/getting-started/install/) first. This example
 follows real Ethereum Mainnet blocks with no API key and no configuration file.
 Run it from a fresh directory:
 
@@ -69,8 +69,9 @@ data directory separate; do not start two nodes against the same writable data.
 
 - [Index a small historical range](/docs/getting-started/bounded-mainnet/) to query decoded contract events.
 - [Query and follow with TypeScript](/docs/guides/query-then-follow/) to seed application state.
+- [Run your own processor as Wasm](/docs/guides/wasm-processors/), in Rust or TypeScript, in the stock binary.
 - [Build a custom processor in Rust](/docs/guides/custom-processor/) to run your own transformation using the Leani library.
 
 For startup diagnostics and all CLI fields, see
 [block subscriptions](/docs/guides/live-block-subscriptions/). Read
-[alpha limitations](/docs/operations/preview-limitations/) before connecting production applications.
+[known limitations](/docs/operations/preview-limitations/) before connecting production applications.

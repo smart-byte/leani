@@ -3,6 +3,8 @@
 mod browser_guard;
 mod extension;
 mod extensions;
+mod playground;
+mod wasm_runs;
 
 pub use extension::{
     QueryContext, QueryExtension, QueryExtensionRegistration, QueryExtensionSummary,
@@ -280,7 +282,56 @@ pub struct ApiConfig {
     /// then end cleanly, so the shutdown need not wait for their clients,
     /// which reconnect from their last cursor.
     pub shutdown: CancellationToken,
+    /// The live lane's committed blocks, which ad-hoc Wasm runs follow; without
+    /// them, runs that ask to follow are refused.
+    pub live_events: Option<tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>>,
+    /// Checks a configuration document as `leani doctor --json` does; the
+    /// node binary supplies it. Without it, the check endpoint answers 503.
+    pub config_check: Option<ConfigCheck>,
+    /// Builds a configuration from requirements, given the chain head when
+    /// the node retains blocks; the node binary supplies it. Without it, the
+    /// build endpoint answers 503.
+    pub config_build: Option<ConfigBuild>,
+    /// Builds a processor's Rust or TypeScript source into a Wasm module on
+    /// the node's host; the node binary supplies it when `api.allow_wasm_builds`
+    /// is set. Without it, the build endpoint answers 409.
+    pub wasm_build: Option<WasmBuild>,
+    /// Opens a feed of the material one processor needs from the node's live
+    /// source, for ad-hoc Wasm runs whose material the live lane lacks; the
+    /// node binary supplies it.
+    pub live_feed: Option<LiveFeed>,
 }
+
+pub type ConfigCheck = Arc<dyn Fn(&str) -> serde_json::Value + Send + Sync>;
+
+/// `Err` says why the requirements cannot be met.
+pub type ConfigBuild =
+    Arc<dyn Fn(&serde_json::Value, Option<u64>) -> Result<serde_json::Value, String> + Send + Sync>;
+
+/// A source that does not compile is `Ok`, with its diagnostics; `Err` says
+/// why the source is refused.
+pub type WasmBuild = Arc<
+    dyn Fn(
+            String,
+            leani_processor_wasm::scaffold::Language,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<serde_json::Value, String>> + Send>,
+        > + Send
+        + Sync,
+>;
+
+/// The feed ends when its token is cancelled.
+pub type LiveFeed = Arc<
+    dyn Fn(
+            Arc<dyn Processor>,
+            leani_source_api::LiveStart,
+            CancellationToken,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<leani_source_api::ChainEventStream, leani_source_api::SourceError>,
+        > + Send
+        + Sync,
+>;
 
 impl Default for ApiConfig {
     fn default() -> Self {
@@ -308,6 +359,11 @@ impl Default for ApiConfig {
             backfill_control: None,
             raw_history_control: None,
             shutdown: CancellationToken::new(),
+            live_events: None,
+            config_check: None,
+            config_build: None,
+            wasm_build: None,
+            live_feed: None,
         }
     }
 }
@@ -357,6 +413,23 @@ impl std::fmt::Debug for ApiConfig {
                 &self.raw_history_control.as_ref().map(|_| "[AVAILABLE]"),
             )
             .field("shutdown", &self.shutdown.is_cancelled())
+            .field(
+                "live_events",
+                &self.live_events.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "config_check",
+                &self.config_check.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "config_build",
+                &self.config_build.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "wasm_build",
+                &self.wasm_build.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field("live_feed", &self.live_feed.as_ref().map(|_| "[AVAILABLE]"))
             .finish()
     }
 }
@@ -909,6 +982,7 @@ struct ApiState {
     capabilities: Arc<CapabilitiesResponse>,
     config: ApiConfig,
     started: Instant,
+    wasm_runs: wasm_runs::Runs,
 }
 
 impl std::fmt::Debug for ApiState {
@@ -1162,11 +1236,38 @@ pub fn router_with_processors(
         capabilities: cached_capabilities,
         config,
         started: Instant::now(),
+        wasm_runs: wasm_runs::Runs::default(),
     };
     let protected = Router::new()
         .route("/v1/status", get(status))
         .route("/v1/capabilities", get(capabilities))
         .route("/v1/processors", get(list_processors))
+        .route("/v1/wasm/templates", get(wasm_runs::templates))
+        .route("/v1/wasm/compose", axum::routing::post(wasm_runs::compose))
+        .route(
+            "/admin/v1/wasm/build",
+            axum::routing::post(wasm_runs::build_module),
+        )
+        .route(
+            "/admin/v1/config/check",
+            axum::routing::post(playground::check_config),
+        )
+        .route(
+            "/admin/v1/config/build",
+            axum::routing::post(playground::build_config),
+        )
+        .route(
+            "/admin/v1/wasm/runs",
+            axum::routing::post(wasm_runs::start_run).layer(axum::extract::DefaultBodyLimit::max(
+                wasm_runs::MAX_REQUEST_BYTES,
+            )),
+        )
+        .route(
+            "/admin/v1/wasm/runs/{run}/processor",
+            axum::routing::put(wasm_runs::swap_processor).layer(
+                axum::extract::DefaultBodyLimit::max(wasm_runs::MAX_REQUEST_BYTES),
+            ),
+        )
         .route("/v1/processors/{processor}/status", get(processor_status))
         .route("/v1/processors/{processor}/schema", get(processor_schema))
         .route(
@@ -1346,6 +1447,7 @@ pub fn router_with_processors(
         .route("/health/ready", get(readiness))
         .route("/v1/network/status", get(network_status))
         .route("/debug/network", get(network_dashboard))
+        .route("/playground", get(playground::page))
         .route("/metrics", get(metrics))
         .with_state(state);
     Ok(operational
@@ -9422,6 +9524,7 @@ mod tests {
             query_extensions,
             config: ApiConfig::default(),
             started: Instant::now(),
+            wasm_runs: wasm_runs::Runs::default(),
         };
         let cursor =
             encode_stream_cursor(&state, processor.as_ref(), "history-a", 42).expect("cursor");
@@ -10075,6 +10178,7 @@ mod tests {
             query_extensions,
             config: ApiConfig::default(),
             started: Instant::now(),
+            wasm_runs: wasm_runs::Runs::default(),
         };
         let first = QueryContext::new(state.clone(), processor.clone(), Arc::from("orders-v1"));
         let second = QueryContext::new(state, processor, Arc::from("orders-v2"));

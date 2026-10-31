@@ -5,6 +5,7 @@ mod block_summaries;
 mod builtin_processors;
 pub mod cli;
 pub mod config;
+mod config_builder;
 mod guide;
 mod init;
 mod local_state;
@@ -12,6 +13,7 @@ pub mod process;
 pub mod processors;
 mod subscribe;
 mod uniswap_markets;
+mod wasm_build;
 
 pub use cli::{Cli, Command};
 pub use config::{Config, ConfigError, ProcessorConfig, ValidatedConfig};

@@ -8,6 +8,97 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Wasm processors: write a processor in Rust with the new `leani-wasm-guest`
+  crate, compile it to `wasm32-unknown-unknown`, and run it in the stock
+  binary without rebuilding the node. Configure it as a `wasm` processor with
+  `settings.module`, or run it once over finalized history with
+  `leani processor run`. Modules run in the wasmi interpreter, sandboxed and
+  metered, in a fresh instance per call that sees only the material its
+  manifest requires; their code hash is the module's BLAKE3 hash. Native
+  processors are unchanged. The binary ships four example modules as
+  templates, among them an event decoder that decodes any contract's events
+  from their Solidity signatures with the SDK's `solidity` module.
+  See [Wasm processors](docs/guides/wasm-processors.mdx).
+- Wasm processors in TypeScript: `packages/wasm-guest`, a TypeScript guest SDK
+  compiled with AssemblyScript, implements the ABI of `leani-wasm-guest`, and
+  every example processor has a TypeScript twin that publishes exactly its
+  Rust original's changes.
+- Ad-hoc Wasm runs: `POST /admin/v1/wasm/runs` streams a template or an
+  uploaded module over the node's recent blocks and, optionally, its live
+  ones, and `GET /v1/wasm/templates` lists the templates with their Rust and
+  TypeScript sources. A run whose material the live lane lacks fetches its
+  own from the node's P2P peers, for at most its last 64 blocks and then new
+  ones. A running run takes another module or other parameters
+  (`PUT /admin/v1/wasm/runs/{run}/processor`), reruns the blocks it holds
+  with them, and follows on with them.
+- `leani doctor` warns when a block-local processor has `output = "latest"`:
+  such a processor usually writes new keys every block, so `latest` keeps all
+  of them, as `full` does.
+- Configuration builder: `leani init` builds a complete configuration from
+  what an application needs, with `--keep`, `--follow`,
+  `--history-from-block`, `--memory`, `--disk`, `--bandwidth`, and `--tuning`,
+  or from JSON for any processor with `--requirements`. Every setting is
+  written out, each derived one commented with its reason, and `--json`
+  reports them for agents (`leani guide config`).
+- Generated Wasm processors: `leani processor create` writes a Rust crate or,
+  with `--language typescript`, a TypeScript package from a spec of the
+  onchain data to keep (events, transactions, or blocks, their filters and
+  fields, kept as rows or running totals), from a bundled template's source,
+  or a starter, carrying the binary's own guest SDK and a lockfile. A running
+  node generates the source at `POST /v1/wasm/compose` and builds it at
+  `POST /admin/v1/wasm/build`, a development feature, off unless
+  `api.allow_wasm_builds = true`, which logs a warning at startup and in
+  `leani doctor`. It refuses Rust that would read files or the environment
+  while it compiles, and builds Rust only for requests from the node's own
+  machine, TypeScript for any client the API admits.
+- Playground: `GET /playground` runs templates and your own processors on the
+  node's live blocks. Its build-your-own panel clicks a processor together and
+  runs it, the code panel shows every processor's source in Rust or TypeScript,
+  highlighted, and its editor builds edited code and swaps it into the run,
+  marking what each version changed, block by block. Its configuration tab
+  builds a node configuration from your needs and limits
+  (`POST /admin/v1/config/build`), shows what each kind of storage keeps,
+  toggles tuning recipes, and downloads, copies, or checks the result
+  (`POST /admin/v1/config/check`) as `leani doctor` would.
+
+### Changed
+
+- The live lane keeps every block's header, which the P2P source fetches
+  anyway, so header-only processors run ad hoc on any node.
+- The live subscriptions of one P2P source share their downloads: a block's
+  bodies or receipts that two of them need are downloaded once.
+
+## [0.1.1] - 2026-10-29
+
+### Changed
+
+- The release coordinator promotes leani.dev under the Homebrew tap's
+  stable-first rule: once a stable release exists, a prerelease leaves the
+  site on it. The README status names a release candidate as such.
+- The install guide's source build clones the release tag instead of `main`,
+  so it builds the version the guide documents.
+
+### Fixed
+
+- A hole in Xatu's published tables moves to the next source in one piece.
+  Xatu named only a hole's first block, so a backfill crossing the 20,915
+  blocks from 23,272,479 that lack their transaction rows alternated between
+  Xatu and execution P2P one block at a time. Xatu now names every incomplete
+  block of the chunk it read, from the first to the last.
+- Execution P2P history reuses the header chain an earlier request proved.
+  Every detour from another source downloaded the chain from its first block
+  up to the finalized anchor again, about two minutes at block 23,272,479. A
+  proof now keeps the hashes of at least 131,072 blocks from its first, so a
+  backfill's later detours skip that download.
+
+## [0.1.0] - 2026-10-28
+
+First stable release, the same code as 0.1.0-rc.9.
+
+## [0.1.0-rc.9] - 2026-10-27
+
+### Added
+
 - `evm-events` decodes every ABI type events use except `function` and
   fixed-point: `string`, `bytes`, fixed-size and dynamic arrays, and tuples,
   nested up to six levels, with at most 64 values in one element of a
@@ -105,6 +196,10 @@ record, and documented RPC contracts.
   checking it no longer fails its live lane with `processor_finality_conflict`.
   The lane could not be reset and needed a rebuild, although it covered the
   anchor itself.
+- Delivery pruning by age no longer deletes a live change still inside the
+  window when older history follows it in the log, as a block-local
+  processor's backfills commit it. A best-effort consumer that had not read
+  the change got `reset_required` before the window ran out.
 
 ### Security
 

@@ -8761,10 +8761,11 @@ SOFTWARE.__
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-leani-primitives 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-api 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-source-api 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-testkit 0.1.0-rc.8 — https://github.com/smart-byte/leani
+leani-primitives 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-api 0.1.1 — https://github.com/smart-byte/leani
+leani-source-api 0.1.1 — https://github.com/smart-byte/leani
+leani-testkit 0.1.1 — https://github.com/smart-byte/leani
+leani-wasm-guest 0.1.0 — https://github.com/smart-byte/leani
 
 MIT License
 
@@ -8832,26 +8833,27 @@ reth-transaction-pool 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-common 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie-sparse 2.5.2 — https://github.com/paradigmxyz/reth
 reth-trie 2.5.2 — https://github.com/paradigmxyz/reth
-leani-api 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-finality-beacon-api 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-finality-consensus-p2p 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-blobs 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-block-summary 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-erc20 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-evm-events 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-rollup-txs 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-transaction-stats 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-processor-uniswap 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-rpc 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-runtime 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-source-archive 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-source-erae 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-source-p2p 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-source-xatu 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-store-artifacts 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-store-history 0.1.0-rc.8 — https://github.com/smart-byte/leani
-leani-store-sqlite 0.1.0-rc.8 — https://github.com/smart-byte/leani
+leani-api 0.1.1 — https://github.com/smart-byte/leani
+leani-finality-beacon-api 0.1.1 — https://github.com/smart-byte/leani
+leani-finality-consensus-p2p 0.1.1 — https://github.com/smart-byte/leani
+leani 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-blobs 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-block-summary 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-erc20 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-evm-events 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-rollup-txs 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-transaction-stats 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-uniswap 0.1.1 — https://github.com/smart-byte/leani
+leani-processor-wasm 0.1.1 — https://github.com/smart-byte/leani
+leani-rpc 0.1.1 — https://github.com/smart-byte/leani
+leani-runtime 0.1.1 — https://github.com/smart-byte/leani
+leani-source-archive 0.1.1 — https://github.com/smart-byte/leani
+leani-source-erae 0.1.1 — https://github.com/smart-byte/leani
+leani-source-p2p 0.1.1 — https://github.com/smart-byte/leani
+leani-source-xatu 0.1.1 — https://github.com/smart-byte/leani
+leani-store-artifacts 0.1.1 — https://github.com/smart-byte/leani
+leani-store-history 0.1.1 — https://github.com/smart-byte/leani
+leani-store-sqlite 0.1.1 — https://github.com/smart-byte/leani
 alloy-consensus-any 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus-any 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-consensus 1.8.3 — https://github.com/alloy-rs/alloy
@@ -8939,6 +8941,11 @@ sqlx-core 0.9.0 — https://github.com/launchbadge/sqlx
 sqlx-sqlite 0.9.0 — https://github.com/launchbadge/sqlx
 syn-solidity 1.7.3 — https://github.com/alloy-rs/core
 uint 0.10.0 — https://github.com/paritytech/parity-common
+wasmi 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_collections 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_core 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmi_ir 2.0.0 — https://github.com/wasmi-labs/wasmi
+wasmparser 0.228.0 — https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser
 wide 0.7.33 — https://github.com/Lokathor/wide
 winapi-i686-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs
 winapi-x86_64-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs

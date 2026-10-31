@@ -4,7 +4,9 @@ module PublicationPolicy
   PRIVATE_PATHS = [
     %r{(?:\A|/)(?:\.private|\.agents|\.codex|\.claude|\.ssh|\.aws|\.gnupg|\.planning|\.specify)(?:/|\z)}i,
     %r{(?:\A|/)(?:plans?|planning|superpowers|design-explorations|reports|evidence)(?:/|\z)}i,
-    %r{(?:\A|/)(?:AGENTS|CLAUDE|BACKLOG|ROADMAP|PLAN)(?:\.md)?\z}i,
+    %r{(?:\A|/)(?:CLAUDE|BACKLOG|ROADMAP|PLAN)(?:\.md)?\z}i,
+    # Only the root AGENTS.md is public.
+    %r{/AGENTS(?:\.md)?\z}i,
     %r{(?:\A|/)[^/]*(?:-PLAN|-READINESS|-CHECKLIST|IMPLEMENTATION-DESIGN|IMPLEMENTATION-STATUS|XATU-OPTIMIZATIONS)\.md\z}i,
     %r{(?:\A|/)\.env(?:\..*)?\z}i,
     %r{(?:\A|/)(?:id_rsa|id_ed25519|credentials|credentials\.json)\z}i,
