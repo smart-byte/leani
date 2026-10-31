@@ -300,7 +300,7 @@ impl HeaderAnchor {
 /// Numbers the execution blocks Gloas headers name by hash, through
 /// execution headers checked against the hash.
 #[derive(Clone, Default)]
-struct ExecutionNumbers {
+pub struct ExecutionNumbers {
     headers: Option<Arc<dyn ExecutionHeaders>>,
     recent: Arc<std::sync::Mutex<VecDeque<(BlockHash, u64)>>>,
 }
@@ -315,7 +315,23 @@ impl fmt::Debug for ExecutionNumbers {
 }
 
 impl ExecutionNumbers {
-    async fn resolve(
+    /// Number through `headers`. The default numbers no Gloas header.
+    #[must_use]
+    pub fn new(headers: Arc<dyn ExecutionHeaders>) -> Self {
+        Self {
+            headers: Some(headers),
+            recent: Arc::default(),
+        }
+    }
+
+    /// `anchor` with its execution block number: the one its header carries,
+    /// or for a Gloas header, the one a recent or a new lookup found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a Gloas header whose number no execution header
+    /// served.
+    pub async fn resolve(
         &self,
         anchor: HeaderAnchor,
     ) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
@@ -737,7 +753,7 @@ impl VerifiedBeaconApi {
     /// `headers`. Without it, finality and heads past Gloas are refused.
     #[must_use]
     pub fn with_execution_headers(mut self, headers: Arc<dyn ExecutionHeaders>) -> Self {
-        self.numbers.headers = Some(headers);
+        self.numbers = ExecutionNumbers::new(headers);
         self
     }
 

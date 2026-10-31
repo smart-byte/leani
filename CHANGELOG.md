@@ -21,17 +21,19 @@ record, and documented RPC contracts.
   config's `network`) now names a built-in chain entry; its chain id, slot
   clock, Beacon network (genesis validators root, fork schedule from the
   network's upstream `config.yaml`), execution DNS tree, and bootnodes follow
-  from it. Both follow live over P2P with Beacon API finality. eraE, Xatu,
-  consensus P2P finality, and built-in subscriptions stay mainnet-only.
+  from it. Both follow live over P2P, with Beacon API finality or with
+  consensus P2P finality from their embedded consensus bootnodes. eraE, Xatu,
+  and built-in subscriptions stay mainnet-only.
 - Glamsterdam: Beacon API finality verifies Gloas light-client data, whose
   headers prove the payload their block builds on by hash alone; execution
   peers number that block from a header checked against the hash. Execution
   P2P accepts Amsterdam receipts, whose header gas counts gas before refunds
   (EIP-7778). Sepolia, past the fork, follows at every level. Consensus P2P
-  finality still stops at Gloas, fail-closed. Xatu, whose beacon rows carry
-  no Gloas payload, passes the rest of a gap to the next source from the
-  fork's first day. ERC-20 balances skip the EIP-7708 ETH transfer logs of
-  `0xff…fe` unless `tokens` lists it; blocks before Amsterdam carry none.
+  finality verifies and numbers Gloas light-client data the same way, from
+  peers that serve it. Xatu, whose beacon rows carry no Gloas payload, passes
+  the rest of a gap to the next source from the fork's first day. ERC-20
+  balances skip the EIP-7708 ETH transfer logs of `0xff…fe` unless `tokens`
+  lists it; blocks before Amsterdam carry none.
 - With the P2P live source, `sources.history` may be empty: execution P2P
   serves finalized history, and no archive reconciliation runs. On-demand
   JSON-RPC history then must be `disabled`.
@@ -94,6 +96,11 @@ record, and documented RPC contracts.
   anyway, so header-only processors run ad hoc on any node.
 - The live subscriptions of one P2P source share their downloads: a block's
   bodies or receipts that two of them need are downloaded once.
+- Consensus P2P discovery runs its lookups concurrently, looks for the
+  chain's fork digest, and keeps every record they see, so it also finds the
+  peers of a testnet, whose records are rare in the discovery network all
+  chains share. It handshakes with Status v2, which some peers require, and
+  still answers v1.
 
 ## [0.1.1] - 2026-10-29
 

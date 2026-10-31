@@ -21,15 +21,15 @@ use discv5::{
     ConfigBuilder, Discv5, Enr, ListenConfig,
     enr::{CombinedKey, CombinedPublicKey, EnrPublicKey, NodeId},
 };
-use futures::{AsyncReadExt, AsyncWriteExt, StreamExt, stream};
+use futures::{AsyncReadExt, AsyncWriteExt, StreamExt, future, stream};
 use helios_consensus_core::{
     consensus_spec::MainnetConsensusSpec,
     types::{Bootstrap, FinalityUpdate, OptimisticUpdate, Update},
 };
-use leani_chain::{BeaconNetwork, SLOTS_PER_EPOCH};
+use leani_chain::{BeaconNetwork, Chain, SLOTS_PER_EPOCH};
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
-    HELIOS_REVISION, HeaderAnchor, LightClientVerifier, StartAnchor, TrustedCheckpoint,
+    ExecutionNumbers, HELIOS_REVISION, LightClientVerifier, StartAnchor, TrustedCheckpoint,
     VerifiedFinalityAnchor, current_slot, resolve_start_anchor, signed_implausibly_ahead,
     until_next_attested_poll, verification_slot,
 };
@@ -37,8 +37,9 @@ use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
 };
 use leani_source_api::{
-    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
-    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
+    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, ExecutionHeaders, FinalityEvent,
+    FinalityEventStream, FinalityModel, FinalitySource, Partitioning, SourceDescriptor,
+    SourceError,
 };
 use libp2p::{
     Multiaddr, PeerId, StreamProtocol, SwarmBuilder, identity,
@@ -55,39 +56,36 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-/// Consensus P2P finality follows Ethereum mainnet only.
-static MAINNET_BEACON: std::sync::LazyLock<leani_chain::BeaconNetwork> =
-    std::sync::LazyLock::new(|| {
-        leani_chain::ethereum_mainnet()
-            .beacon()
-            .expect("mainnet has a beacon chain")
-            .clone()
-    });
-
 const BOOTSTRAP_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
 const UPDATE_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy";
 const FINALITY_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_finality_update/1/ssz_snappy";
 const OPTIMISTIC_PROTOCOL: &str =
     "/eth2/beacon_chain/req/light_client_optimistic_update/1/ssz_snappy";
-const STATUS_PROTOCOL: &str = "/eth2/beacon_chain/req/status/1/ssz_snappy";
+const STATUS_PROTOCOL: &str = "/eth2/beacon_chain/req/status/2/ssz_snappy";
+/// Status v1, which peers may still ask for: v2 without its last field.
+const STATUS_V1_PROTOCOL: &str = "/eth2/beacon_chain/req/status/1/ssz_snappy";
 const PING_PROTOCOL: &str = "/eth2/beacon_chain/req/ping/1/ssz_snappy";
 const GOODBYE_PROTOCOL: &str = "/eth2/beacon_chain/req/goodbye/1/ssz_snappy";
 const MAX_LIGHT_CLIENT_SSZ_BYTES: usize = 2 * 1_024 * 1_024;
 const MAX_WIRE_BYTES: usize = 3 * 1_024 * 1_024;
 const MAX_CONTROL_WIRE_BYTES: usize = 1_024;
-const STATUS_BYTES: usize = 84;
+const STATUS_BYTES: usize = 92;
+const STATUS_V1_BYTES: usize = 84;
 const DISCOVERY_QUERIES: usize = 3;
+/// Discovery records one connect classifies at most.
+const MAX_DISCOVERED_RECORDS: usize = 4_096;
 const PEER_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
 const MAX_PEER_REDIALS: usize = 2;
 /// Default and largest consensus peer set dialed at once.
 pub const DEFAULT_MAXIMUM_PEERS: usize = 24;
 /// How often an exhausted peer set is reported at `warn` level.
 const EXHAUSTED_PEERS_WARNING_INTERVAL: Duration = Duration::from_mins(5);
-const EMBEDDED_MAINNET_BOOTNODES: &str = include_str!("../assets/mainnet-bootnodes.txt");
 
 /// Native consensus-network settings.
 #[derive(Clone, Debug)]
 pub struct ConsensusP2pConfig {
+    /// The chain whose beacon network is followed.
+    pub chain: Arc<Chain>,
     pub bootnodes: Vec<String>,
     pub discovery_ip: IpAddr,
     pub discovery_port: u16,
@@ -103,10 +101,13 @@ pub struct ConsensusP2pConfig {
     pub anchor: AnchorFile,
 }
 
-impl Default for ConsensusP2pConfig {
-    fn default() -> Self {
+impl ConsensusP2pConfig {
+    /// Follow the beacon network of `chain` from its embedded bootnodes.
+    #[must_use]
+    pub fn new(chain: Arc<Chain>) -> Self {
         Self {
-            bootnodes: embedded_mainnet_bootnodes(),
+            bootnodes: embedded_bootnodes(&chain),
+            chain,
             discovery_ip: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             discovery_port: 0,
             minimum_peers: 2,
@@ -119,9 +120,7 @@ impl Default for ConsensusP2pConfig {
             anchor: AnchorFile::Disabled,
         }
     }
-}
 
-impl ConsensusP2pConfig {
     fn validate(&self) -> Result<(), ConsensusP2pError> {
         if self.bootnodes.is_empty() {
             return Err(ConsensusP2pError::InvalidConfig(
@@ -171,10 +170,11 @@ pub struct ConsensusP2pProbeReport {
     pub errors: Vec<String>,
 }
 
-/// Ethereum mainnet finality directly from consensus peers.
+/// Finality of a beacon network directly from its consensus peers.
 #[derive(Clone, Debug)]
 pub struct VerifiedConsensusP2p {
     config: ConsensusP2pConfig,
+    beacon: Arc<BeaconNetwork>,
     descriptor: SourceDescriptor,
     connector: Arc<dyn PeerConnector>,
     clock: Clock,
@@ -189,15 +189,17 @@ pub struct VerifiedConsensusP2p {
     /// Where every finality refresh publishes the newest verified attested
     /// head.
     attested_heads: Option<AttestedHeadPublisher>,
+    numbers: ExecutionNumbers,
 }
 
 impl VerifiedConsensusP2p {
-    /// Construct a mainnet source. No sockets are opened until probe/subscribe.
+    /// Construct a source. No sockets are opened until probe/subscribe.
     ///
     /// # Errors
     ///
-    /// Rejects invalid peer bounds, timeouts, or bootnode ENRs.
-    pub fn mainnet(config: ConsensusP2pConfig) -> Result<Self, ConsensusP2pError> {
+    /// Rejects a chain without a beacon network, invalid peer bounds,
+    /// timeouts, or bootnode ENRs.
+    pub fn new(config: ConsensusP2pConfig) -> Result<Self, ConsensusP2pError> {
         let clock = Clock::default();
         Self::with_connector(
             config,
@@ -214,6 +216,11 @@ impl VerifiedConsensusP2p {
         clock: Clock,
     ) -> Result<Self, ConsensusP2pError> {
         config.validate()?;
+        let beacon = config
+            .chain
+            .beacon()
+            .map_err(|error| ConsensusP2pError::InvalidConfig(error.to_string()))?
+            .clone();
         Ok(Self {
             connector,
             clock,
@@ -221,12 +228,13 @@ impl VerifiedConsensusP2p {
             anchor_writer: AnchorWriter::new(config.anchor.clone()),
             trust: Arc::default(),
             attested_heads: None,
-            config,
+            numbers: ExecutionNumbers::default(),
+            beacon: Arc::new(beacon),
             descriptor: SourceDescriptor {
                 id: SourceId::new("consensus-p2p-light-client")
                     .map_err(|error| ConsensusP2pError::InvalidConfig(error.to_string()))?,
                 kind: SourceKind::ConsensusP2p,
-                chain_id: ChainId(1),
+                chain_id: ChainId(config.chain.chain_id),
                 range: None,
                 capabilities: CapabilitySet::of(Capability::ConsensusFinality),
                 complete_capabilities: CapabilitySet::of(Capability::ConsensusFinality),
@@ -237,6 +245,7 @@ impl VerifiedConsensusP2p {
                 schema_version: format!("consensus-p2p-light-client.v1+helios.{HELIOS_REVISION}"),
                 priority: 0,
             },
+            config,
         })
     }
 
@@ -248,13 +257,34 @@ impl VerifiedConsensusP2p {
         self
     }
 
+    /// Number the execution blocks Gloas headers name by hash through
+    /// `headers`. Without it, finality and heads past Gloas are refused.
+    #[must_use]
+    pub fn with_execution_headers(mut self, headers: Arc<dyn ExecutionHeaders>) -> Self {
+        self.numbers = ExecutionNumbers::new(headers);
+        self
+    }
+
     /// Discover peers, perform the required status handshake, and verify a
     /// complete checkpoint-to-finality sync.
     pub async fn probe_checkpoint(&self, checkpoint: TrustedCheckpoint) -> ConsensusP2pProbeReport {
         let checkpoint_root = checkpoint.root;
         let checkpoint_slot = checkpoint.slot.unwrap_or_default();
-        match P2pLightClient::connect_and_sync(self, checkpoint, CancellationToken::new()).await {
-            Ok(client) => {
+        let synced = match P2pLightClient::connect_and_sync(
+            self,
+            checkpoint,
+            CancellationToken::new(),
+        )
+        .await
+        {
+            Ok(client) => match client.numbered_anchors().await {
+                Ok(anchors) => Ok((client, anchors)),
+                Err(error) => Err(client.network.failure(error.to_string())),
+            },
+            Err(failure) => Err(failure),
+        };
+        match synced {
+            Ok((client, (selected, checkpoint_anchor))) => {
                 *self.trust.lock().unwrap_or_else(PoisonError::into_inner) =
                     Some((checkpoint, client.start));
                 ConsensusP2pProbeReport {
@@ -262,12 +292,8 @@ impl VerifiedConsensusP2p {
                     checkpoint_root,
                     checkpoint_slot,
                     accepted: true,
-                    selected: client
-                        .verifier
-                        .finalized_anchor()
-                        .and_then(HeaderAnchor::numbered)
-                        .ok(),
-                    checkpoint_anchor: client.verifier.checkpoint_anchor().numbered().ok(),
+                    selected: Some(selected),
+                    checkpoint_anchor: Some(checkpoint_anchor),
                     updates_verified: client.verifier.updates_verified(),
                     discovered_peers: client.network.discovered_peers,
                     connected_peers: client.network.connected_count(),
@@ -341,10 +367,14 @@ impl FinalitySource for VerifiedConsensusP2p {
                 "configured checkpoint differs from the P2P-verified bootstrap".to_owned(),
             ));
         }
-        let pending = client
+        let finalized = client
             .verifier
             .finalized_anchor()
-            .and_then(HeaderAnchor::numbered)
+            .map_err(|error| beacon_source_error(&error))?;
+        let pending = self
+            .numbers
+            .resolve(finalized)
+            .await
             .map_err(|error| beacon_source_error(&error))?;
         let state = SubscriptionState {
             client,
@@ -404,7 +434,7 @@ async fn next_finality(
                 .map(|head| head.beacon_slot);
             let head_poll_at = tokio::time::Instant::now()
                 + until_next_attested_poll(
-                    &MAINNET_BEACON,
+                    &state.client.source.beacon,
                     state.client.source.clock.now(),
                     published,
                 );
@@ -482,7 +512,7 @@ impl P2pLightClient {
         cancellation: CancellationToken,
     ) -> Result<Self, ProbeFailure> {
         let mut start = resolve_start_anchor(
-            &MAINNET_BEACON,
+            &source.beacon,
             source.config.anchor.path(),
             checkpoint,
             source.config.max_checkpoint_age,
@@ -533,6 +563,25 @@ impl P2pLightClient {
             return Err(client.network.failure(error.to_string()));
         }
         Ok(client)
+    }
+
+    /// The verified finalized and checkpoint anchors with their execution
+    /// block numbers.
+    fn numbered_anchors(
+        &self,
+    ) -> impl Future<
+        Output = Result<(VerifiedFinalityAnchor, VerifiedFinalityAnchor), BeaconApiError>,
+    > + Send
+    + use<> {
+        let numbers = self.source.numbers.clone();
+        let finalized = self.verifier.finalized_anchor();
+        let checkpoint = self.verifier.checkpoint_anchor();
+        async move {
+            Ok((
+                numbers.resolve(finalized?).await?,
+                numbers.resolve(checkpoint).await?,
+            ))
+        }
     }
 
     /// Verify the latest finality update from any peer. Every failure here is
@@ -616,32 +665,32 @@ impl P2pLightClient {
                     continue;
                 }
             };
-            match self
+            let head = match self
                 .verifier
                 .verify_attested_head(&update, self.source.clock.now())
-                .map(HeaderAnchor::numbered)
             {
-                Ok(Ok(head))
-                    if published
-                        .is_none_or(|published| head.beacon_slot > published.beacon_slot) =>
-                {
-                    return Some(head.attested_head());
-                }
-                Ok(Ok(head)) => {
-                    debug!(
-                        %peer,
-                        beacon_slot = head.beacon_slot,
-                        "consensus peer's attested head is no newer than the published one"
-                    );
-                }
-                Ok(Err(error)) => {
-                    debug!(%peer, %error, "consensus peer's attested head has no execution block number");
-                }
+                Ok(head) => head,
                 Err(error) if error.is_unusable_head() => {
                     debug!(%peer, %error, "consensus peer's optimistic update anchors no head");
+                    continue;
                 }
                 Err(error) => {
                     self.network.ban(peer, error);
+                    continue;
+                }
+            };
+            if published.is_some_and(|published| head.beacon_slot <= published.beacon_slot) {
+                debug!(
+                    %peer,
+                    beacon_slot = head.beacon_slot,
+                    "consensus peer's attested head is no newer than the published one"
+                );
+                continue;
+            }
+            match self.source.numbers.resolve(head).await {
+                Ok(head) => return Some(head.attested_head()),
+                Err(error) => {
+                    debug!(%peer, %error, "consensus peer's attested head has no execution block number");
                 }
             }
         }
@@ -679,14 +728,14 @@ impl P2pLightClient {
             };
             let signature_slot = *update.signature_slot();
             let now = self.source.clock.now();
-            if signature_slot > verification_slot(&MAINNET_BEACON, now) {
+            if signature_slot > verification_slot(&self.source.beacon, now) {
                 let error = format!(
                     "finality update signed at slot {signature_slot} is ahead of the local clock"
                 );
                 // A little early is a skewed clock; an epoch beyond it is a
                 // claim no honest peer makes, so the peer is not asked again.
                 errors.push(
-                    if signed_implausibly_ahead(&MAINNET_BEACON, signature_slot, now) {
+                    if signed_implausibly_ahead(&self.source.beacon, signature_slot, now) {
                         self.network.ban(peer, error)
                     } else {
                         format!("{peer}: {error}")
@@ -701,16 +750,17 @@ impl P2pLightClient {
             match self
                 .verifier
                 .apply_finality_update(&update, self.source.clock.now())
-                .map(HeaderAnchor::numbered)
             {
-                Ok(Ok(anchor)) => {
-                    self.source
-                        .anchor_writer
-                        .persist(anchor, self.start.checkpoint_root)
-                        .await;
-                    return Ok(anchor);
-                }
-                Ok(Err(error)) => errors.push(format!("{peer}: {error}")),
+                Ok(anchor) => match self.source.numbers.resolve(anchor).await {
+                    Ok(anchor) => {
+                        self.source
+                            .anchor_writer
+                            .persist(anchor, self.start.checkpoint_root)
+                            .await;
+                        return Ok(anchor);
+                    }
+                    Err(error) => errors.push(format!("{peer}: {error}")),
+                },
                 Err(error) if error.is_stale_update() => errors.push(format!("{peer}: {error}")),
                 Err(error) => errors.push(self.network.ban(peer, error)),
             }
@@ -772,12 +822,12 @@ async fn bootstrap(
     status_slot: u64,
     cancellation: &CancellationToken,
 ) -> Result<LightClientVerifier, ProbeFailure> {
-    match bootstrap_verified(network, &source.config, &source.clock, root).await {
+    match bootstrap_verified(network, source, root).await {
         Ok(verifier) => Ok(verifier),
         Err(RequestFailure::Fatal(error)) => Err(network.failure(error)),
         Err(RequestFailure::Retry(error)) => {
             *network = reconnect_network(source, root, status_slot, cancellation, error).await?;
-            bootstrap_verified(network, &source.config, &source.clock, root)
+            bootstrap_verified(network, source, root)
                 .await
                 .map_err(|failure| network.failure(failure.into_message()))
         }
@@ -787,8 +837,7 @@ async fn bootstrap(
 /// Bootstrap from `root` with the first peer whose bootstrap verifies.
 async fn bootstrap_verified(
     network: &mut P2pNetwork,
-    config: &ConsensusP2pConfig,
-    clock: &Clock,
+    source: &VerifiedConsensusP2p,
     root: [u8; 32],
 ) -> Result<LightClientVerifier, RequestFailure> {
     network
@@ -796,11 +845,11 @@ async fn bootstrap_verified(
             LightClientRequest::Bootstrap(root),
             |response| match response {
                 LightClientResponse::Bootstrap(bootstrap) => LightClientVerifier::bootstrap(
-                    &MAINNET_BEACON,
+                    &source.beacon,
                     root,
                     &bootstrap,
-                    config.max_checkpoint_age,
-                    clock.now(),
+                    source.config.max_checkpoint_age,
+                    source.clock.now(),
                 ),
                 _ => Err(BeaconApiError::Protocol(
                     "answered a bootstrap request with other material".to_owned(),
@@ -842,6 +891,7 @@ async fn connect_network(
     let mut network = source
         .connector
         .connect(
+            &source.beacon,
             &source.config,
             status_root,
             status_slot,
@@ -938,11 +988,13 @@ trait ConsensusPeers: Send {
     ) -> Result<LightClientResponse, PeerFailure>;
 }
 
-/// Opens a consensus peer set that advertises `status_root`/`status_slot`.
+/// Opens a consensus peer set of `beacon` that advertises
+/// `status_root`/`status_slot`.
 #[async_trait]
 trait PeerConnector: Send + Sync + fmt::Debug {
     async fn connect(
         &self,
+        beacon: &Arc<BeaconNetwork>,
         config: &ConsensusP2pConfig,
         status_root: [u8; 32],
         status_slot: u64,
@@ -951,7 +1003,7 @@ trait PeerConnector: Send + Sync + fmt::Debug {
     ) -> Result<P2pNetwork, ProbeFailure>;
 }
 
-/// Discovers mainnet peers over discv5 and dials them over libp2p.
+/// Discovers peers over discv5 and dials them over libp2p.
 #[derive(Debug)]
 struct Libp2pConnector {
     clock: Clock,
@@ -961,14 +1013,15 @@ struct Libp2pConnector {
 impl PeerConnector for Libp2pConnector {
     async fn connect(
         &self,
+        beacon: &Arc<BeaconNetwork>,
         config: &ConsensusP2pConfig,
         status_root: [u8; 32],
         status_slot: u64,
         banned: &HashSet<PeerId>,
         cancellation: CancellationToken,
     ) -> Result<P2pNetwork, ProbeFailure> {
-        let current_slot = current_slot(&MAINNET_BEACON, self.clock.now());
-        let mut discovered = discover_mainnet_peers(config, current_slot, cancellation.clone())
+        let current_slot = current_slot(beacon, self.clock.now());
+        let mut discovered = discover_peers(beacon, config, current_slot, cancellation.clone())
             .await
             .map_err(|error| ProbeFailure {
                 discovered_peers: 0,
@@ -990,12 +1043,13 @@ impl PeerConnector for Libp2pConnector {
             });
         }
         let attempted_peers = discovered.len().min(config.maximum_peers);
-        let status = encode_status(status_root, status_slot, current_slot);
+        let status = encode_status(beacon, status_root, status_slot, current_slot);
         let peers = discovered
             .into_iter()
             .take(config.maximum_peers)
             .collect::<Vec<_>>();
         let (control, connected) = spawn_swarm(
+            beacon.clone(),
             &peers,
             status.clone(),
             self.clock.clone(),
@@ -1008,7 +1062,11 @@ impl PeerConnector for Libp2pConnector {
             errors: vec![error.to_string()],
         })?;
         let mut network = P2pNetwork::new(
-            Box::new(Libp2pPeers { control, connected }),
+            Box::new(Libp2pPeers {
+                beacon: beacon.clone(),
+                control,
+                connected,
+            }),
             config,
             cancellation,
             discovered_peers,
@@ -1023,6 +1081,7 @@ impl PeerConnector for Libp2pConnector {
 }
 
 struct Libp2pPeers {
+    beacon: Arc<BeaconNetwork>,
     control: libp2p_stream::Control,
     connected: watch::Receiver<Vec<PeerId>>,
 }
@@ -1064,12 +1123,12 @@ impl ConsensusPeers for Libp2pPeers {
         )
         .await
         .map_err(PeerFailure::Unavailable)?;
-        decode_light_client_response(request, &response.payload, response.context)
+        decode_light_client_response(&self.beacon, request, &response.payload, response.context)
     }
 }
 
 /// Consensus forks whose light-client messages this crate decodes.
-const DECODED_FORKS: [&str; 7] = [
+const DECODED_FORKS: [&str; 8] = [
     "phase0",
     "altair",
     "bellatrix",
@@ -1077,6 +1136,7 @@ const DECODED_FORKS: [&str; 7] = [
     "deneb",
     "electra",
     "fulu",
+    "gloas",
 ];
 
 /// Every fork digest of `network`'s schedule through the last fork this crate
@@ -1099,12 +1159,13 @@ fn known_fork_digests(network: &BeaconNetwork) -> Vec<[u8; 4]> {
 /// this release knows is checked first: after a network fork this release
 /// does not support, every honest peer answers so, and none is banned.
 fn decode_light_client_response(
+    beacon: &BeaconNetwork,
     request: LightClientRequest,
     payload: &[u8],
     context: Option<[u8; 4]>,
 ) -> Result<LightClientResponse, PeerFailure> {
     if let Some(received) = context
-        && !known_fork_digests(&MAINNET_BEACON).contains(&received)
+        && !known_fork_digests(beacon).contains(&received)
     {
         static WARNED: std::sync::Once = std::sync::Once::new();
         WARNED.call_once(|| {
@@ -1150,7 +1211,7 @@ fn decode_light_client_response(
             (LightClientResponse::Optimistic(Box::new(update)), slot)
         }
     };
-    validate_context(context, slot).map_err(PeerFailure::Invalid)?;
+    validate_context(beacon, context, slot).map_err(PeerFailure::Invalid)?;
     Ok(material)
 }
 
@@ -1501,9 +1562,13 @@ fn decode_varint(bytes: &[u8]) -> Result<(u64, usize), String> {
     Err("protobuf varint is absent or exceeds ten bytes".to_owned())
 }
 
-fn validate_context(context: Option<[u8; 4]>, slot: u64) -> Result<(), String> {
+fn validate_context(
+    beacon: &BeaconNetwork,
+    context: Option<[u8; 4]>,
+    slot: u64,
+) -> Result<(), String> {
     let received = context.ok_or_else(|| "response omitted fork context".to_owned())?;
-    let expected = MAINNET_BEACON.fork_digest(slot);
+    let expected = beacon.fork_digest(slot);
     if received != expected {
         return Err(format!(
             "response fork digest {received:02x?} does not match slot {slot} digest {expected:02x?}"
@@ -1512,13 +1577,18 @@ fn validate_context(context: Option<[u8; 4]>, slot: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64, current_slot: u64) -> Vec<u8> {
+fn encode_status(
+    beacon: &BeaconNetwork,
+    checkpoint_root: [u8; 32],
+    checkpoint_slot: u64,
+    current_slot: u64,
+) -> Vec<u8> {
     // A checkpoint block before its epoch's first slot means that slot was
     // skipped, so the block is the checkpoint of the epoch that follows it.
     let finalized_epoch = checkpoint_slot.div_ceil(32);
     let head_slot = checkpoint_slot.max(finalized_epoch.saturating_mul(32));
     let mut status = Vec::with_capacity(STATUS_BYTES);
-    status.extend_from_slice(&MAINNET_BEACON.fork_digest(current_slot));
+    status.extend_from_slice(&beacon.fork_digest(current_slot));
     // The weak-subjectivity checkpoint is locally trusted before bootstrap
     // verification and is therefore the only internally consistent chain
     // position this outbound light client can advertise. Advertising a zero
@@ -1528,17 +1598,24 @@ fn encode_status(checkpoint_root: [u8; 32], checkpoint_slot: u64, current_slot: 
     status.extend_from_slice(&finalized_epoch.to_le_bytes());
     status.extend_from_slice(&checkpoint_root);
     status.extend_from_slice(&head_slot.to_le_bytes());
+    // The earliest available slot. This client serves no blocks: its head is
+    // the latest slot that keeps the status consistent.
+    status.extend_from_slice(&head_slot.to_le_bytes());
     status
 }
 
-fn validate_peer_status(status: &[u8], current_slot: u64) -> Result<(), String> {
+fn validate_peer_status(
+    beacon: &BeaconNetwork,
+    status: &[u8],
+    current_slot: u64,
+) -> Result<(), String> {
     if status.len() != STATUS_BYTES {
         return Err(format!(
             "status response is {} bytes, expected {STATUS_BYTES}",
             status.len()
         ));
     }
-    let expected = MAINNET_BEACON.fork_digest(current_slot);
+    let expected = beacon.fork_digest(current_slot);
     if status[..4] != expected {
         return Err(format!(
             "peer status fork digest {:02x?} differs from expected {expected:02x?}",
@@ -1554,7 +1631,8 @@ struct PeerAddress {
     address: Multiaddr,
 }
 
-async fn discover_mainnet_peers(
+async fn discover_peers(
+    beacon: &BeaconNetwork,
     config: &ConsensusP2pConfig,
     current_slot: u64,
     cancellation: CancellationToken,
@@ -1582,28 +1660,46 @@ async fn discover_mainnet_peers(
         .start()
         .await
         .map_err(|error| ConsensusP2pError::Discovery(error.to_string()))?;
-    let query = async {
-        for _ in 0..DISCOVERY_QUERIES {
-            match discovery.find_node(NodeId::random()).await {
-                Ok(found) => enrs.extend(found),
-                Err(error) => debug!(%error, "consensus discv5 query failed"),
-            }
-            if enrs.len() >= config.maximum_peers.saturating_mul(2) {
+    let mut events = discovery
+        .event_stream()
+        .await
+        .map_err(|error| ConsensusP2pError::Discovery(error.to_string()))?;
+    let expected_digest = beacon.fork_digest(current_slot);
+    // Every network shares discv5, and a testnet's records are rare in it:
+    // concurrent lookups each go on until they find this network's.
+    let query = future::join_all((0..DISCOVERY_QUERIES).map(|_| {
+        discovery.find_node_predicate(
+            NodeId::random(),
+            Box::new(move |enr: &Enr| enr_fork_digest(enr) == Some(expected_digest)),
+            config.maximum_peers,
+        )
+    }));
+    tokio::pin!(query);
+    let deadline = tokio::time::sleep(config.discovery_timeout);
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            lookups = &mut query => {
+                enrs.extend(lookups.into_iter().flatten().flatten());
                 break;
             }
-        }
-    };
-    tokio::select! {
-        () = query => {}
-        () = tokio::time::sleep(config.discovery_timeout) => {
-            debug!("consensus discovery reached its time bound");
-        }
-        () = cancellation.cancelled() => {
-            return Err(ConsensusP2pError::Cancelled);
+            () = &mut deadline => {
+                debug!("consensus discovery reached its time bound");
+                break;
+            }
+            () = cancellation.cancelled() => {
+                return Err(ConsensusP2pError::Cancelled);
+            }
+            // Every record the lookups' responses carried, so a lookup the
+            // time bound cuts short still counts.
+            Some(event) = events.recv(), if enrs.len() < MAX_DISCOVERED_RECORDS => {
+                if let discv5::Event::Discovered(enr) = event {
+                    enrs.push(enr);
+                }
+            }
         }
     }
     enrs.extend(discovery.table_entries_enr());
-    let expected_digest = MAINNET_BEACON.fork_digest(current_slot);
     let mut digest_counts = BTreeMap::<[u8; 4], usize>::new();
     let mut configured_preferred = BTreeSet::new();
     let mut preferred = BTreeSet::new();
@@ -1683,6 +1779,7 @@ fn enr_peer_id(enr: &Enr) -> Option<PeerId> {
 
 #[allow(clippy::too_many_lines)]
 fn spawn_swarm(
+    beacon: Arc<BeaconNetwork>,
     peers: &[PeerAddress],
     status: Vec<u8>,
     clock: Clock,
@@ -1704,6 +1801,10 @@ fn spawn_swarm(
     let mut control = swarm.behaviour().new_control();
     let status_incoming = control
         .accept(StreamProtocol::new(STATUS_PROTOCOL))
+        .map_err(|error| ConsensusP2pError::Network(error.to_string()))?;
+    let mut status_v1_control = swarm.behaviour().new_control();
+    let status_v1_incoming = status_v1_control
+        .accept(StreamProtocol::new(STATUS_V1_PROTOCOL))
         .map_err(|error| ConsensusP2pError::Network(error.to_string()))?;
     let mut ping_control = swarm.behaviour().new_control();
     let ping_incoming = ping_control
@@ -1732,6 +1833,12 @@ fn spawn_swarm(
     tokio::spawn(handle_status_requests(
         status_incoming,
         status.clone(),
+        handler_cancellation,
+    ));
+    let handler_cancellation = cancellation.clone();
+    tokio::spawn(handle_status_requests(
+        status_v1_incoming,
+        status[..STATUS_V1_BYTES].to_vec(),
         handler_cancellation,
     ));
     let handler_cancellation = cancellation.clone();
@@ -1767,6 +1874,7 @@ fn spawn_swarm(
                             let peer_status = status.clone();
                             let peer_status_tx = status_tx.clone();
                             let peer_clock = clock.clone();
+                            let peer_beacon = beacon.clone();
                             tokio::spawn(async move {
                                 let result = async {
                                     let response = request_peer(
@@ -1779,8 +1887,9 @@ fn spawn_swarm(
                                     )
                                     .await?;
                                     validate_peer_status(
+                                        &peer_beacon,
                                         &response.payload,
-                                        current_slot(&MAINNET_BEACON, peer_clock.now()),
+                                        current_slot(&peer_beacon, peer_clock.now()),
                                     )
                                 }
                                 .await;
@@ -1847,7 +1956,7 @@ async fn handle_status_requests(
         };
         let response = status.clone();
         tokio::spawn(async move {
-            if let Err(error) = respond_to_request(stream, STATUS_BYTES, &response).await {
+            if let Err(error) = respond_to_request(stream, response.len(), &response).await {
                 debug!(%peer, %error, "failed inbound consensus status response");
             }
         });
@@ -1929,8 +2038,16 @@ async fn read_control_request(
     }
 }
 
-fn embedded_mainnet_bootnodes() -> Vec<String> {
-    EMBEDDED_MAINNET_BOOTNODES
+/// The consensus bootnode ENRs embedded for `chain`, from its network's
+/// `bootstrap_nodes.yaml` in eth-clients; none for another chain.
+fn embedded_bootnodes(chain: &Chain) -> Vec<String> {
+    let embedded = match chain.name.as_str() {
+        "ethereum-mainnet" => include_str!("../assets/mainnet-bootnodes.txt"),
+        "ethereum-sepolia" => include_str!("../assets/sepolia-bootnodes.txt"),
+        "ethereum-hoodi" => include_str!("../assets/hoodi-bootnodes.txt"),
+        _ => "",
+    };
+    embedded
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
@@ -1960,12 +2077,19 @@ mod tests {
 
     use alloy_primitives::b256;
     use leani_finality_beacon_api::{
-        CheckpointOrigin, FINALITY_ANCHOR_FILE, PersistedFinalityAnchor, persist_finality_anchor,
-        read_finality_anchor,
+        CheckpointOrigin, FINALITY_ANCHOR_FILE, HeaderAnchor, PersistedFinalityAnchor,
+        persist_finality_anchor, read_finality_anchor,
     };
     use leani_primitives::BlockHash;
 
     use super::*;
+
+    static MAINNET_BEACON: std::sync::LazyLock<BeaconNetwork> = std::sync::LazyLock::new(|| {
+        leani_chain::ethereum_mainnet()
+            .beacon()
+            .expect("mainnet has a beacon chain")
+            .clone()
+    });
 
     const BOOTSTRAP_JSON: &str =
         include_str!("../../finality-beacon-api/tests/fixtures/helios/bootstrap.json");
@@ -2255,6 +2379,7 @@ mod tests {
     impl PeerConnector for ScriptedConnector {
         async fn connect(
             &self,
+            _beacon: &Arc<BeaconNetwork>,
             config: &ConsensusP2pConfig,
             _status_root: [u8; 32],
             _status_slot: u64,
@@ -2303,7 +2428,7 @@ mod tests {
                 minimum_peers: 1,
                 poll_interval,
                 anchor,
-                ..ConsensusP2pConfig::default()
+                ..ConsensusP2pConfig::new(leani_chain::ethereum_mainnet())
             },
             Arc::new(ScriptedConnector(script.clone())),
             clock,
@@ -2337,12 +2462,12 @@ mod tests {
     #[test]
     fn status_advertises_the_epoch_of_a_skipped_boundary_slot() {
         let epoch = 400_000_u64;
-        let status = encode_status([0x42; 32], epoch * 32 - 3, epoch * 32);
+        let status = encode_status(&MAINNET_BEACON, [0x42; 32], epoch * 32 - 3, epoch * 32);
         assert_eq!(&status[36..44], &epoch.to_le_bytes());
         let head_slot = u64::from_le_bytes(status[76..84].try_into().expect("head slot"));
         assert!(head_slot >= epoch * 32, "head slot {head_slot}");
 
-        let aligned = encode_status([0x42; 32], epoch * 32, epoch * 32);
+        let aligned = encode_status(&MAINNET_BEACON, [0x42; 32], epoch * 32, epoch * 32);
         assert_eq!(&aligned[36..44], &epoch.to_le_bytes());
         assert_eq!(&aligned[76..84], &(epoch * 32).to_le_bytes());
     }
@@ -2522,7 +2647,8 @@ mod tests {
         // the request timeout for another to connect; two such refreshes
         // outlast the attested-head grace.
         assert!(
-            started.elapsed() < ConsensusP2pConfig::default().request_timeout,
+            started.elapsed()
+                < ConsensusP2pConfig::new(leani_chain::ethereum_mainnet()).request_timeout,
             "the refresh waited {:?} after trying every peer",
             started.elapsed()
         );
@@ -2603,10 +2729,14 @@ mod tests {
     fn optimistic_updates_decode_from_peer_ssz_with_their_fork_context() {
         let encoded = optimistic_ssz(&fixture_optimistic(Behaviour::Honest));
         let context = Some(MAINNET_BEACON.fork_digest(ATTESTED_SLOT));
-        let decoded =
-            decode_light_client_response(LightClientRequest::Optimistic, &encoded, context)
-                .map_err(|error| error.to_string())
-                .expect("decoded optimistic update");
+        let decoded = decode_light_client_response(
+            &MAINNET_BEACON,
+            LightClientRequest::Optimistic,
+            &encoded,
+            context,
+        )
+        .map_err(|error| error.to_string())
+        .expect("decoded optimistic update");
         let LightClientResponse::Optimistic(update) = decoded else {
             panic!("decoded other material");
         };
@@ -2642,12 +2772,22 @@ mod tests {
         // payload shorter than the container's fixed part.
         for context in [Some(MAINNET_BEACON.fork_digest(0)), None] {
             assert!(matches!(
-                decode_light_client_response(LightClientRequest::Optimistic, &encoded, context),
+                decode_light_client_response(
+                    &MAINNET_BEACON,
+                    LightClientRequest::Optimistic,
+                    &encoded,
+                    context
+                ),
                 Err(PeerFailure::Invalid(_))
             ));
         }
         assert!(matches!(
-            decode_light_client_response(LightClientRequest::Optimistic, &encoded[..171], context),
+            decode_light_client_response(
+                &MAINNET_BEACON,
+                LightClientRequest::Optimistic,
+                &encoded[..171],
+                context
+            ),
             Err(PeerFailure::Invalid(_))
         ));
         // A digest of no known fork is what every honest peer sends after a
@@ -2656,6 +2796,7 @@ mod tests {
         for payload in [&encoded[..], &encoded[..171]] {
             assert!(matches!(
                 decode_light_client_response(
+                    &MAINNET_BEACON,
                     LightClientRequest::Optimistic,
                     payload,
                     Some([0xde, 0xad, 0xbe, 0xef])
@@ -2667,6 +2808,7 @@ mod tests {
         // another header the committee did not sign: verification refuses
         // it, and its peer is banned.
         let Ok(LightClientResponse::Optimistic(cut)) = decode_light_client_response(
+            &MAINNET_BEACON,
             LightClientRequest::Optimistic,
             &encoded[..encoded.len() - 1],
             context,
@@ -2939,27 +3081,37 @@ mod tests {
 
     #[test]
     fn embedded_bootnodes_are_signed_and_dialable() {
-        let bootnodes = embedded_mainnet_bootnodes();
-        assert!(bootnodes.len() >= 8);
-        let mut dialable = 0;
-        for encoded in bootnodes {
-            let enr = encoded.parse::<Enr>().expect("ENR");
-            assert!(enr.verify());
-            dialable += usize::from(peer_address(&enr).is_some());
+        let registry = leani_chain::ChainRegistry::standard();
+        for chain in registry.iter().filter(|chain| chain.beacon.is_some()) {
+            let bootnodes = embedded_bootnodes(chain);
+            assert!(bootnodes.len() >= 8, "{}", chain.name);
+            let mut dialable = 0;
+            for encoded in bootnodes {
+                let enr = encoded.parse::<Enr>().expect("ENR");
+                assert!(enr.verify());
+                assert!(enr.udp4().is_some() || enr.udp6().is_some(), "{encoded}");
+                dialable += usize::from(peer_address(&enr).is_some());
+            }
+            // Testnet bootnodes may serve discovery alone.
+            if chain.name == "ethereum-mainnet" {
+                assert!(dialable >= 3, "only {dialable} bootnodes were dialable");
+            }
         }
-        assert!(dialable >= 3, "only {dialable} bootnodes were dialable");
+        assert!(embedded_bootnodes(&registry.get("base").expect("base")).is_empty());
     }
 
     #[test]
     fn status_is_exact_ssz_container() {
         let now = current_slot(&MAINNET_BEACON, SystemTime::now());
-        let status = encode_status([0x42; 32], 12_352, now);
+        let status = encode_status(&MAINNET_BEACON, [0x42; 32], 12_352, now);
         assert_eq!(status.len(), STATUS_BYTES);
         assert_eq!(&status[4..36], &[0x42; 32]);
         assert_eq!(&status[36..44], &(12_352_u64 / 32).to_le_bytes());
         assert_eq!(&status[44..76], &[0x42; 32]);
         assert_eq!(&status[76..84], &12_352_u64.to_le_bytes());
-        assert!(validate_peer_status(&status, now).is_ok());
+        assert_eq!(&status[84..92], &12_352_u64.to_le_bytes());
+        assert!(validate_peer_status(&MAINNET_BEACON, &status, now).is_ok());
+        assert!(validate_peer_status(&MAINNET_BEACON, &status[..STATUS_V1_BYTES], now).is_err());
     }
 
     #[test]
@@ -2978,16 +3130,27 @@ mod tests {
             );
         }
         assert!(!known.contains(&[0xde, 0xad, 0xbe, 0xef]));
-        // Once a schedule names Gloas, as Sepolia's does, its peers answer
-        // with material this crate cannot decode: unavailable, not banned.
-        let sepolia = leani_chain::ChainRegistry::standard()
-            .get("sepolia")
-            .expect("sepolia");
+        let sepolia = sepolia();
         let sepolia = sepolia.beacon().expect("sepolia beacon");
-        let gloas = sepolia.fork("gloas").expect("gloas").epoch * SLOTS_PER_EPOCH;
+        let gloas = sepolia.fork("gloas").expect("gloas").epoch;
         let known = known_fork_digests(sepolia);
-        assert!(known.contains(&sepolia.fork_digest(gloas - 1)));
-        assert!(!known.contains(&sepolia.fork_digest(gloas)));
+        assert!(known.contains(&sepolia.fork_digest(gloas * SLOTS_PER_EPOCH - 1)));
+        assert!(known.contains(&sepolia.fork_digest(gloas * SLOTS_PER_EPOCH)));
+        // Once a schedule names a fork after Gloas, its peers answer with
+        // material this crate cannot decode: unavailable, not banned.
+        let heze = gloas + 1_000;
+        let scheduled = BeaconNetwork::from_config_yaml(
+            sepolia.genesis_time,
+            sepolia.genesis_validators_root,
+            &format!(
+                "{}HEZE_FORK_VERSION: 0x90000077\nHEZE_FORK_EPOCH: {heze}\n",
+                include_str!("../../../config/chains/beacon/sepolia.yaml")
+            ),
+        )
+        .expect("a schedule with a fork after Gloas");
+        let known = known_fork_digests(&scheduled);
+        assert!(known.contains(&scheduled.fork_digest(heze * SLOTS_PER_EPOCH - 1)));
+        assert!(!known.contains(&scheduled.fork_digest(heze * SLOTS_PER_EPOCH)));
     }
 
     #[test]
@@ -3016,5 +3179,253 @@ mod tests {
             "invalid verified update".to_owned()
         )));
         assert!(!retryable_refresh_error(&SourceError::Cancelled));
+    }
+
+    const SEPOLIA_BOOTSTRAP_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/sepolia-gloas/bootstrap.json");
+    const SEPOLIA_FINALITY_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/sepolia-gloas/finality.json");
+    const SEPOLIA_OPTIMISTIC_JSON: &str =
+        include_str!("../../finality-beacon-api/tests/fixtures/sepolia-gloas/optimistic.json");
+    const SEPOLIA_CHECKPOINT_ROOT: [u8; 32] =
+        b256!("c6729545da5712f6cfc14e95d1f14e012ceea0d4568ffad921a16353d342910a").0;
+    const SEPOLIA_FINALIZED_SLOT: u64 = 11_472_352;
+    const SEPOLIA_FINALIZED_HASH: [u8; 32] =
+        b256!("78965ab07ff409e5799e5134046d25e81788e21c26e79f22ab208b6aa862ae89").0;
+    const SEPOLIA_ATTESTED_SLOT: u64 = 11_472_426;
+    const SEPOLIA_ATTESTED_HASH: [u8; 32] =
+        b256!("028a03f7955a376ffd20dde8af1fa2b6bd473e053dbbb57d3acf74970ec5e70f").0;
+
+    fn sepolia() -> Arc<Chain> {
+        leani_chain::ChainRegistry::standard()
+            .get("ethereum-sepolia")
+            .expect("Sepolia is built in")
+    }
+
+    /// Six seconds into the slot after the optimistic fixture's signature
+    /// slot.
+    fn sepolia_now() -> SystemTime {
+        let genesis = sepolia().beacon().expect("Sepolia beacon").genesis_time;
+        UNIX_EPOCH + Duration::from_secs(genesis + (SEPOLIA_ATTESTED_SLOT + 2) * SLOT_SECONDS + 6)
+    }
+
+    fn sepolia_optimistic() -> OptimisticUpdate<MainnetConsensusSpec> {
+        serde_json::from_value(fixture_data(SEPOLIA_OPTIMISTIC_JSON)).expect("Gloas update")
+    }
+
+    /// One consensus peer serving the recorded Sepolia Gloas responses.
+    struct GloasPeer(PeerId);
+
+    #[async_trait]
+    impl ConsensusPeers for GloasPeer {
+        fn connected(&self) -> Vec<PeerId> {
+            vec![self.0]
+        }
+
+        async fn changed(&mut self) -> bool {
+            false
+        }
+
+        async fn request(
+            &mut self,
+            _peer: PeerId,
+            request: LightClientRequest,
+            _timeout: Duration,
+        ) -> Result<LightClientResponse, PeerFailure> {
+            match request {
+                LightClientRequest::Bootstrap(root) if root == SEPOLIA_CHECKPOINT_ROOT => {
+                    Ok(LightClientResponse::Bootstrap(Box::new(
+                        serde_json::from_value(fixture_data(SEPOLIA_BOOTSTRAP_JSON))
+                            .expect("Gloas bootstrap"),
+                    )))
+                }
+                LightClientRequest::Finality => Ok(LightClientResponse::Finality(Box::new(
+                    serde_json::from_value(fixture_data(SEPOLIA_FINALITY_JSON))
+                        .expect("Gloas finality update"),
+                ))),
+                LightClientRequest::Optimistic => Ok(LightClientResponse::Optimistic(Box::new(
+                    sepolia_optimistic(),
+                ))),
+                _ => Err(PeerFailure::Unavailable(
+                    "not served by the fixture".to_owned(),
+                )),
+            }
+        }
+    }
+
+    #[derive(Debug)]
+    struct GloasConnector;
+
+    #[async_trait]
+    impl PeerConnector for GloasConnector {
+        async fn connect(
+            &self,
+            _beacon: &Arc<BeaconNetwork>,
+            config: &ConsensusP2pConfig,
+            _status_root: [u8; 32],
+            _status_slot: u64,
+            _banned: &HashSet<PeerId>,
+            cancellation: CancellationToken,
+        ) -> Result<P2pNetwork, ProbeFailure> {
+            Ok(P2pNetwork::new(
+                Box::new(GloasPeer(PeerId::random())),
+                config,
+                cancellation,
+                1,
+                1,
+            ))
+        }
+    }
+
+    fn gloas_source() -> VerifiedConsensusP2p {
+        let now = sepolia_now();
+        VerifiedConsensusP2p::with_connector(
+            ConsensusP2pConfig {
+                minimum_peers: 1,
+                ..ConsensusP2pConfig::new(sepolia())
+            },
+            Arc::new(GloasConnector),
+            Clock::new(move || now),
+        )
+        .expect("Sepolia source")
+    }
+
+    /// Numbers execution blocks from a table.
+    struct TableHeaders(Vec<(BlockHash, u64)>);
+
+    #[async_trait]
+    impl ExecutionHeaders for TableHeaders {
+        async fn block_number(&self, hash: BlockHash) -> Result<BlockNumber, SourceError> {
+            self.0
+                .iter()
+                .find_map(|(known, number)| (*known == hash).then_some(BlockNumber(*number)))
+                .ok_or_else(|| SourceError::Unavailable(format!("no peer served {hash}")))
+        }
+    }
+
+    /// Encode a Gloas `update` as the SSZ `LightClientOptimisticUpdate` a
+    /// peer sends. A Gloas header has a fixed size, so the update has no
+    /// offsets.
+    fn gloas_optimistic_ssz(update: &OptimisticUpdate<MainnetConsensusSpec>) -> Vec<u8> {
+        use helios_consensus_core::types::LightClientHeader;
+        use ssz::Encode as _;
+
+        let LightClientHeader::Gloas(header) = update.attested_header() else {
+            panic!("a Gloas update has a Gloas header");
+        };
+        let mut encoded = header.beacon.as_ssz_bytes();
+        encoded.extend_from_slice(header.execution_block_hash.as_slice());
+        encoded.extend_from_slice(&header.execution_branch.as_ssz_bytes());
+        encoded.extend_from_slice(&update.sync_aggregate().as_ssz_bytes());
+        encoded.extend_from_slice(&update.signature_slot().to_le_bytes());
+        assert_eq!(encoded.len(), 664);
+        encoded
+    }
+
+    #[test]
+    fn gloas_optimistic_updates_decode_from_peer_ssz_with_their_fork_context() {
+        let sepolia = sepolia();
+        let beacon = sepolia.beacon().expect("Sepolia beacon");
+        let encoded = gloas_optimistic_ssz(&sepolia_optimistic());
+        let context = Some(beacon.fork_digest(SEPOLIA_ATTESTED_SLOT));
+        let Ok(LightClientResponse::Optimistic(update)) =
+            decode_light_client_response(beacon, LightClientRequest::Optimistic, &encoded, context)
+        else {
+            panic!("a Gloas update under its fork's digest decodes");
+        };
+        let now = sepolia_now();
+        let mut verifier = LightClientVerifier::bootstrap(
+            beacon,
+            SEPOLIA_CHECKPOINT_ROOT,
+            &serde_json::from_value(fixture_data(SEPOLIA_BOOTSTRAP_JSON)).expect("Gloas bootstrap"),
+            DEFAULT_MAX_CHECKPOINT_AGE,
+            now,
+        )
+        .expect("verified Gloas bootstrap");
+        verifier
+            .apply_finality_update(
+                &serde_json::from_value(fixture_data(SEPOLIA_FINALITY_JSON))
+                    .expect("Gloas finality update"),
+                now,
+            )
+            .expect("verified Gloas finality update");
+        let head = verifier
+            .verify_attested_head(&update, now)
+            .expect("verified attested head");
+        assert_eq!(
+            head,
+            verifier
+                .verify_attested_head(&sepolia_optimistic(), now)
+                .expect("verified JSON update")
+        );
+        assert_eq!(
+            (head.beacon_slot, head.execution_block_hash),
+            (SEPOLIA_ATTESTED_SLOT, BlockHash::new(SEPOLIA_ATTESTED_HASH))
+        );
+        // Under the digest of the fork before Gloas, the update is invalid.
+        let fulu = Some(
+            beacon.fork_digest(beacon.fork("gloas").expect("gloas").epoch * SLOTS_PER_EPOCH - 1),
+        );
+        assert!(matches!(
+            decode_light_client_response(beacon, LightClientRequest::Optimistic, &encoded, fulu),
+            Err(PeerFailure::Invalid(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn gloas_finality_and_heads_take_their_numbers_from_execution_headers() {
+        let finalized = BlockHash::new(SEPOLIA_FINALIZED_HASH);
+        let attested = BlockHash::new(SEPOLIA_ATTESTED_HASH);
+        let heads = AttestedHeadPublisher::new();
+        let source = gloas_source()
+            .with_attested_heads(heads.clone())
+            .with_execution_headers(Arc::new(TableHeaders(vec![
+                (finalized, 9_000_000),
+                (attested, 9_000_060),
+            ])));
+        let report = source
+            .probe_checkpoint(operator(SEPOLIA_CHECKPOINT_ROOT, SEPOLIA_FINALIZED_SLOT))
+            .await;
+        assert!(report.accepted, "{:?}", report.errors);
+        let anchor = VerifiedFinalityAnchor {
+            beacon_slot: SEPOLIA_FINALIZED_SLOT,
+            beacon_block_root: SEPOLIA_CHECKPOINT_ROOT,
+            execution_block_number: 9_000_000,
+            execution_block_hash: finalized,
+        };
+        assert_eq!(
+            (report.selected, report.checkpoint_anchor),
+            (Some(anchor), Some(anchor))
+        );
+        let head = heads.latest().expect("attested head");
+        assert_eq!(
+            (head.beacon_slot, head.block_number, head.block_hash),
+            (SEPOLIA_ATTESTED_SLOT, BlockNumber(9_000_060), attested)
+        );
+        let mut events = source
+            .subscribe(checkpoint(anchor), CancellationToken::new())
+            .await
+            .expect("subscribe");
+        assert!(matches!(
+            events.next().await,
+            Some(Ok(FinalityEvent::Finalized {
+                block_number: BlockNumber(9_000_000),
+                ..
+            }))
+        ));
+
+        // Without execution headers, Gloas finality is refused, not guessed.
+        let report = gloas_source()
+            .probe_checkpoint(operator(SEPOLIA_CHECKPOINT_ROOT, SEPOLIA_FINALIZED_SLOT))
+            .await;
+        assert!(!report.accepted);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|error| error.contains("by hash alone")),
+            "{:?}",
+            report.errors
+        );
     }
 }

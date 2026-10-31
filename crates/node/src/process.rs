@@ -5328,9 +5328,9 @@ async fn probe_finality(
                     "--endpoint and --minimum-agreement only apply to beacon_api finality probes"
                 );
             }
-            let mut p2p_config = consensus_p2p_config(&config.finality);
+            let mut p2p_config = consensus_p2p_config(config.chain_entry()?, &config.finality);
             p2p_config.anchor = anchor_file;
-            let source = VerifiedConsensusP2p::mainnet(p2p_config)?;
+            let source = VerifiedConsensusP2p::new(p2p_config)?;
             if checkpoint_slot == 0 {
                 bail!(
                     "consensus_p2p finality probe requires --checkpoint-slot or finality.checkpoint_slot"
@@ -5357,12 +5357,13 @@ async fn probe_finality(
 }
 
 fn consensus_p2p_config(
+    chain: Arc<leani_chain::Chain>,
     finality: &crate::config::FinalityConfig,
 ) -> leani_finality_consensus_p2p::ConsensusP2pConfig {
     let mut config = leani_finality_consensus_p2p::ConsensusP2pConfig {
         discovery_port: finality.discovery_port,
         minimum_peers: finality.minimum_peers,
-        ..leani_finality_consensus_p2p::ConsensusP2pConfig::default()
+        ..leani_finality_consensus_p2p::ConsensusP2pConfig::new(chain)
     };
     if !finality.bootnodes.is_empty() {
         config.bootnodes.clone_from(&finality.bootnodes);
@@ -7147,9 +7148,9 @@ async fn p2p_history_anchor(
                 .context("accepted finality report omitted its selected anchor")?
         }
         crate::config::FinalitySourceKind::ConsensusP2p => {
-            let mut p2p_config = consensus_p2p_config(&config.finality);
+            let mut p2p_config = consensus_p2p_config(config.chain_entry()?, &config.finality);
             p2p_config.anchor = anchor_file;
-            let source = VerifiedConsensusP2p::mainnet(p2p_config)?;
+            let source = VerifiedConsensusP2p::new(p2p_config)?;
             let report = source.probe_checkpoint(checkpoint).await;
             if !report.accepted {
                 bail!(
@@ -7715,10 +7716,12 @@ async fn run_network_lanes(
             (source, selected, bootstrap)
         }
         crate::config::FinalitySourceKind::ConsensusP2p => {
-            let mut p2p_config = consensus_p2p_config(&config.finality);
+            let mut p2p_config = consensus_p2p_config(config.chain_entry()?, &config.finality);
             p2p_config.anchor = anchor_file;
             let source = Arc::new(
-                VerifiedConsensusP2p::mainnet(p2p_config)?.with_attested_heads(attested_heads),
+                VerifiedConsensusP2p::new(p2p_config)?
+                    .with_attested_heads(attested_heads)
+                    .with_execution_headers(live_source.clone()),
             );
             let probe = source.probe_checkpoint(trusted_checkpoint).await;
             if !probe.accepted {

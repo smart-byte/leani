@@ -3,8 +3,9 @@
 Real, signed Ethereum Sepolia light-client responses from after the Gloas
 fork, in the standard Beacon API JSON format. Gloas headers prove their
 execution block by hash alone, through an execution block hash branch. The
-finality tests of `leani-finality-beacon-api` verify them end to end with the
-pinned Helios verifier.
+finality tests of `leani-finality-beacon-api` and
+`leani-finality-consensus-p2p` verify them end to end with the pinned Helios
+verifier.
 
 - Source: the Lodestar Sepolia Beacon API, `https://lodestar-sepolia.chainsafe.io/`
 - Files are the responses as served, unmodified:
