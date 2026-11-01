@@ -20,7 +20,6 @@ use tracing::warn;
 use super::{PeerMaterialKind, PeerQualification};
 
 const SCHEMA_VERSION: i64 = 1;
-const CHAIN_ID_MAINNET: i64 = 1;
 
 const SCHEMA: &str = r"
 CREATE TABLE IF NOT EXISTS execution_peer_candidates (
@@ -143,6 +142,8 @@ struct CandidateRecord {
 pub(super) struct ExecutionPeerStore {
     path: Option<PathBuf>,
     maximum_entries: usize,
+    /// Rows of other chains in a shared file stay invisible.
+    chain_id: i64,
     pool: OnceCell<SqlitePool>,
     initialized: OnceCell<()>,
     candidates: Mutex<HashMap<B512, CandidateRecord>>,
@@ -151,10 +152,11 @@ pub(super) struct ExecutionPeerStore {
 }
 
 impl ExecutionPeerStore {
-    pub(super) fn new(path: Option<PathBuf>, maximum_entries: usize) -> Self {
+    pub(super) fn new(path: Option<PathBuf>, maximum_entries: usize, chain_id: u64) -> Self {
         Self {
             path,
             maximum_entries,
+            chain_id: i64::try_from(chain_id).unwrap_or(i64::MAX),
             pool: OnceCell::new(),
             initialized: OnceCell::new(),
             candidates: Mutex::new(HashMap::new()),
@@ -170,8 +172,9 @@ impl ExecutionPeerStore {
                     return Ok(());
                 };
                 let pool = self.pool().await?;
-                let mut candidates = load_candidates(pool, self.maximum_entries).await?;
-                let mut quality = load_quality(pool, self.maximum_entries).await?;
+                let mut candidates =
+                    load_candidates(pool, self.maximum_entries, self.chain_id).await?;
+                let mut quality = load_quality(pool, self.maximum_entries, self.chain_id).await?;
                 let mut in_memory_candidates = self
                     .candidates
                     .lock()
@@ -428,7 +431,7 @@ impl ExecutionPeerStore {
                     record = excluded.record,
                     last_seen_unix_ms = excluded.last_seen_unix_ms",
             )
-            .bind(CHAIN_ID_MAINNET)
+            .bind(self.chain_id)
             .bind(record.id.as_slice())
             .bind(record.to_string())
             .bind(to_i64(now)?)
@@ -436,9 +439,9 @@ impl ExecutionPeerStore {
             .await?;
         }
         for (peer_id, evidence) in quality {
-            upsert_quality(&mut transaction, *peer_id, evidence).await?;
+            upsert_quality(&mut transaction, *peer_id, evidence, self.chain_id).await?;
         }
-        prune_database(&mut transaction, self.maximum_entries).await?;
+        prune_database(&mut transaction, self.maximum_entries, self.chain_id).await?;
         transaction.commit().await?;
         Ok(())
     }
@@ -531,8 +534,8 @@ pub struct ExecutionPeerStoreMerge {
     pub imported: usize,
 }
 
-/// Merge bounded candidates and monotonic material evidence from sibling
-/// Mainnet peer stores into `destination`.
+/// Merge bounded candidates and monotonic material evidence of `chain_id`
+/// from sibling peer stores into `destination`.
 ///
 /// # Errors
 ///
@@ -543,9 +546,10 @@ pub async fn merge_execution_peer_stores(
     destination: &Path,
     sources: &[PathBuf],
     maximum_entries: usize,
+    chain_id: u64,
 ) -> Result<Option<ExecutionPeerStoreMerge>, ExecutionPeerStoreError> {
     let destination_store =
-        ExecutionPeerStore::new(Some(destination.to_path_buf()), maximum_entries);
+        ExecutionPeerStore::new(Some(destination.to_path_buf()), maximum_entries, chain_id);
     destination_store.initialize().await?;
     let destination_ids = destination_store
         .candidates
@@ -570,7 +574,7 @@ pub async fn merge_execution_peer_stores(
         .iter()
         .filter(|source| source.as_path() != destination && source.is_file())
     {
-        let source_store = ExecutionPeerStore::new(Some(source.clone()), maximum_entries);
+        let source_store = ExecutionPeerStore::new(Some(source.clone()), maximum_entries, chain_id);
         if let Err(error) = source_store.initialize().await {
             warn!(path = %source.display(), %error, "ignoring unreadable sibling execution peer store");
             continue;
@@ -658,11 +662,11 @@ impl ExecutionPeerStore {
         let pool = self.pool().await?;
         let mut transaction = pool.begin().await?;
         sqlx::query("DELETE FROM execution_peer_candidates WHERE chain_id = ?")
-            .bind(CHAIN_ID_MAINNET)
+            .bind(self.chain_id)
             .execute(&mut *transaction)
             .await?;
         sqlx::query("DELETE FROM execution_peer_quality WHERE chain_id = ?")
-            .bind(CHAIN_ID_MAINNET)
+            .bind(self.chain_id)
             .execute(&mut *transaction)
             .await?;
         for candidate in candidates.values() {
@@ -670,7 +674,7 @@ impl ExecutionPeerStore {
                 "INSERT INTO execution_peer_candidates(chain_id, peer_id, record, last_seen_unix_ms)
                  VALUES (?, ?, ?, ?)",
             )
-            .bind(CHAIN_ID_MAINNET)
+            .bind(self.chain_id)
             .bind(candidate.record.id.as_slice())
             .bind(candidate.record.to_string())
             .bind(to_i64(candidate.last_seen_unix_ms)?)
@@ -678,7 +682,7 @@ impl ExecutionPeerStore {
             .await?;
         }
         for (peer_id, evidence) in &quality {
-            upsert_quality(&mut transaction, *peer_id, evidence).await?;
+            upsert_quality(&mut transaction, *peer_id, evidence, self.chain_id).await?;
         }
         transaction.commit().await?;
         Ok(())
@@ -732,6 +736,7 @@ async fn open_database(path: &Path, create: bool) -> Result<SqlitePool, Executio
 async fn load_candidates(
     pool: &SqlitePool,
     maximum_entries: usize,
+    chain_id: i64,
 ) -> Result<HashMap<B512, CandidateRecord>, ExecutionPeerStoreError> {
     let rows = sqlx::query(
         "SELECT candidate.peer_id, candidate.record, candidate.last_seen_unix_ms
@@ -763,7 +768,7 @@ async fn load_candidates(
            candidate.peer_id ASC
          LIMIT ?",
     )
-    .bind(CHAIN_ID_MAINNET)
+    .bind(chain_id)
     .bind(i64::try_from(maximum_entries).map_err(|_| ExecutionPeerStoreError::IntegerRange)?)
     .fetch_all(pool)
     .await?;
@@ -791,6 +796,7 @@ async fn load_candidates(
 async fn load_quality(
     pool: &SqlitePool,
     maximum_entries: usize,
+    chain_id: i64,
 ) -> Result<HashMap<B512, PeerQualityEvidence>, ExecutionPeerStoreError> {
     let rows = sqlx::query(
         "SELECT peer_id, fork_compatible, highest_served_block,
@@ -818,7 +824,7 @@ async fn load_quality(
            peer_id ASC
          LIMIT ?",
     )
-    .bind(CHAIN_ID_MAINNET)
+    .bind(chain_id)
     .bind(i64::try_from(maximum_entries).map_err(|_| ExecutionPeerStoreError::IntegerRange)?)
     .fetch_all(pool)
     .await?;
@@ -846,6 +852,7 @@ async fn upsert_quality(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     peer_id: B512,
     evidence: &PeerQualityEvidence,
+    chain_id: i64,
 ) -> Result<(), ExecutionPeerStoreError> {
     sqlx::query(
         "INSERT INTO execution_peer_quality(
@@ -865,7 +872,7 @@ async fn upsert_quality(
             last_failure_unix_ms = excluded.last_failure_unix_ms,
             qualification = excluded.qualification",
     )
-    .bind(CHAIN_ID_MAINNET)
+    .bind(chain_id)
     .bind(peer_id.as_slice())
     .bind(i64::from(evidence.fork_compatible))
     .bind(optional_i64(evidence.highest_served_block)?)
@@ -884,6 +891,7 @@ async fn upsert_quality(
 async fn prune_database(
     transaction: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
     maximum_entries: usize,
+    chain_id: i64,
 ) -> Result<(), ExecutionPeerStoreError> {
     let maximum =
         i64::try_from(maximum_entries).map_err(|_| ExecutionPeerStoreError::IntegerRange)?;
@@ -920,8 +928,8 @@ async fn prune_database(
             LIMIT ?
          )",
     )
-    .bind(CHAIN_ID_MAINNET)
-    .bind(CHAIN_ID_MAINNET)
+    .bind(chain_id)
+    .bind(chain_id)
     .bind(maximum)
     .execute(&mut **transaction)
     .await?;
@@ -950,8 +958,8 @@ async fn prune_database(
             LIMIT ?
          )",
     )
-    .bind(CHAIN_ID_MAINNET)
-    .bind(CHAIN_ID_MAINNET)
+    .bind(chain_id)
+    .bind(chain_id)
     .bind(maximum)
     .execute(&mut **transaction)
     .await?;
@@ -1091,10 +1099,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn chains_sharing_a_store_file_do_not_see_each_others_peers() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let path = directory.path().join("execution-network.sqlite");
+        let mainnet = ExecutionPeerStore::new(Some(path.clone()), 16, 1);
+        mainnet
+            .persist(vec![node_record(1)])
+            .await
+            .expect("persist mainnet peers");
+
+        let hoodi = ExecutionPeerStore::new(Some(path.clone()), 16, 560_048);
+        hoodi.initialize().await.expect("open the shared store");
+        assert!(hoodi.candidate_ids().is_empty());
+        hoodi
+            .persist(vec![node_record(2)])
+            .await
+            .expect("persist hoodi peers");
+
+        let reopened = ExecutionPeerStore::new(Some(path), 16, 1);
+        reopened.initialize().await.expect("reopen mainnet peers");
+        assert_eq!(reopened.candidate_ids(), [node_record(1).id].into());
+    }
+
+    #[tokio::test]
     async fn persistent_pruning_is_bounded_and_keeps_proven_body_peers() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("execution-network.sqlite");
-        let store = ExecutionPeerStore::new(Some(path.clone()), 2);
+        let store = ExecutionPeerStore::new(Some(path.clone()), 2, 1);
         let proven = node_record(1);
         let second = node_record(2);
         let excess = node_record(3);
@@ -1109,7 +1140,7 @@ mod tests {
             .await
             .expect("persist bounded store");
 
-        let reopened = ExecutionPeerStore::new(Some(path), 2);
+        let reopened = ExecutionPeerStore::new(Some(path), 2, 1);
         reopened.initialize().await.expect("reopen bounded store");
         let retained = reopened.candidate_ids();
         assert_eq!(retained.len(), 2);
@@ -1120,7 +1151,7 @@ mod tests {
     async fn reopening_with_a_smaller_bound_keeps_proven_body_peers() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let path = directory.path().join("execution-network.sqlite");
-        let store = ExecutionPeerStore::new(Some(path.clone()), 3);
+        let store = ExecutionPeerStore::new(Some(path.clone()), 3, 1);
         let proven = node_record(1);
         store.record_success(
             proven.id,
@@ -1133,7 +1164,7 @@ mod tests {
             .await
             .expect("persist peer store");
 
-        let reopened = ExecutionPeerStore::new(Some(path), 1);
+        let reopened = ExecutionPeerStore::new(Some(path), 1, 1);
         reopened.initialize().await.expect("reopen peer store");
         assert_eq!(reopened.candidate_ids(), HashSet::from([proven.id]));
         assert!(reopened.has_material_success(proven.id, PeerMaterialKind::Body));
@@ -1141,7 +1172,7 @@ mod tests {
 
     #[test]
     fn volatile_quality_state_stays_bounded() {
-        let store = ExecutionPeerStore::new(None, 2);
+        let store = ExecutionPeerStore::new(None, 2, 1);
         for marker in 1..=8 {
             store.record_failure(node_record(marker).id, "unavailable");
         }
@@ -1165,7 +1196,7 @@ mod tests {
 
     #[test]
     fn quality_updates_preserve_order_when_wall_clock_milliseconds_collide() {
-        let store = ExecutionPeerStore::new(None, 2);
+        let store = ExecutionPeerStore::new(None, 2, 1);
         let peer_id = node_record(1).id;
         let same_millisecond = observed_at_unix_ms().saturating_add(60_000);
         store
@@ -1196,7 +1227,7 @@ mod tests {
 
     #[test]
     fn lagging_or_timed_out_qualification_is_not_a_service_failure() {
-        let store = ExecutionPeerStore::new(None, 16);
+        let store = ExecutionPeerStore::new(None, 16, 1);
         let peer_id = node_record(1).id;
         store.record_success(
             peer_id,
@@ -1234,7 +1265,7 @@ mod tests {
             .path()
             .join("peers%41")
             .join("execution-network.sqlite");
-        let store = ExecutionPeerStore::new(Some(requested.clone()), 16);
+        let store = ExecutionPeerStore::new(Some(requested.clone()), 16, 1);
         store
             .persist(vec![node_record(1)])
             .await
@@ -1242,7 +1273,7 @@ mod tests {
         assert!(requested.exists());
         assert!(!directory.path().join("peersA").exists());
 
-        let reopened = ExecutionPeerStore::new(Some(requested), 16);
+        let reopened = ExecutionPeerStore::new(Some(requested), 16, 1);
         reopened.initialize().await.expect("reopen peer store");
         assert_eq!(reopened.candidate_ids(), HashSet::from([node_record(1).id]));
     }
@@ -1258,7 +1289,7 @@ mod tests {
             .expect("change schema version");
         pool.close().await;
 
-        let store = ExecutionPeerStore::new(Some(path), 16);
+        let store = ExecutionPeerStore::new(Some(path), 16, 1);
         assert!(matches!(
             store.initialize().await,
             Err(ExecutionPeerStoreError::UnsupportedSchema {

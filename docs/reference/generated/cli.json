@@ -1895,6 +1895,91 @@
                 "subcommands": []
               },
               {
+                "name": "op-gossip",
+                "about": "Follow an op-stack chain's sequencer-signed block gossip",
+                "usage": "Usage: leani source probe op-gossip [OPTIONS]",
+                "arguments": [
+                  {
+                    "id": "seconds",
+                    "long": "seconds",
+                    "short": null,
+                    "help": "How long to listen",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "120"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "output",
+                    "long": "output",
+                    "short": null,
+                    "help": "Optional JSON lines destination for the verified blocks",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help (see more with '--help')",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
                 "name": "p2p",
                 "about": "Exercise the recent execution P2P boundary",
                 "usage": "Usage: leani source probe p2p [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
@@ -2331,6 +2416,13 @@
                     "subcommands": []
                   },
                   {
+                    "name": "op-gossip",
+                    "about": "Follow an op-stack chain's sequencer-signed block gossip",
+                    "usage": "Usage: leani source probe help op-gossip",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
                     "name": "p2p",
                     "about": "Exercise the recent execution P2P boundary",
                     "usage": "Usage: leani source probe help p2p",
@@ -2378,6 +2470,13 @@
                     "name": "xatu",
                     "about": "Inspect the configured Xatu catalog",
                     "usage": "Usage: leani source help probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "op-gossip",
+                    "about": "Follow an op-stack chain's sequencer-signed block gossip",
+                    "usage": "Usage: leani source help probe op-gossip",
                     "arguments": [],
                     "subcommands": []
                   },
@@ -4692,6 +4791,13 @@
                     "name": "xatu",
                     "about": "Inspect the configured Xatu catalog",
                     "usage": "Usage: leani help source probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "op-gossip",
+                    "about": "Follow an op-stack chain's sequencer-signed block gossip",
+                    "usage": "Usage: leani help source probe op-gossip",
                     "arguments": [],
                     "subcommands": []
                   },

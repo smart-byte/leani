@@ -1,0 +1,18 @@
+name = "ethereum-sepolia"
+aliases = ["sepolia"]
+family = "ethereum"
+chain_id = 11155111
+genesis_hash = "0x25a5cc106eea7138acab33231d7160d69cb777ee0c2c553fcddf5138993e6dd9"
+merge_block = 1735371
+
+[execution]
+dns_tree = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.sepolia.ethdisco.net"
+
+[beacon]
+genesis_time = 1655733600
+genesis_validators_root = "0xd8ea171f3c94aea21ebc42a1ed61052acf3f9209c00e4efbaaddac09ed9b8078"
+
+[defaults]
+beacon_endpoints = ["https://lodestar-sepolia.chainsafe.io/"]
+checkpoint_providers = ["https://checkpoint-sync.sepolia.ethpandaops.io/"]
+history_sources = []

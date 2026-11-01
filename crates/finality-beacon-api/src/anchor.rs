@@ -17,10 +17,9 @@ use leani_primitives::BlockHash;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::{
-    BeaconApiError, MAINNET_GENESIS_TIME, SLOT_SECONDS, SLOTS_PER_EPOCH, VerifiedFinalityAnchor,
-    verify_checkpoint_age,
-};
+use leani_chain::BeaconNetwork;
+
+use crate::{BeaconApiError, SLOTS_PER_EPOCH, VerifiedFinalityAnchor, verify_checkpoint_age};
 
 /// File under the data directory that holds the newest verified finality
 /// anchor.
@@ -131,6 +130,7 @@ impl StartAnchor {
 /// or corrupt anchor file falls back to the checkpoint with a warning.
 #[must_use]
 pub fn resolve_start_anchor(
+    network: &BeaconNetwork,
     anchor_path: Option<&Path>,
     checkpoint: TrustedCheckpoint,
     max_age: Duration,
@@ -174,7 +174,7 @@ pub fn resolve_start_anchor(
         }
         return configured;
     }
-    if let Err(error) = verify_checkpoint_age(anchor.beacon_slot, max_age, now) {
+    if let Err(error) = verify_checkpoint_age(network, anchor.beacon_slot, max_age, now) {
         warn!(%error, "ignoring a persisted finality anchor past the checkpoint age limit");
         return configured;
     }
@@ -332,10 +332,10 @@ impl AnchorWriter {
     }
 }
 
-/// Unix time at which a mainnet beacon slot starts.
+/// Unix time at which a beacon slot of `network` starts.
 #[must_use]
-pub const fn slot_unix_seconds(slot: u64) -> u64 {
-    MAINNET_GENESIS_TIME.saturating_add(slot.saturating_mul(SLOT_SECONDS))
+pub const fn slot_unix_seconds(network: &BeaconNetwork, slot: u64) -> u64 {
+    network.slot_start(slot)
 }
 
 /// Whether a restart can re-bootstrap from `anchor`. Beacon nodes serve
