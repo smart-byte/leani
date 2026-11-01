@@ -6,8 +6,7 @@ JSON format. The finality tests of `leani-finality-beacon-api` and
 verifier.
 
 - Source: <https://github.com/a16z/helios>
-- Revision: `204c998a927348e1c000a664f08d5b37b1b0d924` (the revision pinned for
-  `helios-consensus-core` in the workspace `Cargo.toml`)
+- Revision: `204c998a927348e1c000a664f08d5b37b1b0d924`
 - Path in the source repository: `ethereum/testdata/`
 - Files are copied unmodified:
 

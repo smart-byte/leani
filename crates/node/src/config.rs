@@ -1628,12 +1628,12 @@ impl Config {
         match self.chain_entry() {
             Ok(entry) => {
                 if matches!(self.finality.kind, FinalitySourceKind::ConsensusP2p)
-                    && entry.chain_id != 1
+                    && entry.beacon.is_none()
                 {
                     errors.push(ValidationError::new(
                         "finality.kind",
                         format!(
-                            "consensus_p2p finality follows ethereum-mainnet only; use beacon_api on {}",
+                            "consensus_p2p finality follows a beacon chain, and {} has none",
                             entry.name
                         ),
                     ));
@@ -3916,6 +3916,25 @@ max_blocks = 64"#,
                 .any(|error| error.field == "finality.endpoints[1]"),
             "{errors:?}"
         );
+    }
+
+    #[test]
+    fn consensus_p2p_follows_any_beacon_chain() {
+        let mut config = config();
+        config.finality.kind = FinalitySourceKind::ConsensusP2p;
+        config.finality.endpoints.clear();
+        config.finality.checkpoint_slot = 12_345;
+        config.chain.name = "ethereum-sepolia".to_owned();
+        config.chain.chain_id = 11_155_111;
+        config.sources.history.clear();
+        config.rpc.historical_mode = HistoricalMode::Disabled;
+        config
+            .clone()
+            .validate()
+            .expect("Sepolia has a beacon chain");
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8_453;
+        assert!(error_fields(&config).contains(&"finality.kind".to_owned()));
     }
 
     #[test]

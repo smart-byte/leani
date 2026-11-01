@@ -398,9 +398,10 @@ pub enum FinalityEvent {
 }
 
 /// An execution block the Ethereum sync committee attested: the execution
-/// payload of a beacon header that at least two thirds of the committee signed
-/// in a light-client optimistic update, proven by the header's execution
-/// branch.
+/// block a beacon header that at least two thirds of the committee signed in
+/// a light-client optimistic update proves by its execution branch. Before
+/// Gloas that is the header's own payload; from Gloas, the payload its block
+/// builds on.
 ///
 /// It is not final. A later attested head may be on another branch.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -627,6 +628,17 @@ pub trait FinalitySource: Send + Sync {
         checkpoint: ConsensusCheckpoint,
         cancellation: CancellationToken,
     ) -> Result<FinalityEventStream, SourceError>;
+}
+
+/// Execution block numbers by hash. A Gloas light-client header proves an
+/// execution block by hash alone; the number comes from a header checked
+/// against that hash.
+#[async_trait]
+pub trait ExecutionHeaders: Send + Sync {
+    /// # Errors
+    ///
+    /// Returns an error when no header matching `hash` could be obtained.
+    async fn block_number(&self, hash: BlockHash) -> Result<BlockNumber, SourceError>;
 }
 
 #[derive(Clone, Debug, Error, Eq, PartialEq)]

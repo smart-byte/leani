@@ -2,16 +2,15 @@
 //!
 //! Beacon endpoints are treated only as untrusted transports. Checkpoint
 //! bootstraps, sync-committee transitions, finality branches, BLS aggregate
-//! signatures, and execution-payload branches are verified locally by the
-//! pinned Helios consensus-core implementation.
+//! signatures, and execution branches are verified locally by the pinned
+//! Helios consensus-core implementation.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     fmt,
     ops::Range,
-    str::FromStr,
     sync::{
-        Arc,
+        Arc, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -35,11 +34,11 @@ use leani_primitives::{
     BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
 };
 use leani_source_api::{
-    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
-    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
+    AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, ExecutionHeaders, FinalityEvent,
+    FinalityEventStream, FinalityModel, FinalitySource, Partitioning, SourceDescriptor,
+    SourceError,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -73,8 +72,6 @@ pub use http::{
 };
 
 pub use leani_primitives::MAINNET_GENESIS_TIME;
-pub const MAINNET_GENESIS_ROOT: B256 =
-    alloy_primitives::b256!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95");
 const MAX_UPDATES_PER_REQUEST: u64 = 128;
 use leani_chain::{BeaconNetwork, Chain};
 const SLOTS_PER_EPOCH: u64 = 32;
@@ -82,10 +79,6 @@ const SLOTS_PER_EPOCH: u64 = 32;
 const CLOCK_SKEW_SLOTS: u64 = 1;
 /// How long a poll waits after the first verified endpoint for the others.
 const AGREEMENT_GRACE: Duration = Duration::from_secs(2);
-const FULU_FORK_EPOCH: u64 = 411_392;
-const ELECTRA_FORK_EPOCH: u64 = 364_032;
-const MAX_BLOBS_PER_BLOCK_ELECTRA: u64 = 9;
-const MAINNET_BLOB_SCHEDULE: [(u64, u64); 2] = [(412_672, 15), (419_072, 21)];
 pub const DEFAULT_MAX_CHECKPOINT_AGE: Duration = Duration::from_hours(336);
 /// Members of the Ethereum mainnet sync committee.
 const SYNC_COMMITTEE_SIZE: u64 = 512;
@@ -95,76 +88,13 @@ pub const SYNC_COMMITTEE_SUPERMAJORITY: u64 = (2 * SYNC_COMMITTEE_SIZE).div_ceil
 const OPTIMISTIC_UPDATE_PATH: &str = "eth/v1/beacon/light_client/optimistic_update";
 
 /// Immutable Helios revision used by this adapter.
-pub const HELIOS_REVISION: &str = "204c998a927348e1c000a664f08d5b37b1b0d924";
-
-/// Compute the four-byte mainnet fork digest for a beacon slot.
-#[must_use]
-pub fn mainnet_fork_digest(slot: u64) -> [u8; 4] {
-    let epoch = slot / 32;
-    let version = if epoch >= FULU_FORK_EPOCH {
-        [0x06, 0, 0, 0]
-    } else if epoch >= ELECTRA_FORK_EPOCH {
-        [0x05, 0, 0, 0]
-    } else if epoch >= 269_568 {
-        [0x04, 0, 0, 0]
-    } else if epoch >= 194_048 {
-        [0x03, 0, 0, 0]
-    } else if epoch >= 144_896 {
-        [0x02, 0, 0, 0]
-    } else if epoch >= 74_240 {
-        [0x01, 0, 0, 0]
-    } else {
-        [0; 4]
-    };
-    let mut fork_data = [0_u8; 64];
-    fork_data[..4].copy_from_slice(&version);
-    fork_data[32..].copy_from_slice(MAINNET_GENESIS_ROOT.as_slice());
-    let mut digest = Sha256::digest(fork_data);
-    if epoch >= FULU_FORK_EPOCH {
-        // EIP-7892 folds the active blob parameters into the P2P digest so
-        // blob-parameter-only forks separate gossip and req/resp traffic
-        // without changing the consensus fork version.
-        let (parameter_epoch, maximum_blobs) = MAINNET_BLOB_SCHEDULE
-            .iter()
-            .rev()
-            .copied()
-            .find(|(activation, _)| epoch >= *activation)
-            .unwrap_or((ELECTRA_FORK_EPOCH, MAX_BLOBS_PER_BLOCK_ELECTRA));
-        let mut parameters = [0_u8; 16];
-        parameters[..8].copy_from_slice(&parameter_epoch.to_le_bytes());
-        parameters[8..].copy_from_slice(&maximum_blobs.to_le_bytes());
-        let mask = Sha256::digest(parameters);
-        for (byte, mask) in digest.iter_mut().zip(mask) {
-            *byte ^= mask;
-        }
-    }
-    [digest[0], digest[1], digest[2], digest[3]]
-}
-
-/// Every fork digest mainnet uses under the schedule this release knows,
-/// its consensus forks and its blob-parameter-only forks. A peer on any
-/// other digest is on a fork this release cannot verify.
-#[must_use]
-pub fn known_mainnet_fork_digests() -> Vec<[u8; 4]> {
-    let forks = mainnet_forks();
-    [
-        forks.genesis,
-        forks.altair,
-        forks.bellatrix,
-        forks.capella,
-        forks.deneb,
-        forks.electra,
-        forks.fulu,
-    ]
-    .iter()
-    .map(|fork| fork.epoch)
-    .chain(MAINNET_BLOB_SCHEDULE.iter().map(|(epoch, _)| *epoch))
-    .map(|epoch| mainnet_fork_digest(epoch * SLOTS_PER_EPOCH))
-    .collect()
-}
+pub const HELIOS_REVISION: &str = "2af9b41887e069144ee56cd710f3ddca195473f8";
+/// Recent execution block numbers kept by hash, so a Gloas header's block is
+/// looked up once rather than at every poll.
+const RECENT_EXECUTION_NUMBERS: usize = 64;
 
 /// Consensus fork names whose light-client data this release verifies.
-const KNOWN_FORK_NAMES: [&str; 7] = [
+const KNOWN_FORK_NAMES: [&str; 8] = [
     "phase0",
     "altair",
     "bellatrix",
@@ -172,6 +102,7 @@ const KNOWN_FORK_NAMES: [&str; 7] = [
     "deneb",
     "electra",
     "fulu",
+    "gloas",
 ];
 
 /// The fork a Beacon API response names, when this release cannot verify
@@ -321,6 +252,123 @@ pub struct VerifiedFinalityAnchor {
     pub execution_block_hash: BlockHash,
 }
 
+impl VerifiedFinalityAnchor {
+    /// The anchor as the attested head the live lane follows.
+    #[must_use]
+    pub const fn attested_head(self) -> AttestedHead {
+        AttestedHead {
+            beacon_slot: self.beacon_slot,
+            beacon_block_root: self.beacon_block_root,
+            block_number: BlockNumber(self.execution_block_number),
+            block_hash: self.execution_block_hash,
+        }
+    }
+}
+
+/// What a verified light-client header proves. A Gloas header names its
+/// execution block by hash alone.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HeaderAnchor {
+    pub beacon_slot: u64,
+    pub beacon_block_root: [u8; 32],
+    pub execution_block_hash: BlockHash,
+    pub execution_block_number: Option<u64>,
+}
+
+impl HeaderAnchor {
+    /// The anchor with the execution block number its header carries.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a Gloas header, which carries none.
+    pub fn numbered(self) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
+        self.execution_block_number
+            .map(|number| self.with_number(number))
+            .ok_or(BeaconApiError::UnnumberedHeader(self.execution_block_hash))
+    }
+
+    const fn with_number(self, number: u64) -> VerifiedFinalityAnchor {
+        VerifiedFinalityAnchor {
+            beacon_slot: self.beacon_slot,
+            beacon_block_root: self.beacon_block_root,
+            execution_block_number: number,
+            execution_block_hash: self.execution_block_hash,
+        }
+    }
+}
+
+/// Numbers the execution blocks Gloas headers name by hash, through
+/// execution headers checked against the hash.
+#[derive(Clone, Default)]
+pub struct ExecutionNumbers {
+    headers: Option<Arc<dyn ExecutionHeaders>>,
+    recent: Arc<std::sync::Mutex<VecDeque<(BlockHash, u64)>>>,
+}
+
+impl fmt::Debug for ExecutionNumbers {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExecutionNumbers")
+            .field("headers", &self.headers.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+impl ExecutionNumbers {
+    /// Number through `headers`. The default numbers no Gloas header.
+    #[must_use]
+    pub fn new(headers: Arc<dyn ExecutionHeaders>) -> Self {
+        Self {
+            headers: Some(headers),
+            recent: Arc::default(),
+        }
+    }
+
+    /// `anchor` with its execution block number: the one its header carries,
+    /// or for a Gloas header, the one a recent or a new lookup found.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a Gloas header whose number no execution header
+    /// served.
+    pub async fn resolve(
+        &self,
+        anchor: HeaderAnchor,
+    ) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
+        if anchor.execution_block_number.is_some() {
+            return anchor.numbered();
+        }
+        let hash = anchor.execution_block_hash;
+        let known = self
+            .recent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .find_map(|(known, number)| (*known == hash).then_some(*number));
+        if let Some(number) = known {
+            return Ok(anchor.with_number(number));
+        }
+        let headers = self
+            .headers
+            .as_ref()
+            .ok_or(BeaconApiError::UnnumberedHeader(hash))?;
+        let number = headers
+            .block_number(hash)
+            .await
+            .map_err(|error| BeaconApiError::ExecutionNumber {
+                hash,
+                detail: error.to_string(),
+            })?
+            .0;
+        let mut recent = self.recent.lock().unwrap_or_else(PoisonError::into_inner);
+        if recent.len() == RECENT_EXECUTION_NUMBERS {
+            recent.pop_front();
+        }
+        recent.push_back((hash, number));
+        Ok(anchor.with_number(number))
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct EndpointProbe {
     /// Endpoint without userinfo or query string.
@@ -363,7 +411,7 @@ pub struct FinalityProbeReport {
 #[derive(Clone, Debug)]
 pub struct LightClientVerifier {
     checkpoint_root: B256,
-    checkpoint_anchor: VerifiedFinalityAnchor,
+    checkpoint_anchor: HeaderAnchor,
     store: LightClientStore<MainnetConsensusSpec>,
     network: BeaconNetwork,
     forks: Forks,
@@ -389,9 +437,9 @@ impl LightClientVerifier {
         let forks = helios_forks(network);
         verify_bootstrap(bootstrap, checkpoint, &forks)
             .map_err(|error| BeaconApiError::Verification(error.to_string()))?;
-        let checkpoint_slot = bootstrap.header().beacon().slot;
-        verify_checkpoint_age(network, checkpoint_slot, max_checkpoint_age, now)?;
-        let checkpoint_anchor = anchor_from_header(bootstrap.header(), checkpoint.into())?;
+        let header = bootstrap.header();
+        verify_checkpoint_age(network, header.beacon().slot, max_checkpoint_age, now)?;
+        let checkpoint_anchor = anchor_from_header(&header, checkpoint.into())?;
         let mut store = LightClientStore::<MainnetConsensusSpec>::default();
         apply_bootstrap(&mut store, bootstrap);
         Ok(Self {
@@ -410,7 +458,7 @@ impl LightClientVerifier {
     }
 
     #[must_use]
-    pub fn checkpoint_anchor(&self) -> VerifiedFinalityAnchor {
+    pub fn checkpoint_anchor(&self) -> HeaderAnchor {
         self.checkpoint_anchor
     }
 
@@ -419,8 +467,8 @@ impl LightClientVerifier {
     /// # Errors
     ///
     /// Returns an error until the finalized header contains a valid execution
-    /// payload proof.
-    pub fn finalized_anchor(&self) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
+    /// proof.
+    pub fn finalized_anchor(&self) -> Result<HeaderAnchor, BeaconApiError> {
         let root = beacon_header_root(self.store.finalized_header.beacon());
         anchor_from_header(&self.store.finalized_header, root)
     }
@@ -484,7 +532,7 @@ impl LightClientVerifier {
         &mut self,
         update: &FinalityUpdate<MainnetConsensusSpec>,
         now: SystemTime,
-    ) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
+    ) -> Result<HeaderAnchor, BeaconApiError> {
         verify_finality_update::<MainnetConsensusSpec>(
             update,
             verification_slot(&self.network, now),
@@ -524,9 +572,9 @@ impl LightClientVerifier {
         &self,
         update: &OptimisticUpdate<MainnetConsensusSpec>,
         now: SystemTime,
-    ) -> Result<AttestedHead, BeaconApiError> {
+    ) -> Result<HeaderAnchor, BeaconApiError> {
         let participants =
-            get_bits::<MainnetConsensusSpec>(&update.sync_aggregate.sync_committee_bits);
+            get_bits::<MainnetConsensusSpec>(&update.sync_aggregate().sync_committee_bits);
         if !has_sync_committee_supermajority(participants) {
             return Err(BeaconApiError::InsufficientParticipation {
                 participants,
@@ -545,18 +593,12 @@ impl LightClientVerifier {
                 &self.network,
                 error.downcast_ref(),
                 error.to_string(),
-                update.signature_slot,
+                *update.signature_slot(),
                 now,
             )
         })?;
-        let root = beacon_header_root(update.attested_header.beacon());
-        let attested = anchor_from_header(&update.attested_header, root)?;
-        Ok(AttestedHead {
-            beacon_slot: attested.beacon_slot,
-            beacon_block_root: root,
-            block_number: BlockNumber(attested.execution_block_number),
-            block_hash: attested.execution_block_hash,
-        })
+        let header = update.attested_header();
+        anchor_from_header(&header, beacon_header_root(header.beacon()))
     }
 }
 
@@ -583,6 +625,7 @@ pub struct VerifiedBeaconApi {
     /// Whether the last finality poll was accepted. Heads polled between
     /// finality polls are published only while it is.
     last_poll_accepted: Arc<AtomicBool>,
+    numbers: ExecutionNumbers,
 }
 
 /// One endpoint's light client.
@@ -694,6 +737,7 @@ impl VerifiedBeaconApi {
             verifiers: Arc::new(tokio::sync::Mutex::new(VerifierPool::default())),
             attested_heads: None,
             last_poll_accepted: Arc::new(AtomicBool::new(false)),
+            numbers: ExecutionNumbers::default(),
         })
     }
 
@@ -702,6 +746,14 @@ impl VerifiedBeaconApi {
     #[must_use]
     pub fn with_attested_heads(mut self, heads: AttestedHeadPublisher) -> Self {
         self.attested_heads = Some(heads);
+        self
+    }
+
+    /// Number the execution blocks Gloas headers name by hash through
+    /// `headers`. Without it, finality and heads past Gloas are refused.
+    #[must_use]
+    pub fn with_execution_headers(mut self, headers: Arc<dyn ExecutionHeaders>) -> Self {
+        self.numbers = ExecutionNumbers::new(headers);
         self
     }
 
@@ -819,6 +871,7 @@ impl VerifiedBeaconApi {
                     bootstrap_root,
                     self.config.max_checkpoint_age,
                     &self.clock,
+                    &self.numbers,
                 )
                 .await
                 {
@@ -916,6 +969,7 @@ impl VerifiedBeaconApi {
                     endpoint,
                     verifier,
                     &self.clock,
+                    &self.numbers,
                 )),
                 _ => None,
             })
@@ -1139,6 +1193,7 @@ struct EndpointSync {
 /// Advance one endpoint's verifier: bootstrap it once, then verify the
 /// latest finality update after the sync-committee updates it needs, and the
 /// latest optimistic update.
+#[allow(clippy::too_many_arguments)]
 async fn poll_endpoint(
     transport: &Arc<dyn BeaconTransport>,
     network: &BeaconNetwork,
@@ -1147,6 +1202,7 @@ async fn poll_endpoint(
     bootstrap_root: [u8; 32],
     max_checkpoint_age: Duration,
     clock: &Clock,
+    numbers: &ExecutionNumbers,
 ) -> Result<EndpointSync, BeaconApiError> {
     if matches!(verifier, EndpointVerifier::Idle) {
         let (transport, network, endpoint, clock) = (
@@ -1229,9 +1285,9 @@ async fn poll_endpoint(
     }
     let anchor = verifier.apply_finality_update(&finality.data, clock.now())?;
     Ok(EndpointSync {
-        anchor,
-        checkpoint_anchor: verifier.checkpoint_anchor(),
-        attested_head: attested_endpoint_head(transport, endpoint, verifier, clock).await,
+        anchor: numbers.resolve(anchor).await?,
+        checkpoint_anchor: numbers.resolve(verifier.checkpoint_anchor()).await?,
+        attested_head: attested_endpoint_head(transport, endpoint, verifier, clock, numbers).await,
         updates_verified: verifier.updates_verified(),
     })
 }
@@ -1244,6 +1300,7 @@ async fn attested_endpoint_head(
     endpoint: &Url,
     verifier: &LightClientVerifier,
     clock: &Clock,
+    numbers: &ExecutionNumbers,
 ) -> Result<AttestedHead, String> {
     let update: OptimisticUpdateResponse<MainnetConsensusSpec> =
         match get_json(transport, endpoint, OPTIMISTIC_UPDATE_PATH).await {
@@ -1253,7 +1310,7 @@ async fn attested_endpoint_head(
                 return Err(format!("served no optimistic update: {error}"));
             }
         };
-    verifier
+    let attested = verifier
         .verify_attested_head(&update.data, clock.now())
         .map_err(|error| {
             if error.is_unusable_head() {
@@ -1267,7 +1324,12 @@ async fn attested_endpoint_head(
                 );
                 format!("optimistic update failed verification: {error}")
             }
-        })
+        })?;
+    let attested = numbers.resolve(attested).await.map_err(|error| {
+        debug!(%error, "attested execution block has no number yet");
+        format!("attested execution block has no number: {error}")
+    })?;
+    Ok(attested.attested_head())
 }
 
 /// Check an endpoint's network, then verify its bootstrap for `root`.
@@ -1301,16 +1363,22 @@ async fn bootstrap_endpoint(
 fn anchor_from_header(
     header: &helios_consensus_core::types::LightClientHeader,
     beacon_block_root: [u8; 32],
-) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
-    let execution = header.execution().map_err(|()| {
-        BeaconApiError::Protocol("light-client header has no execution payload proof".to_owned())
-    })?;
-    let execution_block_hash: [u8; 32] = (*execution.block_hash()).into();
-    Ok(VerifiedFinalityAnchor {
+) -> Result<HeaderAnchor, BeaconApiError> {
+    // A Gloas header proves the payload its block builds on by hash alone.
+    let (hash, number) = match (header.execution(), header.execution_block_hash()) {
+        (Ok(execution), _) => (*execution.block_hash(), Some(*execution.block_number())),
+        (Err(()), Ok(hash)) => (*hash, None),
+        (Err(()), Err(())) => {
+            return Err(BeaconApiError::Protocol(
+                "light-client header has no execution proof".to_owned(),
+            ));
+        }
+    };
+    Ok(HeaderAnchor {
         beacon_slot: header.beacon().slot,
         beacon_block_root,
-        execution_block_number: *execution.block_number(),
-        execution_block_hash: BlockHash::new(execution_block_hash),
+        execution_block_hash: BlockHash::new(hash.into()),
+        execution_block_number: number,
     })
 }
 
@@ -1560,25 +1628,7 @@ pub fn helios_forks(network: &BeaconNetwork) -> Forks {
         deneb: fork("deneb"),
         electra: fork("electra"),
         fulu: fork("fulu"),
-    }
-}
-
-pub fn mainnet_forks() -> Forks {
-    Forks {
-        genesis: fork(0, "00000000"),
-        altair: fork(74_240, "01000000"),
-        bellatrix: fork(144_896, "02000000"),
-        capella: fork(194_048, "03000000"),
-        deneb: fork(269_568, "04000000"),
-        electra: fork(364_032, "05000000"),
-        fulu: fork(411_392, "06000000"),
-    }
-}
-
-fn fork(epoch: u64, version: &str) -> Fork {
-    Fork {
-        epoch,
-        fork_version: FixedBytes::<4>::from_str(version).expect("static fork version is valid hex"),
+        gloas: fork("gloas"),
     }
 }
 
@@ -1668,6 +1718,12 @@ pub enum BeaconApiError {
         "optimistic update carries {participants} sync-committee signatures; an attested head needs {required}"
     )]
     InsufficientParticipation { participants: u64, required: u64 },
+    #[error(
+        "light-client header names execution block {0} by hash alone, and no execution peers are configured to number it"
+    )]
+    UnnumberedHeader(BlockHash),
+    #[error("execution peers did not number block {hash}: {detail}")]
+    ExecutionNumber { hash: BlockHash, detail: String },
 }
 
 impl BeaconApiError {
@@ -1834,7 +1890,7 @@ mod tests {
                 serde_json::json!({
                     "data": {
                         "genesis_time": MAINNET_GENESIS_TIME.to_string(),
-                        "genesis_validators_root": format!("{MAINNET_GENESIS_ROOT:#x}"),
+                        "genesis_validators_root": format!("{:#x}", mainnet().genesis_validators_root),
                         "genesis_fork_version": "0x00000000"
                     }
                 })
@@ -1910,7 +1966,7 @@ mod tests {
             serde_json::from_str(OPTIMISTIC_JSON).expect("fixture optimistic update");
         AttestedHead {
             beacon_slot: ATTESTED_SLOT,
-            beacon_block_root: beacon_header_root(update.data.attested_header.beacon()),
+            beacon_block_root: beacon_header_root(update.data.attested_header().beacon()),
             block_number: BlockNumber(ATTESTED_BLOCK),
             block_hash: BlockHash::new(ATTESTED_EXECUTION_HASH.into()),
         }
@@ -2722,7 +2778,10 @@ mod tests {
         )
         .expect("verified mainnet bootstrap");
         assert_eq!(
-            verifier.finalized_anchor().expect("anchor"),
+            verifier
+                .finalized_anchor()
+                .and_then(HeaderAnchor::numbered)
+                .expect("anchor"),
             bootstrap_anchor()
         );
     }
@@ -2843,7 +2902,9 @@ mod tests {
         assert_eq!(
             verifier
                 .verify_attested_head(&optimistic_update(OPTIMISTIC_JSON), now)
-                .expect("verified optimistic update"),
+                .and_then(HeaderAnchor::numbered)
+                .expect("verified optimistic update")
+                .attested_head(),
             fixture_attested_head()
         );
         // Signed ahead of the local clock: retryable, not invalid.
@@ -3536,51 +3597,242 @@ mod tests {
 
     #[test]
     fn genesis_identity_decodes_the_standard_beacon_response() {
+        let root = mainnet().genesis_validators_root;
         let response: GenesisResponse = serde_json::from_value(serde_json::json!({
             "data": {
                 "genesis_time": MAINNET_GENESIS_TIME.to_string(),
-                "genesis_validators_root": format!("{MAINNET_GENESIS_ROOT:#x}"),
+                "genesis_validators_root": format!("{root:#x}"),
                 "genesis_fork_version": "0x00000000"
             }
         }))
         .expect("standard genesis response");
-        assert_eq!(response.data.genesis_validators_root, MAINNET_GENESIS_ROOT);
+        assert_eq!(response.data.genesis_validators_root, root);
     }
 
     #[test]
-    fn an_unknown_fork_is_named_and_known_digests_cover_the_schedule() {
+    fn an_unknown_fork_is_named() {
         assert_eq!(
-            unsupported_fork(br#"{"version":"gloas","data":{}}"#),
-            Some("gloas".to_owned())
+            unsupported_fork(br#"{"version":"heze","data":{}}"#),
+            Some("heze".to_owned())
         );
-        assert_eq!(unsupported_fork(br#"{"version":"fulu","data":{}}"#), None);
+        assert_eq!(unsupported_fork(br#"{"version":"gloas","data":{}}"#), None);
         assert_eq!(
-            unsupported_fork(br#"[{"version":"fulu"},{"version":"gloas"}]"#),
-            Some("gloas".to_owned())
+            unsupported_fork(br#"[{"version":"gloas"},{"version":"heze"}]"#),
+            Some("heze".to_owned())
         );
         assert_eq!(unsupported_fork(b"not json"), None);
-        let known = known_mainnet_fork_digests();
-        for slot in [0, FULU_FORK_EPOCH * 32, MAINNET_BLOB_SCHEDULE[1].0 * 32 + 1] {
-            assert!(known.contains(&mainnet_fork_digest(slot)), "slot {slot}");
+    }
+
+    const SEPOLIA_BOOTSTRAP_JSON: &str =
+        include_str!("../tests/fixtures/sepolia-gloas/bootstrap.json");
+    const SEPOLIA_FINALITY_JSON: &str =
+        include_str!("../tests/fixtures/sepolia-gloas/finality.json");
+    const SEPOLIA_OPTIMISTIC_JSON: &str =
+        include_str!("../tests/fixtures/sepolia-gloas/optimistic.json");
+    const SEPOLIA_CHECKPOINT_ROOT: B256 =
+        b256!("c6729545da5712f6cfc14e95d1f14e012ceea0d4568ffad921a16353d342910a");
+    const SEPOLIA_FINALIZED_SLOT: u64 = 11_472_352;
+    const SEPOLIA_FINALIZED_HASH: B256 =
+        b256!("78965ab07ff409e5799e5134046d25e81788e21c26e79f22ab208b6aa862ae89");
+    const SEPOLIA_ATTESTED_SLOT: u64 = 11_472_426;
+    const SEPOLIA_ATTESTED_HASH: B256 =
+        b256!("028a03f7955a376ffd20dde8af1fa2b6bd473e053dbbb57d3acf74970ec5e70f");
+
+    fn sepolia() -> Arc<Chain> {
+        leani_chain::ChainRegistry::standard()
+            .get("ethereum-sepolia")
+            .expect("Sepolia is built in")
+    }
+
+    /// Six seconds into the slot after the optimistic fixture's signature
+    /// slot, as Unix seconds.
+    fn sepolia_now() -> u64 {
+        let genesis = sepolia().beacon().expect("Sepolia beacon").genesis_time;
+        genesis + (SEPOLIA_ATTESTED_SLOT + 2) * SLOT_SECONDS + 6
+    }
+
+    fn sepolia_finalized_anchor() -> HeaderAnchor {
+        HeaderAnchor {
+            beacon_slot: SEPOLIA_FINALIZED_SLOT,
+            beacon_block_root: SEPOLIA_CHECKPOINT_ROOT.into(),
+            execution_block_hash: BlockHash::new(SEPOLIA_FINALIZED_HASH.into()),
+            execution_block_number: None,
         }
-        assert!(!known.contains(&[0xde, 0xad, 0xbe, 0xef]));
+    }
+
+    /// Serves the recorded Sepolia Gloas responses.
+    #[derive(Debug)]
+    struct SepoliaTransport;
+
+    #[async_trait]
+    impl BeaconTransport for SepoliaTransport {
+        async fn get(
+            &self,
+            endpoint: &Url,
+            path_and_query: &str,
+        ) -> Result<Vec<u8>, BeaconApiError> {
+            let bootstrap =
+                format!("eth/v1/beacon/light_client/bootstrap/{SEPOLIA_CHECKPOINT_ROOT:#x}");
+            let body = match path_and_query {
+                "eth/v1/beacon/genesis" => format!(
+                    r#"{{"data":{{"genesis_validators_root":"{:#x}"}}}}"#,
+                    sepolia()
+                        .beacon()
+                        .expect("Sepolia beacon")
+                        .genesis_validators_root
+                ),
+                "eth/v1/beacon/light_client/finality_update" => SEPOLIA_FINALITY_JSON.to_owned(),
+                OPTIMISTIC_UPDATE_PATH => SEPOLIA_OPTIMISTIC_JSON.to_owned(),
+                path if path == bootstrap => SEPOLIA_BOOTSTRAP_JSON.to_owned(),
+                _ => {
+                    return Err(BeaconApiError::Status {
+                        url: request_label(endpoint, path_and_query),
+                        status: 404,
+                        detail: "not served by the fixture".to_owned(),
+                    });
+                }
+            };
+            Ok(body.into_bytes())
+        }
+    }
+
+    /// Numbers execution blocks from a table and counts the lookups.
+    #[derive(Default)]
+    struct TableHeaders {
+        numbers: Vec<(BlockHash, u64)>,
+        lookups: AtomicU64,
+    }
+
+    #[async_trait]
+    impl ExecutionHeaders for TableHeaders {
+        async fn block_number(&self, hash: BlockHash) -> Result<BlockNumber, SourceError> {
+            self.lookups.fetch_add(1, Ordering::SeqCst);
+            self.numbers
+                .iter()
+                .find_map(|(known, number)| (*known == hash).then_some(BlockNumber(*number)))
+                .ok_or_else(|| SourceError::Unavailable(format!("no peer served {hash}")))
+        }
+    }
+
+    fn sepolia_source() -> VerifiedBeaconApi {
+        let now = sepolia_now();
+        VerifiedBeaconApi::with_transport(
+            BeaconApiConfig::new(
+                sepolia(),
+                vec![Url::parse("https://beacon.example/").expect("endpoint")],
+            ),
+            Arc::new(SepoliaTransport),
+            Clock::new(move || UNIX_EPOCH + Duration::from_secs(now)),
+        )
+        .expect("Sepolia source")
+    }
+
+    fn sepolia_checkpoint() -> TrustedCheckpoint {
+        TrustedCheckpoint {
+            root: SEPOLIA_CHECKPOINT_ROOT.into(),
+            slot: Some(SEPOLIA_FINALIZED_SLOT),
+            origin: CheckpointOrigin::Operator,
+        }
     }
 
     #[test]
-    fn mainnet_fork_digests_include_blob_parameter_forks() {
-        assert_eq!(mainnet_fork_digest(0), [0xb5, 0x30, 0x3f, 0x2a]);
-        assert_eq!(mainnet_fork_digest(269_568 * 32), [0x6a, 0x95, 0xa1, 0xa9]);
+    fn gloas_headers_prove_their_execution_block_by_hash() {
+        let network = sepolia().beacon().expect("Sepolia beacon").clone();
+        let now = UNIX_EPOCH + Duration::from_secs(sepolia_now());
+        let bootstrap: BootstrapResponse<MainnetConsensusSpec> =
+            serde_json::from_str(SEPOLIA_BOOTSTRAP_JSON).expect("Gloas bootstrap");
+        let mut verifier = LightClientVerifier::bootstrap(
+            &network,
+            SEPOLIA_CHECKPOINT_ROOT.into(),
+            &bootstrap.data,
+            DEFAULT_MAX_CHECKPOINT_AGE,
+            now,
+        )
+        .expect("verified Gloas bootstrap");
+        assert_eq!(verifier.checkpoint_anchor(), sepolia_finalized_anchor());
+        let finality: FinalityUpdateResponse<MainnetConsensusSpec> =
+            serde_json::from_str(SEPOLIA_FINALITY_JSON).expect("Gloas finality update");
         assert_eq!(
-            mainnet_fork_digest(FULU_FORK_EPOCH * 32),
-            [0xcc, 0x2c, 0x5c, 0xdb]
+            verifier
+                .apply_finality_update(&finality.data, now)
+                .expect("verified Gloas finality update"),
+            sepolia_finalized_anchor()
         );
+        let attested = verifier
+            .verify_attested_head(&optimistic_update(SEPOLIA_OPTIMISTIC_JSON), now)
+            .expect("verified Gloas optimistic update");
         assert_eq!(
-            mainnet_fork_digest(MAINNET_BLOB_SCHEDULE[0].0 * 32),
-            [0xcb, 0x0d, 0x1a, 0xcc]
+            (
+                attested.beacon_slot,
+                attested.execution_block_hash,
+                attested.execution_block_number
+            ),
+            (
+                SEPOLIA_ATTESTED_SLOT,
+                BlockHash::new(SEPOLIA_ATTESTED_HASH.into()),
+                None
+            )
         );
+        assert!(matches!(
+            attested.numbered(),
+            Err(BeaconApiError::UnnumberedHeader(_))
+        ));
+
+        // A hash the execution branch does not prove fails verification.
+        let mut forged: serde_json::Value =
+            serde_json::from_str(SEPOLIA_OPTIMISTIC_JSON).expect("optimistic JSON");
+        forged["data"]["attested_header"]["execution_block_hash"] =
+            serde_json::Value::from(format!("{SEPOLIA_FINALIZED_HASH:#x}"));
+        let forged: OptimisticUpdateResponse<MainnetConsensusSpec> =
+            serde_json::from_value(forged).expect("forged optimistic update");
+        assert!(matches!(
+            verifier.verify_attested_head(&forged.data, now),
+            Err(BeaconApiError::Verification(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn gloas_finality_and_heads_take_their_numbers_from_execution_headers() {
+        let finalized = BlockHash::new(SEPOLIA_FINALIZED_HASH.into());
+        let attested = BlockHash::new(SEPOLIA_ATTESTED_HASH.into());
+        let headers = Arc::new(TableHeaders {
+            numbers: vec![(finalized, 9_000_000), (attested, 9_000_060)],
+            ..TableHeaders::default()
+        });
+        let source = sepolia_source().with_execution_headers(headers.clone());
+        let report = source.probe_root(sepolia_checkpoint()).await;
+        assert!(report.accepted, "{:?}", report.disagreements);
         assert_eq!(
-            mainnet_fork_digest(MAINNET_BLOB_SCHEDULE[1].0 * 32),
-            [0x8c, 0x9f, 0x62, 0xfe]
+            report.selected,
+            Some(VerifiedFinalityAnchor {
+                beacon_slot: SEPOLIA_FINALIZED_SLOT,
+                beacon_block_root: SEPOLIA_CHECKPOINT_ROOT.into(),
+                execution_block_number: 9_000_000,
+                execution_block_hash: finalized,
+            })
+        );
+        let head = report.attested_head.expect("attested head");
+        assert_eq!(
+            (head.beacon_slot, head.block_number, head.block_hash),
+            (SEPOLIA_ATTESTED_SLOT, BlockNumber(9_000_060), attested)
+        );
+        // The checkpoint and the finalized header name one block, looked up
+        // once; the next poll looks up nothing it already numbered.
+        assert_eq!(headers.lookups.load(Ordering::SeqCst), 2);
+        let report = source.poll_current().await;
+        assert!(report.accepted, "{:?}", report.disagreements);
+        assert_eq!(headers.lookups.load(Ordering::SeqCst), 2);
+
+        // Without execution headers, Gloas finality is refused, not guessed.
+        let report = sepolia_source().probe_root(sepolia_checkpoint()).await;
+        assert!(!report.accepted);
+        assert!(
+            report.endpoints[0]
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("by hash alone")),
+            "{:?}",
+            report.endpoints[0].error
         );
     }
 }

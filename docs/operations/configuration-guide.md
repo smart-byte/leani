@@ -328,7 +328,7 @@ The shipped profiles list eraE at priority 10 and Xatu at priority 20:
 | Source | Serves | Checks each block for | Notes |
 |---|---|---|---|
 | `era_e` | Whole blocks and receipts up to its mirror's last catalog update | Transactions and receipts roots against the header | The public mirror's catalog ended at block 24,518,655 (2026-02-26) when this was written |
-| `xatu` | Columnar projections, about one day behind the chain | Transaction rows against the beacon payload count; log rows without a gap | Cannot prove a block's last logs complete; Ethereum mainnet only |
+| `xatu` | Columnar projections, about one day behind the chain, until the day Glamsterdam activates | Transaction rows against the beacon payload count; log rows without a gap | Cannot prove a block's last logs complete; Ethereum mainnet only |
 | P2P (live source) | Recent and live blocks from peers | Commitments of every header, body, and receipt | Slowest for old history; peers may no longer serve very old blocks |
 
 So for blocks the eraE mirror covers, a backfill reads verified complete

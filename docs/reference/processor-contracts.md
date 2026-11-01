@@ -55,6 +55,9 @@ addresses, Solidity event ABI fragments, and output mappings. The
 factory parses and validates the ABI before a source is opened, derives exact
 topic-zero signatures, pushes address/topic predicates into capable sources,
 and decodes without EVM execution. It declares the `Logs` field group.
+Without `addresses` it decodes every emitter's matching logs; from Amsterdam
+that includes the ERC-20-shaped `Transfer` log `0xff…fe` emits for each ETH
+transfer (EIP-7708).
 
 An event's `abi` is a human-readable fragment, one JSON ABI event object as a
 block explorer shows it, or `log0` (below). Fragments may use every ABI type
@@ -338,7 +341,8 @@ balances. Any contract can emit a `Transfer` log, so a log with that
 signature that is not a canonical ERC-20 transfer (three topics, zero-padded
 addresses, and a 32-byte value), such as an ERC-721 transfer, is skipped
 rather than failing the block; the block's mapped delta counts the skipped
-logs.
+logs. From Amsterdam, each ETH transfer emits a `Transfer` log from
+`0xff…fe` (EIP-7708); it counts as a token only when the allowlist names it.
 
 A transfer the ledger cannot apply proves it incomplete for that token and
 holder: an outgoing transfer above the derived balance means transfers before

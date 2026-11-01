@@ -22,12 +22,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok_or("checkpoint root must start with 0x")?;
     let mut checkpoint = [0_u8; 32];
     hex::decode_to_slice(encoded, &mut checkpoint)?;
-    let mut config = ConsensusP2pConfig::default();
+    let mut config = ConsensusP2pConfig::new(leani_chain::ethereum_mainnet());
     let bootnodes = arguments.collect::<Vec<_>>();
     if !bootnodes.is_empty() {
         config.bootnodes = bootnodes;
     }
-    let source = VerifiedConsensusP2p::mainnet(config)?;
+    let source = VerifiedConsensusP2p::new(config)?;
     let report = source
         .probe_checkpoint(TrustedCheckpoint {
             root: checkpoint,

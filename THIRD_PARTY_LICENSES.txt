@@ -8579,7 +8579,7 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-helios-consensus-core 0.11.1
+helios-consensus-core 0.12.0
 
 MIT License
 
@@ -8858,25 +8858,20 @@ leani-source-xatu 0.1.1 — https://github.com/smart-byte/leani
 leani-store-artifacts 0.1.1 — https://github.com/smart-byte/leani
 leani-store-history 0.1.1 — https://github.com/smart-byte/leani
 leani-store-sqlite 0.1.1 — https://github.com/smart-byte/leani
-alloy-consensus-any 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus-any 2.5.0 — https://github.com/alloy-rs/alloy
-alloy-consensus 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-consensus 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-core 1.6.1 — https://github.com/alloy-rs/core
 alloy-dyn-abi 1.7.3 — https://github.com/alloy-rs/core
 alloy-eip2124 0.2.0 — https://github.com/alloy-rs/eips
 alloy-eip2930 0.2.3 — https://github.com/alloy-rs/eips
 alloy-eip7702 0.6.3 — https://github.com/alloy-rs/eips
-alloy-eip7928 0.3.7 — https://github.com/alloy-rs/eips
 alloy-eip7928 0.4.5 — https://github.com/alloy-rs/eips
 alloy-eip8141 0.1.1 — https://github.com/alloy-rs/eips
-alloy-eips 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-eips 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-evm 0.38.0 — https://github.com/alloy-rs/alloy-evm
 alloy-genesis 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-hardforks 0.4.10 — https://github.com/alloy-rs/hardforks
+alloy-hardforks 0.4.11 — https://github.com/alloy-rs/hardforks
 alloy-json-abi 1.7.3 — https://github.com/alloy-rs/core
-alloy-network-primitives 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-network-primitives 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-primitives 1.7.3 — https://github.com/alloy-rs/core
 alloy-rlp-derive 0.3.16 — https://github.com/alloy-rs/rlp
@@ -8884,19 +8879,16 @@ alloy-rlp 0.3.16 — https://github.com/alloy-rs/rlp
 alloy-rpc-types-admin 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-rpc-types-beacon 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-rpc-types-engine 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-rpc-types-eth 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-rpc-types-eth 2.5.0 — https://github.com/alloy-rs/alloy
-alloy-rpc-types 1.8.3 — https://github.com/alloy-rs/alloy
-alloy-serde 1.8.3 — https://github.com/alloy-rs/alloy
+alloy-rpc-types 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-serde 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-sol-macro-expander 1.7.3 — https://github.com/alloy-rs/core
 alloy-sol-macro-input 1.7.3 — https://github.com/alloy-rs/core
 alloy-sol-macro 1.7.3 — https://github.com/alloy-rs/core
 alloy-sol-type-parser 1.7.3 — https://github.com/alloy-rs/core
 alloy-sol-types 1.7.3 — https://github.com/alloy-rs/core
-alloy-tx-macros 1.8.3 — https://github.com/alloy-rs/alloy
 alloy-tx-macros 2.5.0 — https://github.com/alloy-rs/alloy
-alloy 1.8.3 — https://github.com/alloy-rs/alloy
+alloy 2.4.1 — https://github.com/alloy-rs/alloy
 aquamarine 0.6.0 — https://github.com/mersinvald/aquamarine
 base256emoji 1.0.2 — https://github.com/Jorropo/base256emoji/
 base45 3.2.0 — https://github.com/opendevtools/base45
