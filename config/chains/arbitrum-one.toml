@@ -6,8 +6,15 @@ genesis_hash = "0x7ee576b35482195fc49205cec9af72ce14f003b9ae69f6ba0faef4514be8b4
 
 # Nitro chains run no public execution P2P: blocks come from JSON-RPC and
 # are checked against their own header, transactions, and receipts roots.
+# Public keyless endpoints, paced to the limits their operators announce;
+# operators may list their own in sources.json_rpc.endpoints.
 [defaults]
-rpc_endpoints = ["https://arb1.arbitrum.io/rpc"]
+rpc_endpoints = [
+  "https://arbitrum.drpc.org",
+  "https://arb-one.api.pocket.network",
+  "https://arb1.arbitrum.io/rpc",
+  "https://arbitrum-one-rpc.publicnode.com",
+]
 
 # SonarX's export on AWS Open Data. Classic blocks before the Nitro
 # genesis hash differently.
@@ -20,3 +27,10 @@ first_block = 22207817
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0x4DCeB440657f21083db8aDd07665f8ddBe1DCfc0"
+
+# The signer is a batch poster of SequencerInbox
+# 0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6.
+[sequencer_feed]
+url = "wss://arb1.arbitrum.io/feed"
+signer = "0xC1b634853Cb333D3aD8663715b08f41A3Aec47cc"
+first_block = 22207817

@@ -6,15 +6,23 @@ genesis_hash = "0xaad15f3d702aaea00caf3e9bb56395efe9127bc3b31b24921abf1eee340930
 
 # Nitro chains run no public execution P2P: blocks come from JSON-RPC and
 # are checked against their own header, transactions, and receipts roots.
+# Public keyless endpoints, paced to the limits their operators announce;
+# operators may list their own in sources.json_rpc.endpoints.
 [defaults]
-# Two independent operators: Robinhood and dRPC. A block counts once both
-# serve the same hash.
 rpc_endpoints = [
-  "https://rpc.mainnet.chain.robinhood.com",
   "https://robinhood.drpc.org",
+  "https://robinhood.api.pocket.network",
+  "https://rpc.mainnet.chain.robinhood.com",
+  "https://robinhood-rpc.publicnode.com",
 ]
 
 # The BoLD rollup, as the bridge's rollup() names it.
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0x23A19d23e89166adedbDcB432518AB01e4272D94"
+
+# The signer is a batch poster of SequencerInbox
+# 0xbd0d173eeb87d57a09521c24388a12789f33ba96.
+[sequencer_feed]
+url = "wss://feed.mainnet.chain.robinhood.com"
+signer = "0xDaa526086787d9DEbE1D7F3FFdb1fE50cf8687F4"

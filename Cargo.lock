@@ -4878,17 +4878,22 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-trie",
  "async-trait",
+ "base64 0.22.1",
+ "flate2",
  "futures",
  "leani-primitives",
  "leani-source-api",
  "reqwest 0.12.28",
+ "rustls",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tracing",
  "url",
+ "webpki-roots",
 ]
 
 [[package]]

@@ -394,6 +394,7 @@
               "type": "array",
               "items": { "type": "string", "format": "uri" }
             },
+            "public_endpoints": { "enum": ["chainlist", "bundled", "none"] },
             "quorum": { "$ref": "#/$defs/positiveInteger" },
             "poll_interval_ms": { "$ref": "#/$defs/positiveInteger" },
             "finality_poll_interval_ms": { "$ref": "#/$defs/positiveInteger" },
@@ -413,6 +414,7 @@
             "consensus_p2p",
             "json_rpc",
             "op_gossip",
+            "sequencer_feed",
             "disabled"
           ]
         },

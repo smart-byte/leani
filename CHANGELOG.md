@@ -8,6 +8,57 @@ record, and documented RPC contracts.
 
 ### Added
 
+- `sources.json_rpc.public_endpoints` picks the public endpoints behind your
+  own `sources.json_rpc.endpoints`: `chainlist` (default under the
+  sequencer feed) adds chainlist.org's keyless HTTPS endpoints that track
+  nothing or little to the chain entry's vetted ones, `bundled` (default
+  otherwise) only the vetted ones, `none` only yours. Your endpoints come
+  first and keep `calls_per_second`; public ones get 40 calls per second, at
+  most eight of them, and are dropped unless they qualify within 5 seconds.
+  chainlist.org's list is fetched at most daily and kept in the data
+  directory. `chainlist` is refused where endpoints vouch for blocks.
+- JSON-RPC chains backfill history automatically below the finalized block,
+  as Ethereum does: the block of the assertion the L1 anchor confirmed last,
+  or else the endpoints' `finalized` block. Each processor with automatic
+  history backfills from its `start_block` through the configured history
+  sources in priority order, and the live lane takes over just below that
+  block. Under the L1 anchor a `json_rpc` history source proves its blocks
+  by parent links down from the confirmed hash before a processor sees them,
+  so they are `finalized` without trusting the endpoints.
+- A history source missing the newest blocks of a range keeps the blocks
+  before them, and the next source serves the rest: an `aws_public` source
+  ahead of a `json_rpc` one serves the days SonarX exported, and the
+  endpoints the days after.
+- With `sequencer_feed`, a fresh store catches up over JSON-RPC from the
+  lowest automatic `start_block`, bounded by
+  `sources.live.history_fallback_blocks`: the headers down from the first
+  signed block are hashed locally and every 256th hash kept, and each
+  catch-up batch must end at one, so the endpoints are trusted for nothing.
+  A restarted node proves the chain down to its stored tip the same way.
+- JSON-RPC endpoints form a pool: at start each must serve the configured
+  chain and `eth_getBlockReceipts`; block ranges spread over the rest in
+  parallel, every endpoint taking a part before any takes a second and
+  keeping one in flight per 40 calls per second of its pace (at most 16). A
+  failed range moves to another endpoint, and an idle endpoint takes over a
+  part another still fetches once it would likely serve it first, or once
+  the other has taken twice as long as usual. Each endpoint keeps to the
+  limit its rate-limit headers announce (`RateLimit`/`X-RateLimit` policies,
+  or a limit and its reset) and to a 429's `Retry-After`, halves its pace
+  once per burst of rate limits and recovers per call served; its calls take
+  their slots in turn, so calls queued during a rate limit speed up once it
+  lifts. All lanes of a node share each endpoint's budget.
+  The live lane fetches 256 blocks at a time while catching up. With
+  `sequencer_feed`, the quorum defaults to 1 and no
+  endpoint can claim a head the sequencer has not signed. Nitro entries list
+  public keyless endpoints of several operators. Requests name `leani` in
+  their User-Agent.
+- `finality.kind = "sequencer_feed"` follows a Nitro chain's sequencer feed
+  (Arbitrum One, Arbitrum Nova, Robinhood Chain; chain entries name the feed
+  and its signer). Each message's block hash, signed by the chain's batch
+  poster, checks the blocks the JSON-RPC lanes fetch: a block that differs is
+  refused and one that matches attests the chain below it, so the endpoints
+  are trusted only to serve. Finality comes from the L1 anchor. A feed
+  connection silent for 30 seconds is reopened.
 - Op-stack history over P2P: a fresh store catches up from the lowest
   `start_block` of the processors with automatic history, bounded by
   `sources.live.history_fallback_blocks`, along the chain of the first signed

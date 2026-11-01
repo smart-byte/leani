@@ -1,5 +1,10 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::{BTreeMap, VecDeque},
+    sync::Arc,
+    time::Duration,
+};
 
+use alloy_primitives::B256;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use leani_primitives::{
@@ -12,12 +17,18 @@ use leani_source_api::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use crate::{FetchMode, RpcQuorum, history::capabilities, history::fetch_range};
+use crate::{
+    FetchMode, RpcQuorum,
+    feed::SignedHashes,
+    history::{Label, capabilities, fetch_range},
+};
 
 /// Delivered blocks kept to find a fork point.
 const RECENT_BLOCKS: usize = 256;
 /// Blocks fetched and quorum-checked together.
 const BATCH_BLOCKS: u64 = 32;
+/// Blocks fetched together while catching up, spread over the endpoints.
+const CATCH_UP_BLOCKS: u64 = 256;
 /// How often the endpoints' `safe` block is read for promotions.
 const SAFE_POLL: Duration = Duration::from_secs(2);
 
@@ -26,6 +37,10 @@ pub struct RpcLiveSource {
     descriptor: SourceDescriptor,
     quorum: RpcQuorum,
     poll_interval: Duration,
+    signed: Option<SignedHashes>,
+    /// Hashes proven down from a signed block, every few hundred blocks: a
+    /// catch-up batch ends at one, so it is checked before it is delivered.
+    proven: Arc<BTreeMap<u64, B256>>,
 }
 
 impl RpcLiveSource {
@@ -56,7 +71,27 @@ impl RpcLiveSource {
             },
             quorum,
             poll_interval,
+            signed: None,
+            proven: Arc::default(),
         })
+    }
+
+    /// Catch up along hashes proven down from a signed block, as
+    /// [`crate::RpcQuorum::prove_down`] returns them.
+    #[must_use]
+    pub fn with_proven_hashes(mut self, proven: BTreeMap<u64, B256>) -> Self {
+        self.proven = Arc::new(proven);
+        self
+    }
+
+    /// Check blocks against the hashes the sequencer signed: a block whose
+    /// hash differs is refused, and a signed one attests the blocks it
+    /// links to, so the endpoints are trusted for nothing but serving.
+    #[must_use]
+    pub fn with_signed_hashes(mut self, signed: SignedHashes) -> Self {
+        self.descriptor.trust = TrustModel::ProtocolVerified;
+        self.signed = Some(signed);
+        self
     }
 }
 
@@ -153,7 +188,7 @@ impl LiveState {
     }
 
     /// Fetch `first..=last`, linked to what was delivered and checked at its
-    /// tip with the quorum.
+    /// tip with the quorum, and each against the hash the sequencer signed.
     async fn fetch(
         &self,
         first: u64,
@@ -168,14 +203,49 @@ impl LiveState {
             expected_parent: None,
             estimated_bytes: None,
         };
-        fetch_range(
+        let frames = fetch_range(
             &self.source.quorum,
             &self.source.descriptor,
             &chunk,
             self.mode,
-            true,
+            Label::Unattested,
+            self.source.signed.is_none(),
         )
-        .await
+        .await?;
+        if let Some(frame) = frames.iter().find(|frame| {
+            self.trusted_hash(frame.block.number.0)
+                .is_some_and(|hash| hash.0 != frame.block.hash.0)
+        }) {
+            return Err(SourceError::CorruptFrame(format!(
+                "block {} is not on the chain the sequencer signed",
+                frame.block.number.0
+            )));
+        }
+        Ok(frames)
+    }
+
+    /// The hash the sequencer signed at `number`, or that a proof down from a
+    /// signed block found there.
+    fn trusted_hash(&self, number: u64) -> Option<B256> {
+        self.source
+            .signed
+            .as_ref()
+            .and_then(|signed| signed.get(number))
+            .or_else(|| self.source.proven.get(&number).copied())
+    }
+
+    /// The newest delivered block on the signed chain: it and every block it
+    /// links down to are attested.
+    fn signed_through(&self) -> Option<BlockRef> {
+        self.recent
+            .iter()
+            .rev()
+            .take_while(|block| block.number.0 > self.attested_through)
+            .find(|block| {
+                self.trusted_hash(block.number.0)
+                    .is_some_and(|hash| hash.0 == block.hash.0)
+            })
+            .copied()
     }
 
     /// The highest delivered block the quorum still has at its height: the
@@ -194,11 +264,25 @@ impl LiveState {
     async fn advance(&mut self) -> Result<(), SourceError> {
         // While catching up, the known head is still ahead: no need to ask.
         if self.next > self.head {
-            self.head = self.source.quorum.agreed_tag("latest").await?.0;
+            let latest = self.source.quorum.agreed_tag("latest").await?.0;
+            // An endpoint cannot claim a head the sequencer has not signed.
+            self.head = match &self.source.signed {
+                Some(signed) => signed.newest().map_or(0, |(number, _)| number.min(latest)),
+                None => latest,
+            };
         }
         let head = self.head;
         if self.next <= head {
-            let last = head.min(self.next.saturating_add(BATCH_BLOCKS - 1));
+            let batch = if head - self.next >= BATCH_BLOCKS {
+                CATCH_UP_BLOCKS
+            } else {
+                BATCH_BLOCKS
+            };
+            let mut last = head.min(self.next.saturating_add(batch - 1));
+            // A catch-up batch ends at a proven block, which checks it all.
+            if let Some((tip, _)) = self.source.proven.range(self.next..).next() {
+                last = last.min(*tip);
+            }
             let frames = self.fetch(self.next, last).await?;
             let links = match (self.recent.back(), frames.first()) {
                 (Some(tip), Some(first)) => first.block.parent_hash == tip.hash,
@@ -213,6 +297,14 @@ impl LiveState {
             } else {
                 self.reorg().await?;
             }
+        }
+        if self.source.signed.is_some() {
+            if let Some(block) = self.signed_through() {
+                self.attested_through = block.number.0;
+                self.pending
+                    .push_back(ChainEvent::Attested { through: block });
+            }
+            return Ok(());
         }
         if self
             .safe_polled

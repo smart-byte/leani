@@ -2035,10 +2035,17 @@ impl HistoricalRuntime {
                     let chunk =
                         failed_chunk.and_then(|chunk| intersect_ranges(chunk, request.range));
                     let failed = match &error {
-                        // Blocks the source has not published yet run to its
-                        // end, and a schema drift recurs in later objects: the
-                        // next source keeps the rest of the gap.
-                        SourceError::MissingRange(_) | SourceError::SchemaDrift { .. } => None,
+                        // Blocks the source has not published yet run to the
+                        // gap's end: the next source keeps them, and the
+                        // failed one the blocks before them.
+                        SourceError::MissingRange(missing) => BlockRange::new(
+                            missing.start().max(request.range.start()),
+                            request.range.end(),
+                        )
+                        .ok(),
+                        // A schema drift recurs in later objects: the next
+                        // source keeps the rest of the gap.
+                        SourceError::SchemaDrift { .. } => None,
                         // A dataset hole names its blocks.
                         SourceError::IncompleteRange { range, .. } => {
                             intersect_ranges(*range, request.range).or(chunk)
@@ -15723,6 +15730,58 @@ mod tests {
             (6, 1),
             "one failed read, not one per chunk"
         );
+        assert_eq!(sources["fallback"], (6, 0));
+    }
+
+    /// Like an export a few days behind: a plan reaching past `published`
+    /// fails, naming the blocks after it.
+    struct UnpublishedTailSource {
+        inner: ScriptedHistorySource,
+        published: BlockNumber,
+    }
+
+    #[async_trait]
+    impl HistorySource for UnpublishedTailSource {
+        fn descriptor(&self) -> &SourceDescriptor {
+            self.inner.descriptor()
+        }
+
+        async fn plan(
+            &self,
+            request: &DataRequest,
+        ) -> Result<leani_source_api::SourcePlan, SourceError> {
+            if request.range.end() > self.published {
+                return Err(SourceError::MissingRange(
+                    BlockRange::new(
+                        BlockNumber(self.published.0 + 1).max(request.range.start()),
+                        request.range.end(),
+                    )
+                    .expect("unpublished"),
+                ));
+            }
+            self.inner.plan(request).await
+        }
+
+        async fn open(
+            &self,
+            chunk: &SourceChunk,
+            budget: SourceBudget,
+            cancellation: CancellationToken,
+        ) -> Result<leani_source_api::BlockFrameStream, SourceError> {
+            self.inner.open(chunk, budget, cancellation).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_source_keeps_the_blocks_it_published_before_a_missing_tail() {
+        let sources = run_four_chunk_failover(|scripted| {
+            Arc::new(UnpublishedTailSource {
+                inner: scripted,
+                published: BlockNumber(6),
+            })
+        })
+        .await;
+        assert_eq!(sources["primary"], (6, 1));
         assert_eq!(sources["fallback"], (6, 0));
     }
 

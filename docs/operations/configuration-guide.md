@@ -141,7 +141,7 @@ which its `/playground` uses.
 | `artifact_storage` | table | Physical backend and bounded compaction policy for retained processor artifacts. |
 | `budgets` | table | Hard memory, temporary disk, pending-delta, recent-input, and concurrency limits. |
 | `sources` | table | Priority-ordered history sources and the optional live source. |
-| `finality` | table | `consensus_p2p`, `beacon_api`, `json_rpc`, `op_gossip`, or `disabled`. |
+| `finality` | table | `consensus_p2p`, `beacon_api`, `json_rpc`, `op_gossip`, `sequencer_feed`, or `disabled`. |
 | `processors` | array | One immutable processor kind/instance contract per entry. |
 | `rpc` | table | HTTP/WS binds, browser origins, request and response limits, and bounded historical lookup behavior. |
 | `api` | table | Native API bind, bearer-token environment variable, allowed hosts and browser origins, and delivery batching. |
@@ -489,6 +489,102 @@ chain, so caught-up blocks are `attested` like the ones that follow. A restart
 resumes from the store's tip. A processor's status shows the catch-up's
 progress in `processedThrough`. Blocks are not `finalized` until the L1
 anchor finalizes them.
+
+Nitro chains (Arbitrum One and Nova, Robinhood Chain) run no public execution
+P2P, so `sources.live.kind = "json_rpc"` serves their blocks. With
+`finality.kind = "sequencer_feed"`, the node follows the sequencer feed the
+chain entry names, whose every message carries a block's hash signed by the
+chain's batch poster. The endpoints then only carry blocks: one whose hash
+differs from the signed one is refused, and one that matches makes it and
+every block it links to `attested`, so a single endpoint is enough (the
+quorum defaults to 1). The lanes start at a signed block the endpoints
+serve. A feed connection silent for 30 seconds is reopened. Feed relays
+replay only the last few minutes, so after a longer outage blocks become
+`attested` once the lane reaches the feed's blocks again. Without
+`[l1_anchor]` nothing is `finalized`, and recent frames settle
+`finality.settle_blocks` (default 3,600) below the tip.
+
+A fresh store under the feed catches up from the lowest `start_block` among
+processors with automatic history, at most
+`sources.live.history_fallback_blocks` below the first signed block when
+that is set. The node first walks the headers down from the signed block,
+hashing each itself, and keeps every 256th hash; each catch-up batch then
+ends at one of them, so no block reaches a processor before it is proven,
+and the caught-up blocks are `attested`. A restarted node proves the chain
+down to its stored tip the same way, and refuses a tip that is not on it.
+The walk costs one call per block, the catch-up two.
+
+Below the finalized block, history comes from automatic backfills as on
+Ethereum. With `[l1_anchor]` that is the block of the assertion the anchor
+confirmed last, about 6.4 days old; without the anchor and the feed, the
+endpoints' `finalized` block. Each processor with automatic history
+backfills from its `start_block` up to it from `sources.history` in priority
+order, and the live lane takes over just below it; under the feed it then
+catches up from there as above. A `json_rpc` history source reads the
+JSON-RPC endpoint pool below. Under the L1 anchor its blocks are proven by
+parent links down from the confirmed hash before a processor sees them, at
+one more call per block, so they are `finalized` without trusting any
+endpoint. A source that has not published the newest blocks keeps the ones
+it has and hands the rest to the next, so with SonarX first Arbitrum One's
+history comes from AWS up to its last exported day and from the endpoints
+for the days after:
+
+```toml
+[[sources.history]]
+id = "sonarx"
+kind = "aws_public"
+priority = 0
+trust = "trusted_dataset"
+
+[[sources.history]]
+id = "rpc"
+kind = "json_rpc"
+priority = 1
+trust = "verified_material"
+```
+
+The node keeps the newest confirmed hash in `l1-anchor-confirmed.txt` in its
+data directory, so a restart does not wait for the next confirmation.
+
+The JSON-RPC lanes and history read a pool of endpoints: yours first, then
+public ones. `sources.json_rpc.endpoints` lists your own, such as a provider
+account's keyed URL, paced at `sources.json_rpc.calls_per_second` (default
+40). `sources.json_rpc.public_endpoints` names the public ones behind them:
+
+| `public_endpoints` | Public endpoints | Default |
+| --- | --- | --- |
+| `chainlist` | The chain entry's vetted endpoints, then the keyless HTTPS endpoints chainlist.org lists for the chain whose operators state they track nothing or little (`tracking` `none` or `limited`) | With `finality.kind = "sequencer_feed"` |
+| `bundled` | The chain entry's vetted endpoints only | Otherwise |
+| `none` | None: only your own endpoints | |
+
+```toml
+[sources.json_rpc]
+endpoints = ["https://arb-mainnet.example.com/v2/<key>"]
+public_endpoints = "chainlist" # or "bundled", or "none" for yours alone
+```
+
+Anyone can list an endpoint on chainlist.org, so its endpoints only carry
+blocks the node checks itself: `chainlist` needs the sequencer feed, and
+with `json_rpc` finality, where the endpoints vouch for the blocks, it is
+refused. The node fetches chainlist.org's list at most once a day and keeps
+it in `chainlist-endpoints.json` in its data directory; when the list cannot
+be fetched, the kept one serves, and without one only your own and the
+bundled endpoints do. `leani doctor` shows the plan, and the lanes log the
+hosts they kept.
+
+At start each endpoint must serve the configured chain and
+`eth_getBlockReceipts`, or it is dropped. Of the public ones, the bundled
+stay ahead of the listed ones, which go fastest first, eight public
+endpoints at most, so few operators see the node's traffic. Your endpoints
+take work first and a range another endpoint fails goes to them first; the
+public ones take what yours leave: more parallel work than yours can hold,
+and ranges yours fail or rate-limit. Block ranges spread over all of them in
+parallel, a faster endpoint taking more. Each public endpoint is paced at 40
+calls per second, or slower where its rate-limit headers announce a lower
+limit; it waits as long as a rate limit's `Retry-After` asks, slows down on
+each rate limit, and recovers gradually. All lanes of the node share each
+endpoint's pace. Public endpoints are shared and offered free, so list
+endpoints of your own for long backfills.
 
 ### L1 anchor
 
