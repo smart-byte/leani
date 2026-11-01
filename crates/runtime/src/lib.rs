@@ -47,6 +47,8 @@ const FINALITY_ANCHOR_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 /// How often finality retries its last applied anchor for the processors
 /// that did not take it.
 const FINALITY_PROCESSOR_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How often a settle depth prunes recent frames below the tip.
+const SETTLE_INTERVAL: Duration = Duration::from_secs(2);
 /// Longest wait between retries for a processor whose finality keeps failing.
 const FINALITY_PROCESSOR_RETRY_MAX: Duration = Duration::from_secs(300);
 const RECENT_STORAGE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -7515,6 +7517,9 @@ pub struct SharedFinalityReport {
     pub failed_processors: BTreeMap<String, String>,
     pub pruned_recent_frames: u64,
     pub retained_recent_bytes: u64,
+    /// Recent frames are pruned through here without finality.
+    #[serde(default)]
+    pub settled_through: Option<BlockNumber>,
 }
 
 impl SharedFinalityReport {
@@ -7575,6 +7580,8 @@ pub struct SharedFinalityRuntime {
     processors: Vec<Arc<dyn Processor>>,
     config: SharedFinalityRuntimeConfig,
     applied_anchors: Option<tokio::sync::broadcast::Sender<AppliedFinalityAnchor>>,
+    settle_depth: Option<u64>,
+    settle_head: Option<leani_source_api::AttestedHeadReceiver>,
 }
 
 impl std::fmt::Debug for SharedFinalityRuntime {
@@ -7593,6 +7600,8 @@ impl std::fmt::Debug for SharedFinalityRuntime {
             )
             .field("config", &self.config)
             .field("publishes_applied_anchors", &self.applied_anchors.is_some())
+            .field("settle_depth", &self.settle_depth)
+            .field("settles_below_attested_head", &self.settle_head.is_some())
             .finish()
     }
 }
@@ -7628,7 +7637,26 @@ impl SharedFinalityRuntime {
             processors,
             config,
             applied_anchors: None,
+            settle_depth: None,
+            settle_head: None,
         })
+    }
+
+    /// Prune recent frames `depth` blocks below the canonical tip, for
+    /// chains whose finality lags days. Settled blocks keep their level:
+    /// only verified finality labels a block `finalized`.
+    #[must_use]
+    pub const fn with_settle_depth(mut self, depth: u64) -> Self {
+        self.settle_depth = Some(depth);
+        self
+    }
+
+    /// Count the settle depth from the newest attested head when it is above
+    /// the canonical tip, as while the live lane catches up.
+    #[must_use]
+    pub fn with_settle_head(mut self, heads: leani_source_api::AttestedHeadReceiver) -> Self {
+        self.settle_head = Some(heads);
+        self
     }
 
     /// Publish consensus-verified anchors after their canonical execution
@@ -7680,9 +7708,16 @@ impl SharedFinalityRuntime {
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
         processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut settle = tokio::time::interval(SETTLE_INTERVAL);
+        settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        self.settle(&mut report).await?;
         loop {
             let event = tokio::select! {
                 () = cancellation.cancelled() => break,
+                _ = settle.tick(), if self.settle_depth.is_some() => {
+                    self.settle(&mut report).await?;
+                    continue;
+                }
                 _ = retry.tick(), if pending_finalized.is_some() => {
                     let Some(finalized) = pending_finalized else {
                         continue;
@@ -7814,11 +7849,19 @@ impl SharedFinalityRuntime {
             retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let mut processor_retry = tokio::time::interval(FINALITY_PROCESSOR_RETRY_INTERVAL);
             processor_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut settle = tokio::time::interval(SETTLE_INTERVAL);
+            settle.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             let disconnected = loop {
                 let event = tokio::select! {
                     () = cancellation.cancelled() => {
                         signal_readiness(Some(&readiness), false);
                         return Ok(report);
+                    }
+                    _ = settle.tick(), if self.settle_depth.is_some() => {
+                        self.settle(&mut report)
+                            .await
+                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?;
+                        continue;
                     }
                     _ = retry.tick(), if pending_finalized.is_some() => {
                         let Some(finalized) = pending_finalized else {
@@ -7925,6 +7968,52 @@ impl SharedFinalityRuntime {
         }
         signal_readiness(Some(&readiness), false);
         Ok(report)
+    }
+
+    async fn settle(&self, report: &mut SharedFinalityReport) -> Result<(), RuntimeError> {
+        let Some(depth) = self.settle_depth else {
+            return Ok(());
+        };
+        let chain_id = self.source.descriptor().chain_id;
+        let Some(bounds) = self.store.recent_canonical_bounds(chain_id).await? else {
+            return Ok(());
+        };
+        let tip = self
+            .settle_head
+            .clone()
+            .and_then(|mut heads| heads.latest())
+            .map_or(bounds.end(), |head| head.block_number.max(bounds.end()));
+        let through = BlockNumber(tip.0.saturating_sub(depth));
+        if report
+            .settled_through
+            .is_some_and(|settled| settled >= through)
+        {
+            return Ok(());
+        }
+        // An hour of large blocks, such as Base's, can outgrow the recent
+        // budget: the budget then wins over the depth, down to the minimum the
+        // store keeps.
+        for cutoff in [through, bounds.end()] {
+            let pruned = self
+                .store
+                .prune_recent_frames(
+                    chain_id,
+                    cutoff,
+                    self.config.minimum_recent_blocks,
+                    self.config.recent_soft_bytes,
+                    self.config.recent_hard_bytes,
+                )
+                .await?;
+            report.pruned_recent_frames = report
+                .pruned_recent_frames
+                .saturating_add(pruned.deleted_frames);
+            report.retained_recent_bytes = pruned.retained_bytes;
+            if pruned.retained_bytes <= self.config.recent_soft_bytes {
+                break;
+            }
+        }
+        report.settled_through = Some(through);
+        Ok(())
     }
 
     /// Apply a verified finalized block once the canonical chain reaches its
@@ -22724,6 +22813,190 @@ mod tests {
                 .expect("recent lookup")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_settle_depth_prunes_recent_frames_without_finalizing_them() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range");
+        let chain = live_blocks(5);
+        let processor = Arc::new(BlockLocalCounter::named("settled"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, processor.as_ref(), frame, sequence).await;
+        }
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 5,
+            beacon_block_root: [0; 32],
+            execution_block_hash: chain[5].block.hash,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        // Room for two and a half frames: the two above the settle depth fit.
+        let soft_bytes = retained_recent_bytes(&store).await / 6 * 5 / 2;
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor("settled-finality", range),
+                checkpoint.clone(),
+                vec![FinalityStep::Event(FinalityEvent::Optimistic {
+                    block_hash: chain[5].block.hash,
+                    beacon_slot: 5,
+                })],
+            )),
+            vec![processor.clone()],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: soft_bytes,
+                recent_hard_bytes: 1_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .with_settle_depth(2)
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("settling");
+
+        assert_eq!(report.settled_through, Some(BlockNumber(3)));
+        assert_eq!(report.pruned_recent_frames, 4);
+        assert_eq!(report.finalized_through, None);
+        for (number, retained) in [(3, false), (4, true)] {
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("recent lookup")
+                    .is_some(),
+                retained
+            );
+        }
+        assert_eq!(
+            store
+                .finalized_through(processor.descriptor())
+                .await
+                .expect("finality"),
+            None
+        );
+        let (_, finality) = store
+            .canonical_block(ChainId(1), BlockNumber(3))
+            .await
+            .expect("canonical lookup")
+            .expect("canonical block");
+        assert_ne!(finality, Finality::Finalized);
+    }
+
+    /// The bytes of the recent frames a store retains.
+    async fn retained_recent_bytes(store: &SqliteStore) -> u64 {
+        store
+            .prune_recent_frames(ChainId(1), BlockNumber(0), 1, u64::MAX, u64::MAX)
+            .await
+            .expect("measure recent frames")
+            .retained_bytes
+    }
+
+    #[tokio::test]
+    async fn the_recent_budget_wins_over_the_settle_depth() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range");
+        let chain = live_blocks(5);
+        let processor = Arc::new(BlockLocalCounter::named("over-budget"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, processor.as_ref(), frame, sequence).await;
+        }
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 5,
+            beacon_block_root: [0; 32],
+            execution_block_hash: chain[5].block.hash,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor("over-budget-finality", range),
+                checkpoint.clone(),
+                Vec::new(),
+            )),
+            vec![processor],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: 1,
+                recent_hard_bytes: 1_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .with_settle_depth(2)
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("settling");
+
+        // The frames above the settle depth outgrow the budget too: all but
+        // the minimum kept go.
+        assert_eq!(report.settled_through, Some(BlockNumber(3)));
+        assert_eq!(report.pruned_recent_frames, 5);
+        for (number, retained) in [(4, false), (5, true)] {
+            assert_eq!(
+                store
+                    .recent_frame(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("recent lookup")
+                    .is_some(),
+                retained
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_settles_below_the_attested_head() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(5)).expect("range");
+        let chain = live_blocks(5);
+        let processor = Arc::new(BlockLocalCounter::named("caught-up"));
+        let (_directory, store) = store().await;
+        for (sequence, frame) in (1..).zip(&chain) {
+            store.store_recent_frame(frame).await.expect("retain frame");
+            apply_live_frame(&store, processor.as_ref(), frame, sequence).await;
+        }
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 5,
+            beacon_block_root: [0; 32],
+            execution_block_hash: chain[5].block.hash,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        let heads = leani_source_api::AttestedHeadPublisher::new();
+        heads.publish(leani_source_api::AttestedHead {
+            beacon_slot: 100,
+            beacon_block_root: [0; 32],
+            block_number: BlockNumber(100),
+            block_hash: BlockHash::new([0x64; 32]),
+        });
+        // Room for three and a half frames: the three above the cutoff fit.
+        let soft_bytes = retained_recent_bytes(&store).await / 6 * 7 / 2;
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedFinalitySource::new(
+                fixture_source_descriptor("caught-up-finality", range),
+                checkpoint.clone(),
+                Vec::new(),
+            )),
+            vec![processor],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: soft_bytes,
+                recent_hard_bytes: 1_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .with_settle_depth(98)
+        .with_settle_head(heads.subscribe())
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("settling");
+
+        // Counted from the store's tip at 5, nothing would settle.
+        assert_eq!(report.settled_through, Some(BlockNumber(2)));
+        assert_eq!(report.pruned_recent_frames, 3);
     }
 
     #[tokio::test]

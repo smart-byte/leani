@@ -168,11 +168,12 @@ fn entry_with_beacon_section_needs_its_config() {
 
 #[test]
 fn op_stack_fork_ids_match_live_peers() {
-    // Fork ids once every scheduled fork is active (EIP-2124); OP Mainnet
-    // and Unichain were verified live against their peers.
+    // Fork ids once every scheduled fork is active (EIP-2124); OP Mainnet's,
+    // Base Sepolia's, and Unichain's match what their peers advertise.
     for (name, hash) in [
         ("op-mainnet", [0xc2, 0x92, 0x39, 0xaf]),
         ("base", [0x16, 0x9d, 0x85, 0xa3]),
+        ("base-sepolia", [0xc6, 0x75, 0x7f, 0x44]),
         ("unichain", [0x1f, 0xaa, 0x45, 0x6e]),
         ("worldchain", [0xf1, 0x13, 0x24, 0x8b]),
     ] {
@@ -205,6 +206,50 @@ fn base_announces_cobalt_until_denim() {
 }
 
 #[test]
+fn base_blocks_come_every_200_ms_from_denim() {
+    // Denim takes the first 2 s slot at or after its time: one second late on
+    // mainnet, whose genesis sits on an odd second. Base Sepolia's head on
+    // 2026-10-25 21:43:05 UTC was block 50,213,581, as its schedule predicts.
+    let registry = ChainRegistry::standard();
+    let base = registry.get("base").unwrap();
+    assert_eq!(
+        base.op_stack.as_ref().unwrap().denim_block(),
+        Some(53_556_127)
+    );
+    let cadence = base.cadence().unwrap();
+    // Block 53,086,330 as seen on gossip.
+    assert_eq!(cadence.slot_start(53_086_330), 1_792_962_007);
+    assert_eq!(cadence.slot_start(53_556_126), 1_793_901_599);
+    assert_eq!(cadence.slot_ms(53_556_126), 2_000);
+    assert_eq!(cadence.slot_start_ms(53_556_127), 1_793_901_601_000);
+    assert_eq!(cadence.slot_ms(53_556_127), 200);
+    assert_eq!(cadence.slot_start_ms(53_556_128), 1_793_901_601_200);
+    // Five blocks share each second, and the number names the slot.
+    assert_eq!(cadence.slot_start(53_556_131), 1_793_901_601);
+    assert_eq!(cadence.slot_start(53_556_132), 1_793_901_602);
+    assert_eq!(cadence.slot_at(1_793_901_602), 53_556_132);
+    assert_eq!(cadence.slot_starting_at(1_793_901_601), None);
+    assert_eq!(
+        cadence.header_slot(53_556_129, 1_793_901_601),
+        Some(53_556_129)
+    );
+    assert_eq!(cadence.header_slot(53_556_129, 1_793_901_602), None);
+    assert_eq!(cadence.slot_ms(u64::MAX), 200);
+    let sepolia = registry.get("base-sepolia").unwrap();
+    assert_eq!(
+        sepolia.op_stack.as_ref().unwrap().denim_block(),
+        Some(48_418_656)
+    );
+    assert_eq!(
+        sepolia.cadence().unwrap().slot_at(1_792_964_585),
+        50_213_581
+    );
+    let op = registry.get("optimism").unwrap();
+    assert_eq!(op.op_stack.as_ref().unwrap().denim_block(), None);
+    assert_eq!(op.cadence().unwrap().slot_ms(u64::MAX), 2_000);
+}
+
+#[test]
 fn op_stack_entries_carry_their_schedule() {
     let op = ChainRegistry::standard().get("optimism").unwrap();
     let schedule = op.op_stack.as_ref().unwrap();
@@ -216,9 +261,10 @@ fn op_stack_entries_carry_their_schedule() {
         None,
         "consensus-only forks are skipped"
     );
-    // Block n of the rollup is due at its slot of the cadence.
+    // Block n of the rollup is due at slot n of the cadence.
     let cadence = op.cadence().unwrap();
-    assert_eq!(cadence.slot_start(10), 1_686_068_903 + 20);
+    assert_eq!(cadence.slot_start(105_235_063 + 10), 1_686_068_903 + 20);
+    assert_eq!(cadence.slot_at(1_686_068_903 + 21), 105_235_063 + 10);
     let base = ChainRegistry::standard().get("base").unwrap();
     assert!(!base.execution.discv4);
     assert_eq!(base.execution.discv5_protocol_id.as_deref(), Some("basev0"));
@@ -278,4 +324,31 @@ fn public_datasets_name_their_layout() {
     );
     assert_eq!(base.layout, DatasetLayout::SonarxEvmV1);
     assert_eq!(arbitrum.first_block, 22_207_817);
+}
+
+#[test]
+fn rollups_name_their_l1_anchor() {
+    let registry = ChainRegistry::standard();
+    assert_eq!(
+        registry.get("base").unwrap().l1_anchor,
+        Some(L1Anchor::DisputeGames {
+            factory: "0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"
+                .parse()
+                .unwrap(),
+            registry: "0x909f6cf47ed12f010a796527f562bfc26c7f4e72"
+                .parse()
+                .unwrap(),
+            game_type: 621,
+        })
+    );
+    assert!(matches!(
+        registry.get("robinhood").unwrap().l1_anchor,
+        Some(L1Anchor::NitroRollup { .. })
+    ));
+    // OP Mainnet's respected games claim super roots, which the anchor does
+    // not read.
+    assert_eq!(registry.get("op-mainnet").unwrap().l1_anchor, None);
+    let misplaced = include_str!("../../../config/chains/arbitrum-one.toml")
+        .replace("family = \"arbitrum\"", "family = \"ethereum\"");
+    assert!(Chain::from_entry(&misplaced, None).is_err());
 }

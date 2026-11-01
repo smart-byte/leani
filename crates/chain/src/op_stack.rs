@@ -125,12 +125,15 @@ impl OpStackNetwork {
         })
     }
 
-    /// One block per slot from the first derived block.
+    /// One block per slot, numbered like the blocks, from the first derived
+    /// block; 200 ms slots from Base's Denim block on.
     #[must_use]
-    pub const fn cadence(&self) -> Cadence {
+    pub fn cadence(&self) -> Cadence {
         Cadence {
             genesis_time: self.first_block_time,
             seconds: self.block_time,
+            first_block: Some(self.first_block),
+            fast_from: self.denim_block(),
         }
     }
 
@@ -140,5 +143,18 @@ impl OpStackNetwork {
             .iter()
             .find(|(name, _)| *name == fork)
             .map(|(_, timestamp)| *timestamp)
+    }
+
+    /// The first block of Base's Denim: the first legacy slot at or after
+    /// its activation time. Blocks after it come every 200 ms.
+    #[must_use]
+    pub fn denim_block(&self) -> Option<u64> {
+        let denim = self.activation("denim")?;
+        Some(
+            self.first_block
+                + denim
+                    .saturating_sub(self.first_block_time)
+                    .div_ceil(self.block_time),
+        )
     }
 }

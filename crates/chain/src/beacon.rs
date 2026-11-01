@@ -136,6 +136,8 @@ impl BeaconNetwork {
         crate::Cadence {
             genesis_time: self.genesis_time,
             seconds: self.seconds_per_slot,
+            first_block: None,
+            fast_from: None,
         }
     }
 
