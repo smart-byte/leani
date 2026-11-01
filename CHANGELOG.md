@@ -8,6 +8,18 @@ record, and documented RPC contracts.
 
 ### Added
 
+- A node can follow a chain over JSON-RPC: `kind = "json_rpc"` for the live
+  source, finality, and history, with endpoints and a quorum under
+  `[sources.json_rpc]` (defaulting to the chain entry's). A block counts as
+  canonical once `quorum` endpoints serve the same hash, and its header,
+  transactions, and receipts are checked against its own roots. Levels follow
+  the endpoints' `latest`, `safe`, and `finalized` blocks, labeled trusted.
+  Fetches read only what the processors need and keep within each
+  endpoint's `calls_per_second`. Robinhood Chain follows live this way.
+- Arbitrum One, Arbitrum Nova, and Robinhood Chain entries. Nitro chains run
+  no public execution P2P, so `leani source probe rpc` fetches their blocks
+  over JSON-RPC and checks each header hash, transactions root, and receipts
+  root locally, Arbitrum's internal and deposit transactions included.
 - OP-stack chain entries: OP Mainnet, Base, Unichain, World Chain, Ink,
   Soneium, Zora, and Mode, with schedules from the superchain registry (Base
   from its own client's config). The execution P2P source handshakes with

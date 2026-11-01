@@ -64,6 +64,8 @@ pub enum SourceKind {
     ConsensusP2p,
     BeaconApi,
     Synthetic,
+    /// JSON-RPC endpoints, trusted for which block is canonical.
+    JsonRpc,
 }
 
 /// Trust needed beyond cryptographic checks represented in the report.

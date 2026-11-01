@@ -1895,6 +1895,99 @@
                 "subcommands": []
               },
               {
+                "name": "rpc",
+                "about": "Fetch blocks over JSON-RPC and check them against their own roots",
+                "usage": "Usage: leani source probe rpc [OPTIONS]",
+                "arguments": [
+                  {
+                    "id": "from_block",
+                    "long": "from-block",
+                    "short": null,
+                    "help": "First block; omitted, 31 blocks before the last",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_block",
+                    "long": "to-block",
+                    "short": null,
+                    "help": "Last block; omitted, the endpoint's head minus ten",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "endpoint",
+                    "long": "endpoint",
+                    "short": null,
+                    "help": "Endpoint to ask instead of the chain entry's",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help (see more with '--help')",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
                 "name": "op-gossip",
                 "about": "Follow an op-stack chain's sequencer-signed block gossip",
                 "usage": "Usage: leani source probe op-gossip [OPTIONS]",
@@ -2416,6 +2509,13 @@
                     "subcommands": []
                   },
                   {
+                    "name": "rpc",
+                    "about": "Fetch blocks over JSON-RPC and check them against their own roots",
+                    "usage": "Usage: leani source probe help rpc",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
                     "name": "op-gossip",
                     "about": "Follow an op-stack chain's sequencer-signed block gossip",
                     "usage": "Usage: leani source probe help op-gossip",
@@ -2470,6 +2570,13 @@
                     "name": "xatu",
                     "about": "Inspect the configured Xatu catalog",
                     "usage": "Usage: leani source help probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "rpc",
+                    "about": "Fetch blocks over JSON-RPC and check them against their own roots",
+                    "usage": "Usage: leani source help probe rpc",
                     "arguments": [],
                     "subcommands": []
                   },
@@ -4791,6 +4898,13 @@
                     "name": "xatu",
                     "about": "Inspect the configured Xatu catalog",
                     "usage": "Usage: leani help source probe xatu",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "rpc",
+                    "about": "Fetch blocks over JSON-RPC and check them against their own roots",
+                    "usage": "Usage: leani help source probe rpc",
                     "arguments": [],
                     "subcommands": []
                   },
