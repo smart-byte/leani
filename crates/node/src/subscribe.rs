@@ -1340,12 +1340,13 @@ async fn embedded_config(
         config.finality.checkpoint = checkpoint.root;
         config.finality.checkpoint_slot = checkpoint.slot;
         config.finality.endpoints = crate::init::starter_finality_endpoints(
+            &crate::config::default_finality_endpoints().map_err(anyhow::Error::msg)?,
             checkpoint
                 .beacon_api_endpoints
                 .iter()
                 .map(|endpoint| Url::parse(endpoint).context("parse cached Beacon API endpoint"))
                 .collect::<Result<Vec<_>>>()?,
-        )?;
+        );
     }
     match finality_kind {
         FinalitySourceKind::BeaconApi => {

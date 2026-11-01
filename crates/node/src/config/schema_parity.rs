@@ -24,7 +24,7 @@ use serde::{
 };
 use serde_json::Value;
 
-use super::{Config, StarterConfig};
+use super::{Config, StarterConfig, StarterFinalityConfig};
 
 /// Accepted when decoding only so validation can refuse them and name the
 /// replacement; the schema must not offer them. `path=value` names an enum
@@ -679,21 +679,22 @@ fn compact_configurations_validate_against_json_schema() {
         .should_validate_formats(true)
         .build(&schema.0)
         .expect("valid configuration schema");
-    let checkpoint = format!("0x{}", "11".repeat(32));
-    let endpoints = vec![url::Url::parse("https://beacon.example/").expect("URL")];
+    let finality = StarterFinalityConfig {
+        checkpoint: format!("0x{}", "11".repeat(32)),
+        checkpoint_slot: 15_000_000,
+        endpoints: vec![url::Url::parse("https://beacon.example/").expect("URL")],
+    };
     for starter in [
         StarterConfig::blocks(
+            "ethereum-mainnet".to_owned(),
             PathBuf::from("./data"),
-            checkpoint.clone(),
-            15_000_000,
-            endpoints.clone(),
+            Some(finality.clone()),
         ),
+        StarterConfig::blocks("op-mainnet".to_owned(), PathBuf::from("./data"), None),
         StarterConfig::uniswap(
             PathBuf::from("./data"),
             vec!["ETH/USDC".to_owned()],
-            checkpoint.clone(),
-            15_000_000,
-            endpoints.clone(),
+            finality.clone(),
         ),
     ] {
         let encoded = toml::to_string_pretty(&starter).expect("compact TOML");

@@ -14,7 +14,12 @@ With a preset and flags:
 leani init uniswap-v3 ETH/USDC --keep window --window-days 30 \
   --memory 1GiB --bandwidth 100 --yes --json
 leani init blocks --keep result --follow none --history-from-block 20000000 --json
+leani init blocks --network base --keep window --window-days 7 --yes --json
 ```
+
+`--network` names the chain: a built-in entry or alias such as `base`, `op`,
+`arbitrum-one`, `robinhood`, or `hoodi` (default `ethereum-mainnet`). Uniswap
+markets are Ethereum Mainnet's.
 
 With requirements as JSON, from a file or standard input, for any processor:
 

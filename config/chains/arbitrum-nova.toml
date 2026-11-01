@@ -14,6 +14,7 @@ rpc_endpoints = [
   "https://nova.arbitrum.io/rpc",
   "https://arbitrum-nova-rpc.publicnode.com",
 ]
+history_sources = ["json_rpc"]
 
 # The BoLD rollup, as the bridge's rollup() names it.
 [l1_anchor]

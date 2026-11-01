@@ -10,14 +10,18 @@
     "starterConfig": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["config_version", "network", "finality"],
+      "required": ["config_version", "network"],
       "oneOf": [
         { "required": ["blocks"], "not": { "required": ["uniswap"] } },
         { "required": ["uniswap"], "not": { "required": ["blocks"] } }
       ],
       "properties": {
         "config_version": { "const": 1 },
-        "network": { "enum": ["ethereum-mainnet", "ethereum-sepolia", "ethereum-hoodi"] },
+        "network": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A built-in chain entry or its alias, such as `ethereum-mainnet`, `base`, `op`, `arbitrum-one`, or `robinhood`."
+        },
         "data_dir": {
           "type": "string",
           "minLength": 1,
@@ -136,10 +140,17 @@
     "chain": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["name", "chain_id"],
+      "required": ["name"],
       "properties": {
-        "name": { "type": "string", "minLength": 1 },
-        "chain_id": { "$ref": "#/$defs/positiveInteger" },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "description": "A built-in chain entry or its alias."
+        },
+        "chain_id": {
+          "$ref": "#/$defs/positiveInteger",
+          "description": "The entry's EIP-155 chain id when omitted; a given one must match it."
+        },
         "merge_block": { "$ref": "#/$defs/nonNegativeInteger" }
       }
     },
