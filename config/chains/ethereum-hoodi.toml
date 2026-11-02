@@ -1,0 +1,21 @@
+name = "ethereum-hoodi"
+aliases = ["hoodi"]
+family = "ethereum"
+chain_id = 560048
+genesis_hash = "0xbbe312868b376a3001692a646dd2d7d1e4406380dfd86b98aa8a34d1557c971b"
+merge_block = 0
+
+[execution]
+dns_tree = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.hoodi.ethdisco.net"
+
+[beacon]
+genesis_time = 1742213400
+genesis_validators_root = "0x212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"
+
+[defaults]
+beacon_endpoints = [
+  "https://ethereum-hoodi-beacon-api.publicnode.com/",
+  "https://lodestar-hoodi.chainsafe.io/",
+]
+checkpoint_providers = ["https://checkpoint-sync.hoodi.ethpandaops.io/"]
+history_sources = []

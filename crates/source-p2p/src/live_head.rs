@@ -9,7 +9,7 @@ use std::{
 
 use alloy_consensus::Header;
 use alloy_primitives::{B256, B512};
-use leani_primitives::{BlockFrame, BlockHash, BlockNumber, BlockRef, Material, SLOT_SECONDS};
+use leani_primitives::{BlockFrame, BlockHash, BlockNumber, BlockRef, Material};
 use leani_source_api::AttestedHead;
 
 /// Unattested blocks run at most this many slots past the newest attested
@@ -166,8 +166,8 @@ pub(crate) const fn late_reveal(slot_start: u64, seen: u64) -> bool {
 
 /// How long to wait before polling the block after one at `last_timestamp`,
 /// at `now_ms` UNIX milliseconds.
-pub(crate) fn head_poll_delay(last_timestamp: u64, now_ms: u64) -> Duration {
-    let first_poll_ms = (last_timestamp + SLOT_SECONDS) * 1_000
+pub(crate) fn head_poll_delay(last_timestamp: u64, slot_seconds: u64, now_ms: u64) -> Duration {
+    let first_poll_ms = (last_timestamp + slot_seconds) * 1_000
         + u64::try_from(HEAD_FIRST_POLL_OFFSET.as_millis()).unwrap_or(u64::MAX);
     Duration::from_millis(first_poll_ms.saturating_sub(now_ms))
 }
@@ -334,9 +334,9 @@ mod tests {
         assert!(late_reveal(1_000, 1_008));
         // The next block's slot starts at 1_012; polls start a second in.
         assert_eq!(
-            head_poll_delay(1_000, 1_005_000),
+            head_poll_delay(1_000, 12, 1_005_000),
             Duration::from_millis(8_000)
         );
-        assert_eq!(head_poll_delay(1_000, 1_014_000), Duration::ZERO);
+        assert_eq!(head_poll_delay(1_000, 12, 1_014_000), Duration::ZERO);
     }
 }

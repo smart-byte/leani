@@ -1516,7 +1516,7 @@ async fn merge_local_execution_peer_stores(
 ) -> Result<Option<PeerStoreMerge>> {
     let destination = data_dir.join("execution-network.sqlite");
     let sources = local_execution_peer_store_sources(config_path, data_dir)?;
-    leani_source_p2p::merge_execution_peer_stores(&destination, &sources, maximum_entries)
+    leani_source_p2p::merge_execution_peer_stores(&destination, &sources, maximum_entries, 1)
         .await
         .with_context(|| {
             format!(

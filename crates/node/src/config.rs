@@ -6,6 +6,7 @@ use std::{
     net::SocketAddr,
     path::{Path, PathBuf},
     str::FromStr,
+    sync::Arc,
 };
 
 use leani_processor_api::{
@@ -49,7 +50,8 @@ pub struct Config {
 #[serde(deny_unknown_fields)]
 pub(crate) struct StarterConfig {
     pub config_version: u32,
-    pub network: StarterNetwork,
+    /// A built-in chain entry name.
+    pub network: String,
     #[serde(default = "default_starter_data_dir")]
     pub data_dir: PathBuf,
     pub finality: StarterFinalityConfig,
@@ -59,12 +61,6 @@ pub(crate) struct StarterConfig {
     pub uniswap: Option<StarterUniswapConfig>,
     #[serde(default)]
     pub api: StarterApiConfig,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum StarterNetwork {
-    EthereumMainnet,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -123,7 +119,7 @@ impl StarterConfig {
     ) -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            network: StarterNetwork::EthereumMainnet,
+            network: "ethereum-mainnet".to_owned(),
             data_dir,
             finality: StarterFinalityConfig {
                 checkpoint,
@@ -144,7 +140,7 @@ impl StarterConfig {
     ) -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            network: StarterNetwork::EthereumMainnet,
+            network: "ethereum-mainnet".to_owned(),
             data_dir,
             finality: StarterFinalityConfig {
                 checkpoint,
@@ -159,6 +155,28 @@ impl StarterConfig {
 
     fn expand(self) -> Result<Config, String> {
         let mut config = Config::ethereum_mainnet_defaults()?;
+        let chain = leani_chain::ChainRegistry::standard()
+            .get(&self.network)
+            .map_err(|error| error.to_string())?;
+        if chain.chain_id != config.chain.chain_id {
+            // Mainnet's dataset history sources do not serve other chains;
+            // the execution P2P source serves their finalized history.
+            config.chain = ChainConfig {
+                name: chain.name.clone(),
+                chain_id: chain.chain_id,
+                merge_block: chain.merge_block,
+            };
+            config.sources.history.retain(|source| {
+                chain
+                    .defaults
+                    .history_sources
+                    .iter()
+                    .any(|kind| kind == source.kind.name())
+            });
+            if config.sources.history.is_empty() {
+                config.rpc.historical_mode = HistoricalMode::Disabled;
+            }
+        }
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
                 crate::block_summaries::COMPACT_INSTANCE,
@@ -473,6 +491,8 @@ pub enum HistoryMaterialCoordinatorMode {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourcesConfig {
+    /// Empty when the P2P live source serves all history.
+    #[serde(default)]
     pub history: Vec<HistorySourceConfig>,
     pub live: LiveSourceConfig,
 }
@@ -516,6 +536,19 @@ pub enum HistorySourceKind {
     /// name `xatu`, which reads public Parquet history.
     Parquet,
     Archive,
+}
+
+impl HistorySourceKind {
+    /// The config spelling.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Xatu => "xatu",
+            Self::EraE => "era_e",
+            Self::Parquet => "parquet",
+            Self::Archive => "archive",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1426,6 +1459,24 @@ impl Config {
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))
     }
 
+    /// The built-in chain entry `[chain] name` names, checked against the
+    /// configured chain id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown chain or a chain id the entry does not
+    /// have.
+    pub fn chain_entry(&self) -> Result<Arc<leani_chain::Chain>, leani_chain::ChainError> {
+        let entry = leani_chain::ChainRegistry::standard().get(&self.chain.name)?;
+        if entry.chain_id != self.chain.chain_id {
+            return Err(leani_chain::ChainError::InvalidEntry(format!(
+                "chain {} has chain id {}, but chain_id = {} is configured",
+                entry.name, entry.chain_id, self.chain.chain_id
+            )));
+        }
+        Ok(entry)
+    }
+
     /// Read TOML without opening the configured data directory or any network
     /// connection. Relative paths in the file, its `data_dir`, archive
     /// `manifest`s, and Wasm processor `module`s, are resolved against the
@@ -1574,6 +1625,22 @@ impl Config {
                 "must be greater than zero",
             ));
         }
+        match self.chain_entry() {
+            Ok(entry) => {
+                if matches!(self.finality.kind, FinalitySourceKind::ConsensusP2p)
+                    && entry.chain_id != 1
+                {
+                    errors.push(ValidationError::new(
+                        "finality.kind",
+                        format!(
+                            "consensus_p2p finality follows ethereum-mainnet only; use beacon_api on {}",
+                            entry.name
+                        ),
+                    ));
+                }
+            }
+            Err(error) => errors.push(ValidationError::new("chain", error.to_string())),
+        }
         validate_positive_budgets(&self.budgets, &mut errors);
         validate_raw_history(self.raw_history, &mut errors);
         validate_artifact_storage(self.artifact_storage, &self.budgets, &mut errors);
@@ -1593,10 +1660,19 @@ impl Config {
                 "must not exceed recent_raw_hard_bytes",
             ));
         }
-        if self.sources.history.is_empty() {
+        if self.sources.history.is_empty() && !matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        {
             errors.push(ValidationError::new(
                 "sources.history",
-                "at least one historical source is required",
+                "at least one historical source is required without the p2p live source",
+            ));
+        }
+        if self.sources.history.is_empty()
+            && matches!(self.rpc.historical_mode, HistoricalMode::OnDemand)
+        {
+            errors.push(ValidationError::new(
+                "rpc.historical_mode",
+                "on_demand serves history from sources.history, which is empty; set it to \"disabled\"",
             ));
         }
         unique_non_empty_ids(
@@ -3591,6 +3667,7 @@ verification_segment_blocks = 8192"#,
     fn xatu_history_sources_are_mainnet_only() {
         // Audit History-3: Xatu stamps every frame as chain 1.
         let mut config = config();
+        config.chain.name = "ethereum-sepolia".to_owned();
         config.chain.chain_id = 11_155_111;
         assert_eq!(error_fields(&config), ["sources.history[0].kind"]);
     }
@@ -3920,6 +3997,74 @@ max_blocks = 64"#,
         loaded.data_dir = data_path.clone();
         let _ = loaded.validation_errors();
         assert!(!data_path.exists());
+    }
+
+    fn compact_blocks_config(network: &str) -> String {
+        format!(
+            r#"config_version = 1
+network = "{network}"
+
+[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
+
+[blocks]
+"#
+        )
+    }
+
+    #[test]
+    fn compact_testnet_configuration_follows_its_chain_entry() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config_path = temp.path().join("leani.toml");
+        fs::write(&config_path, compact_blocks_config("ethereum-hoodi")).expect("write config");
+        let config = Config::load(&config_path).expect("load compact config");
+        config
+            .clone()
+            .validate()
+            .expect("expanded configuration validates");
+        assert_eq!(config.chain.name, "ethereum-hoodi");
+        assert_eq!(config.chain.chain_id, 560_048);
+        assert_eq!(config.chain.merge_block, Some(0));
+        assert!(
+            config.sources.history.is_empty(),
+            "eraE and Xatu serve mainnet only"
+        );
+        assert!(matches!(
+            config.rpc.historical_mode,
+            HistoricalMode::Disabled
+        ));
+        assert_eq!(config.chain_entry().expect("entry").name, "ethereum-hoodi");
+    }
+
+    #[test]
+    fn unknown_chains_and_mismatched_ids_are_refused() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let config_path = temp.path().join("leani.toml");
+        fs::write(&config_path, compact_blocks_config("dogecoin")).expect("write config");
+        let error = Config::load(&config_path)
+            .expect_err("unknown chain")
+            .to_string();
+        assert!(error.contains("ethereum-hoodi"), "{error}");
+
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.chain.chain_id = 560_048;
+        let errors = config.validation_errors();
+        assert!(
+            errors.iter().any(|error| error.message.contains(
+                "chain ethereum-mainnet has chain id 1, but chain_id = 560048 is configured"
+            )),
+            "{errors:?}"
+        );
+        config.chain.name = "hoodi".to_owned();
+        config.sources.history.clear();
+        config.rpc.historical_mode = HistoricalMode::Disabled;
+        assert!(
+            config.validation_errors().is_empty(),
+            "{:?}",
+            config.validation_errors()
+        );
     }
 
     #[test]

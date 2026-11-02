@@ -14,6 +14,7 @@ async-trait.workspace = true
 discv5 = { git = "https://github.com/sigp/discv5", rev = "7663c00", features = ["libp2p"] }
 futures.workspace = true
 helios-consensus-core.workspace = true
+leani-chain = { path = "../chain" }
 leani-finality-beacon-api = { path = "../finality-beacon-api" }
 leani-primitives = { path = "../primitives" }
 leani-source-api = { path = "../source-api" }

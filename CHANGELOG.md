@@ -8,6 +8,25 @@ record, and documented RPC contracts.
 
 ### Added
 
+- OP-stack chain entries: OP Mainnet, Base, Unichain, World Chain, Ink,
+  Soneium, Zora, and Mode, with schedules from the superchain registry (Base
+  from its own client's config). The execution P2P source handshakes with
+  their peers (EIP-2124 fork ids match live peers), decodes deposit and
+  post-exec transactions and receipts, and checks their roots, including
+  Regolith's receipts root without deposit nonces and Isthmus's withdrawals
+  root. Base discovery uses its `basev0` Discv5 network.
+- `leani source probe op-gossip` follows an op-stack chain's block gossip and
+  keeps the blocks its sequencer key signed.
+- Ethereum Sepolia and Hoodi chain entries. `[chain] name` (or a compact
+  config's `network`) now names a built-in chain entry; its chain id, slot
+  clock, Beacon network (genesis validators root, fork schedule from the
+  network's upstream `config.yaml`), execution DNS tree, and bootnodes follow
+  from it. Hoodi follows live over P2P with Beacon API finality; Sepolia
+  needs the Gloas light client first. eraE, Xatu, consensus P2P finality,
+  and built-in subscriptions stay mainnet-only.
+- With the P2P live source, `sources.history` may be empty: execution P2P
+  serves finalized history, and no archive reconciliation runs. On-demand
+  JSON-RPC history then must be `disabled`.
 - Wasm processors: write a processor in Rust with the new `leani-wasm-guest`
   crate, compile it to `wasm32-unknown-unknown`, and run it in the stock
   binary without rebuilding the node. Configure it as a `wasm` processor with

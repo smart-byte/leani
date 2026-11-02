@@ -592,6 +592,9 @@ again. A durable `failed` archive reconciliation is a correctness incident:
 preserve the database and source object, stop publication, and compare the
 processor version/configuration and block identity before resuming.
 
+With `sources.history` empty, execution P2P serves all history and no archive
+can reproduce it, so nothing is reconciled.
+
 Reconciliation compares only exact finalized coverage, which keeps each
 block's identity and mapped-delta checksum. It skips blocks nothing covers,
 and blocks that coverage compaction reduced to proof segments, logging the

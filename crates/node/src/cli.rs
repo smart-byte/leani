@@ -971,6 +971,15 @@ pub enum ProbeSource {
         #[arg(long, requires_all = ["from_date", "to_date"])]
         expected_export: Option<PathBuf>,
     },
+    /// Follow an op-stack chain's sequencer-signed block gossip.
+    OpGossip {
+        /// How long to listen.
+        #[arg(long, default_value_t = 120)]
+        seconds: u64,
+        /// Optional JSON lines destination for the verified blocks.
+        #[arg(long)]
+        output: Option<PathBuf>,
+    },
     /// Exercise the recent execution P2P boundary.
     P2p {
         /// First execution block in the inclusive probe range.

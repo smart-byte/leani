@@ -1,0 +1,24 @@
+name = "ethereum-mainnet"
+aliases = ["mainnet", "ethereum"]
+family = "ethereum"
+chain_id = 1
+genesis_hash = "0xd4e56740f876aef8c010b86a40d5f56745a118d0906a34e69aec8c0db1cb8fa3"
+merge_block = 15537394
+
+[execution]
+dns_tree = "enrtree://AKA3AM6LPBYEUDMVNU3BSVQJ5AD45Y7YPOHJLEF6W26QOE4VTUDPE@all.mainnet.ethdisco.net"
+
+[beacon]
+genesis_time = 1606824023
+genesis_validators_root = "0x4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95"
+
+[defaults]
+beacon_endpoints = [
+  "https://ethereum-beacon-api.publicnode.com/",
+  "https://lodestar-mainnet.chainsafe.io/",
+]
+checkpoint_providers = [
+  "https://mainnet.checkpoint.sigp.io/",
+  "https://beaconstate-mainnet.chainsafe.io/",
+]
+history_sources = ["era_e", "xatu"]

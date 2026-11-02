@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use alloy_consensus::Header;
 use alloy_eips::eip4844::DATA_GAS_PER_BLOB;
-use leani_primitives::slot_starting_at;
+use leani_chain::Cadence;
 use leani_source_api::AttestedHead;
 use reth_chainspec::ChainSpec;
 use reth_consensus::{ConsensusError, HeaderValidator};
@@ -34,14 +34,30 @@ pub(crate) enum HeaderVerdict {
 
 #[derive(Debug)]
 pub(crate) struct HeaderRules {
-    consensus: EthBeaconConsensus<ChainSpec>,
+    /// Ethereum's header rules; op-stack headers get the structural and
+    /// cadence checks only.
+    consensus: Option<EthBeaconConsensus<ChainSpec>>,
+    cadence: Cadence,
 }
 
 impl HeaderRules {
-    pub(crate) fn new(chain_spec: Arc<ChainSpec>) -> Self {
+    pub(crate) fn new(chain_spec: Arc<ChainSpec>, cadence: Cadence) -> Self {
         Self {
-            consensus: EthBeaconConsensus::new(chain_spec),
+            consensus: Some(EthBeaconConsensus::new(chain_spec)),
+            cadence,
         }
+    }
+
+    pub(crate) const fn cadence_only(cadence: Cadence) -> Self {
+        Self {
+            consensus: None,
+            cadence,
+        }
+    }
+
+    /// The clock headers are judged against.
+    pub(crate) const fn cadence(&self) -> &Cadence {
+        &self.cadence
     }
 
     /// Judge `header` as the child of `parent` at `now` UNIX seconds.
@@ -54,7 +70,7 @@ impl HeaderRules {
         now: u64,
         attested_parent_root: Option<[u8; 32]>,
     ) -> HeaderVerdict {
-        let Some(slot) = slot_starting_at(header.timestamp) else {
+        let Some(slot) = self.cadence.slot_starting_at(header.timestamp) else {
             return HeaderVerdict::Invalid(format!(
                 "timestamp {} is not a slot start",
                 header.timestamp
@@ -90,12 +106,22 @@ impl HeaderRules {
         }
         // ponytail: block_access_list_hash needs the BAL (eth/71) and
         // gas_limit == bid.gas_limit an authenticated bid; neither is checked.
+        let Some(consensus) = &self.consensus else {
+            return if header.number == parent.number + 1
+                && header.parent_hash == parent.hash_slow()
+                && header.timestamp > parent.timestamp
+            {
+                HeaderVerdict::Valid
+            } else {
+                HeaderVerdict::Invalid("header does not follow its parent".to_owned())
+            };
+        };
         let header = SealedHeader::seal_slow(header.clone());
         let parent = SealedHeader::seal_slow(parent.clone());
-        match self.consensus.validate_header(&header).and_then(|()| {
-            self.consensus
-                .validate_header_against_parent(&header, &parent)
-        }) {
+        match consensus
+            .validate_header(&header)
+            .and_then(|()| consensus.validate_header_against_parent(&header, &parent))
+        {
             Ok(()) => HeaderVerdict::Valid,
             Err(
                 error @ (ConsensusError::SlotNumberUnexpected
@@ -125,9 +151,12 @@ impl HeaderRules {
         headers.len() >= 2
             && !late_reveal(tip.timestamp, now)
             && headers.windows(2).all(|pair| {
-                slot_starting_at(pair[1].timestamp).is_some_and(|slot| {
-                    slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
-                }) && self.check(&pair[1], &pair[0], now, None) == HeaderVerdict::Valid
+                self.cadence
+                    .slot_starting_at(pair[1].timestamp)
+                    .is_some_and(|slot| {
+                        slot.saturating_sub(attested.beacon_slot) <= MAX_UNATTESTED_SLOTS
+                    })
+                    && self.check(&pair[1], &pair[0], now, None) == HeaderVerdict::Valid
             })
     }
 }
@@ -146,6 +175,10 @@ mod tests {
     use reth_chainspec::{ChainSpecBuilder, EthChainSpec, MAINNET};
 
     use super::*;
+
+    fn mainnet_beacon() -> Cadence {
+        leani_chain::ethereum_mainnet().cadence()
+    }
 
     /// A post-Osaka mainnet slot (2026-05-28), so every scheduled blob
     /// parameter set applies.
@@ -192,7 +225,7 @@ mod tests {
     }
 
     fn rules() -> HeaderRules {
-        HeaderRules::new(MAINNET.clone())
+        HeaderRules::new(MAINNET.clone(), mainnet_beacon())
     }
 
     #[test]
@@ -261,7 +294,7 @@ mod tests {
     #[test]
     fn amsterdam_slot_numbers_follow_the_timestamp_and_the_parent() {
         let spec = Arc::new(ChainSpecBuilder::mainnet().amsterdam_activated().build());
-        let rules = HeaderRules::new(spec.clone());
+        let rules = HeaderRules::new(spec.clone(), mainnet_beacon());
         let mut parent = parent();
         parent.block_access_list_hash = Some(B256::ZERO);
         parent.slot_number = Some(SLOT);

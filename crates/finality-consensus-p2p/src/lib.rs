@@ -28,9 +28,9 @@ use helios_consensus_core::{
 };
 use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
-    HELIOS_REVISION, MainnetLightClientVerifier, StartAnchor, TrustedCheckpoint,
-    VerifiedFinalityAnchor, current_slot, known_mainnet_fork_digests, mainnet_fork_digest,
-    resolve_start_anchor, signed_implausibly_ahead, until_next_attested_poll, verification_slot,
+    HELIOS_REVISION, LightClientVerifier, StartAnchor, TrustedCheckpoint, VerifiedFinalityAnchor,
+    current_slot, known_mainnet_fork_digests, mainnet_fork_digest, resolve_start_anchor,
+    signed_implausibly_ahead, until_next_attested_poll, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -53,6 +53,15 @@ use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+
+/// Consensus P2P finality follows Ethereum mainnet only.
+static MAINNET_BEACON: std::sync::LazyLock<leani_chain::BeaconNetwork> =
+    std::sync::LazyLock::new(|| {
+        leani_chain::ethereum_mainnet()
+            .beacon()
+            .expect("mainnet has a beacon chain")
+            .clone()
+    });
 
 const BOOTSTRAP_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_bootstrap/1/ssz_snappy";
 const UPDATE_PROTOCOL: &str = "/eth2/beacon_chain/req/light_client_updates_by_range/1/ssz_snappy";
@@ -388,7 +397,11 @@ async fn next_finality(
                 .and_then(AttestedHeadPublisher::latest)
                 .map(|head| head.beacon_slot);
             let head_poll_at = tokio::time::Instant::now()
-                + until_next_attested_poll(state.client.source.clock.now(), published);
+                + until_next_attested_poll(
+                    &MAINNET_BEACON,
+                    state.client.source.clock.now(),
+                    published,
+                );
             // Heads are polled only once finality verified.
             if state.client.source.attested_heads.is_none()
                 || state.last_emitted.is_none()
@@ -449,7 +462,7 @@ struct P2pLightClient {
     source: VerifiedConsensusP2p,
     cancellation: CancellationToken,
     network: P2pNetwork,
-    verifier: MainnetLightClientVerifier,
+    verifier: LightClientVerifier,
     start: StartAnchor,
 }
 
@@ -463,6 +476,7 @@ impl P2pLightClient {
         cancellation: CancellationToken,
     ) -> Result<Self, ProbeFailure> {
         let mut start = resolve_start_anchor(
+            &MAINNET_BEACON,
             source.config.anchor.path(),
             checkpoint,
             source.config.max_checkpoint_age,
@@ -655,17 +669,19 @@ impl P2pLightClient {
             };
             let signature_slot = *update.signature_slot();
             let now = self.source.clock.now();
-            if signature_slot > verification_slot(now) {
+            if signature_slot > verification_slot(&MAINNET_BEACON, now) {
                 let error = format!(
                     "finality update signed at slot {signature_slot} is ahead of the local clock"
                 );
                 // A little early is a skewed clock; an epoch beyond it is a
                 // claim no honest peer makes, so the peer is not asked again.
-                errors.push(if signed_implausibly_ahead(signature_slot, now) {
-                    self.network.ban(peer, error)
-                } else {
-                    format!("{peer}: {error}")
-                });
+                errors.push(
+                    if signed_implausibly_ahead(&MAINNET_BEACON, signature_slot, now) {
+                        self.network.ban(peer, error)
+                    } else {
+                        format!("{peer}: {error}")
+                    },
+                );
                 continue;
             }
             // The update's signature may need the next sync committees.
@@ -743,7 +759,7 @@ async fn bootstrap(
     root: [u8; 32],
     status_slot: u64,
     cancellation: &CancellationToken,
-) -> Result<MainnetLightClientVerifier, ProbeFailure> {
+) -> Result<LightClientVerifier, ProbeFailure> {
     match bootstrap_verified(network, &source.config, &source.clock, root).await {
         Ok(verifier) => Ok(verifier),
         Err(RequestFailure::Fatal(error)) => Err(network.failure(error)),
@@ -762,12 +778,13 @@ async fn bootstrap_verified(
     config: &ConsensusP2pConfig,
     clock: &Clock,
     root: [u8; 32],
-) -> Result<MainnetLightClientVerifier, RequestFailure> {
+) -> Result<LightClientVerifier, RequestFailure> {
     network
         .request_verified(
             LightClientRequest::Bootstrap(root),
             |response| match response {
-                LightClientResponse::Bootstrap(bootstrap) => MainnetLightClientVerifier::bootstrap(
+                LightClientResponse::Bootstrap(bootstrap) => LightClientVerifier::bootstrap(
+                    &MAINNET_BEACON,
                     root,
                     &bootstrap,
                     config.max_checkpoint_age,
@@ -938,7 +955,7 @@ impl PeerConnector for Libp2pConnector {
         banned: &HashSet<PeerId>,
         cancellation: CancellationToken,
     ) -> Result<P2pNetwork, ProbeFailure> {
-        let current_slot = current_slot(self.clock.now());
+        let current_slot = current_slot(&MAINNET_BEACON, self.clock.now());
         let mut discovered = discover_mainnet_peers(config, current_slot, cancellation.clone())
             .await
             .map_err(|error| ProbeFailure {
@@ -1726,7 +1743,7 @@ fn spawn_swarm(
                                     .await?;
                                     validate_peer_status(
                                         &response.payload,
-                                        current_slot(peer_clock.now()),
+                                        current_slot(&MAINNET_BEACON, peer_clock.now()),
                                     )
                                 }
                                 .await;
@@ -2525,8 +2542,9 @@ mod tests {
     }
 
     /// A verifier synced from the fixtures, as a finality refresh leaves it.
-    fn fixture_verifier(now: SystemTime) -> MainnetLightClientVerifier {
-        let mut verifier = MainnetLightClientVerifier::bootstrap(
+    fn fixture_verifier(now: SystemTime) -> LightClientVerifier {
+        let mut verifier = LightClientVerifier::bootstrap(
+            &MAINNET_BEACON,
             bootstrap_root(),
             &fixture_bootstrap(),
             DEFAULT_MAX_CHECKPOINT_AGE,
@@ -2893,7 +2911,7 @@ mod tests {
 
     #[test]
     fn status_is_exact_ssz_container() {
-        let now = current_slot(SystemTime::now());
+        let now = current_slot(&MAINNET_BEACON, SystemTime::now());
         let status = encode_status([0x42; 32], 12_352, now);
         assert_eq!(status.len(), STATUS_BYTES);
         assert_eq!(&status[4..36], &[0x42; 32]);
@@ -2908,7 +2926,10 @@ mod tests {
         assert!(decode_peer_response(&[], true).is_err());
         let payload = encode_snappy_payload(b"ok").expect("frame");
         let mut wire = vec![0];
-        wire.extend_from_slice(&mainnet_fork_digest(current_slot(SystemTime::now())));
+        wire.extend_from_slice(&mainnet_fork_digest(current_slot(
+            &MAINNET_BEACON,
+            SystemTime::now(),
+        )));
         wire.extend_from_slice(&payload);
         let decoded = decode_peer_response(&wire, true).expect("response");
         assert_eq!(decoded.payload, b"ok");

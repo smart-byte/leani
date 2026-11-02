@@ -76,7 +76,7 @@ pub use leani_primitives::MAINNET_GENESIS_TIME;
 pub const MAINNET_GENESIS_ROOT: B256 =
     alloy_primitives::b256!("4b363db94e286120d76eb905340fdd4e54bfe9f06bf33ff6cf5ad27f511bfe95");
 const MAX_UPDATES_PER_REQUEST: u64 = 128;
-use leani_primitives::SLOT_SECONDS;
+use leani_chain::{BeaconNetwork, Chain};
 const SLOTS_PER_EPOCH: u64 = 32;
 /// Slots an update may be signed ahead of the local clock.
 const CLOCK_SKEW_SLOTS: u64 = 1;
@@ -241,6 +241,7 @@ impl fmt::Debug for Clock {
 
 #[derive(Clone, Debug)]
 pub struct BeaconApiConfig {
+    pub chain: Arc<Chain>,
     pub endpoints: Vec<Url>,
     pub minimum_agreement: usize,
     pub request_timeout: Duration,
@@ -254,17 +255,40 @@ pub struct BeaconApiConfig {
 impl BeaconApiConfig {
     #[must_use]
     pub fn mainnet(endpoints: Vec<Url>) -> Self {
+        Self::new(leani_chain::ethereum_mainnet(), endpoints)
+    }
+
+    /// Follow the beacon chain of `chain`, which must have one.
+    #[must_use]
+    pub fn new(chain: Arc<Chain>, endpoints: Vec<Url>) -> Self {
+        let slot = chain
+            .beacon
+            .as_ref()
+            .map_or(12, |beacon| beacon.seconds_per_slot);
         Self {
+            chain,
             endpoints,
             minimum_agreement: 1,
             request_timeout: Duration::from_secs(30),
-            poll_interval: Duration::from_secs(SLOT_SECONDS),
+            poll_interval: Duration::from_secs(slot),
             max_checkpoint_age: DEFAULT_MAX_CHECKPOINT_AGE,
             anchor: AnchorFile::Disabled,
         }
     }
 
+    /// The beacon network this configuration follows.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a chain without a beacon chain.
+    pub fn network(&self) -> Result<&BeaconNetwork, BeaconApiError> {
+        self.chain
+            .beacon()
+            .map_err(|error| BeaconApiError::InvalidConfig(error.to_string()))
+    }
+
     fn validate(&self) -> Result<(), BeaconApiError> {
+        self.network()?;
         if self.endpoints.is_empty() {
             return Err(BeaconApiError::InvalidConfig(
                 "at least one endpoint is required".to_owned(),
@@ -337,34 +361,36 @@ pub struct FinalityProbeReport {
 
 /// Stateful verifier shared by every untrusted light-client transport.
 #[derive(Clone, Debug)]
-pub struct MainnetLightClientVerifier {
+pub struct LightClientVerifier {
     checkpoint_root: B256,
     checkpoint_anchor: VerifiedFinalityAnchor,
     store: LightClientStore<MainnetConsensusSpec>,
+    network: BeaconNetwork,
     forks: Forks,
     updates_verified: u64,
 }
 
-impl MainnetLightClientVerifier {
-    /// Verify a checkpoint bootstrap and initialize the mainnet light-client
-    /// store.
+impl LightClientVerifier {
+    /// Verify a checkpoint bootstrap and initialize the light-client store
+    /// of `network`.
     ///
     /// # Errors
     ///
     /// Rejects an invalid bootstrap, a checkpoint without an execution proof,
     /// or a checkpoint older than the configured weak-subjectivity bound.
     pub fn bootstrap(
+        network: &BeaconNetwork,
         checkpoint_root: [u8; 32],
         bootstrap: &Bootstrap<MainnetConsensusSpec>,
         max_checkpoint_age: Duration,
         now: SystemTime,
     ) -> Result<Self, BeaconApiError> {
         let checkpoint = B256::from(checkpoint_root);
-        let forks = mainnet_forks();
+        let forks = helios_forks(network);
         verify_bootstrap(bootstrap, checkpoint, &forks)
             .map_err(|error| BeaconApiError::Verification(error.to_string()))?;
         let checkpoint_slot = bootstrap.header().beacon().slot;
-        verify_checkpoint_age(checkpoint_slot, max_checkpoint_age, now)?;
+        verify_checkpoint_age(network, checkpoint_slot, max_checkpoint_age, now)?;
         let checkpoint_anchor = anchor_from_header(bootstrap.header(), checkpoint.into())?;
         let mut store = LightClientStore::<MainnetConsensusSpec>::default();
         apply_bootstrap(&mut store, bootstrap);
@@ -372,6 +398,7 @@ impl MainnetLightClientVerifier {
             checkpoint_root: checkpoint,
             checkpoint_anchor,
             store,
+            network: network.clone(),
             forks,
             updates_verified: 0,
         })
@@ -428,13 +455,14 @@ impl MainnetLightClientVerifier {
     ) -> Result<(), BeaconApiError> {
         verify_update::<MainnetConsensusSpec>(
             update,
-            verification_slot(now),
+            verification_slot(&self.network, now),
             &self.store,
-            MAINNET_GENESIS_ROOT,
+            self.network.genesis_validators_root,
             &self.forks,
         )
         .map_err(|error| {
             update_error(
+                &self.network,
                 error.downcast_ref(),
                 error.to_string(),
                 *update.signature_slot(),
@@ -459,13 +487,14 @@ impl MainnetLightClientVerifier {
     ) -> Result<VerifiedFinalityAnchor, BeaconApiError> {
         verify_finality_update::<MainnetConsensusSpec>(
             update,
-            verification_slot(now),
+            verification_slot(&self.network, now),
             &self.store,
-            MAINNET_GENESIS_ROOT,
+            self.network.genesis_validators_root,
             &self.forks,
         )
         .map_err(|error| {
             update_error(
+                &self.network,
                 error.downcast_ref(),
                 error.to_string(),
                 *update.signature_slot(),
@@ -506,13 +535,14 @@ impl MainnetLightClientVerifier {
         }
         verify_optimistic_update::<MainnetConsensusSpec>(
             update,
-            verification_slot(now),
+            verification_slot(&self.network, now),
             &self.store,
-            MAINNET_GENESIS_ROOT,
+            self.network.genesis_validators_root,
             &self.forks,
         )
         .map_err(|error| {
             update_error(
+                &self.network,
                 error.downcast_ref(),
                 error.to_string(),
                 update.signature_slot,
@@ -540,6 +570,7 @@ pub const fn has_sync_committee_supermajority(participants: u64) -> bool {
 #[derive(Clone, Debug)]
 pub struct VerifiedBeaconApi {
     config: BeaconApiConfig,
+    network: BeaconNetwork,
     /// Endpoints as reports and errors show them.
     labels: Vec<String>,
     descriptor: SourceDescriptor,
@@ -561,8 +592,8 @@ enum EndpointVerifier {
     Idle,
     /// A bootstrap in flight. It outlives a poll's grace cutoff and is
     /// collected by a later poll.
-    Bootstrapping(tokio::task::JoinHandle<Result<MainnetLightClientVerifier, BeaconApiError>>),
-    Ready(Box<MainnetLightClientVerifier>),
+    Bootstrapping(tokio::task::JoinHandle<Result<LightClientVerifier, BeaconApiError>>),
+    Ready(Box<LightClientVerifier>),
 }
 
 impl Drop for EndpointVerifier {
@@ -614,13 +645,14 @@ fn verified_any(report: &FinalityProbeReport) -> bool {
 }
 
 impl VerifiedBeaconApi {
-    /// Construct a mainnet verifier. No endpoint is contacted here.
+    /// Construct a verifier for the configured chain. No endpoint is
+    /// contacted here.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid quorum/time limits or an HTTP client that
     /// cannot be initialized.
-    pub fn mainnet(config: BeaconApiConfig) -> Result<Self, BeaconApiError> {
+    pub fn new(config: BeaconApiConfig) -> Result<Self, BeaconApiError> {
         let client = http::client_builder(config.request_timeout)
             .build()
             .map_err(BeaconApiError::HttpClient)?;
@@ -635,24 +667,26 @@ impl VerifiedBeaconApi {
         config.validate()?;
         config.endpoints = config.endpoints.iter().map(normalized_endpoint).collect();
         let labels = endpoint_labels(&config.endpoints, "finality.endpoints");
+        let slot_seconds = config.network()?.seconds_per_slot;
         let source_id = SourceId::new("beacon-api-light-client")
             .map_err(|error| BeaconApiError::InvalidConfig(error.to_string()))?;
         Ok(Self {
             descriptor: SourceDescriptor {
                 id: source_id,
                 kind: SourceKind::BeaconApi,
-                chain_id: ChainId(1),
+                chain_id: ChainId(config.chain.chain_id),
                 range: None,
                 capabilities: CapabilitySet::of(Capability::ConsensusFinality),
                 complete_capabilities: CapabilitySet::of(Capability::ConsensusFinality),
                 trust: TrustModel::ProtocolVerified,
                 finality: FinalityModel::Finalized,
                 partitioning: Partitioning::None,
-                expected_lag: Duration::from_secs(2 * SLOT_SECONDS),
+                expected_lag: Duration::from_secs(2 * slot_seconds),
                 schema_version: format!("beacon-light-client.v1+helios.{HELIOS_REVISION}"),
                 priority: 0,
             },
             anchor_writer: AnchorWriter::new(config.anchor.clone()),
+            network: config.network()?.clone(),
             config,
             labels,
             transport,
@@ -720,6 +754,7 @@ impl VerifiedBeaconApi {
             Some(start) if pool.follows(checkpoint.root) => start,
             _ => {
                 let start = resolve_start_anchor(
+                    &self.network,
                     self.config.anchor.path(),
                     checkpoint,
                     self.config.max_checkpoint_age,
@@ -778,6 +813,7 @@ impl VerifiedBeaconApi {
             .map(|((endpoint, label), verifier)| async move {
                 match poll_endpoint(
                     &self.transport,
+                    &self.network,
                     endpoint,
                     verifier,
                     bootstrap_root,
@@ -1056,7 +1092,11 @@ async fn next_finality_event(
                 .and_then(AttestedHeadPublisher::latest)
                 .map(|head| head.beacon_slot);
             let head_poll_at = tokio::time::Instant::now()
-                + until_next_attested_poll(state.source.clock.now(), published);
+                + until_next_attested_poll(
+                    &state.source.network,
+                    state.source.clock.now(),
+                    published,
+                );
             if state.source.attested_heads.is_none() || head_poll_at >= full_poll_at {
                 tokio::select! {
                     () = tokio::time::sleep_until(full_poll_at) => break,
@@ -1101,6 +1141,7 @@ struct EndpointSync {
 /// latest optimistic update.
 async fn poll_endpoint(
     transport: &Arc<dyn BeaconTransport>,
+    network: &BeaconNetwork,
     endpoint: &Url,
     verifier: &mut EndpointVerifier,
     bootstrap_root: [u8; 32],
@@ -1108,10 +1149,16 @@ async fn poll_endpoint(
     clock: &Clock,
 ) -> Result<EndpointSync, BeaconApiError> {
     if matches!(verifier, EndpointVerifier::Idle) {
-        let (transport, endpoint, clock) = (transport.clone(), endpoint.clone(), clock.clone());
+        let (transport, network, endpoint, clock) = (
+            transport.clone(),
+            network.clone(),
+            endpoint.clone(),
+            clock.clone(),
+        );
         *verifier = EndpointVerifier::Bootstrapping(tokio::spawn(async move {
             bootstrap_endpoint(
                 transport.as_ref(),
+                &network,
                 &endpoint,
                 bootstrap_root,
                 max_checkpoint_age,
@@ -1149,7 +1196,7 @@ async fn poll_endpoint(
     )
     .await?;
     let signature_slot = *finality.data.signature_slot();
-    if signature_slot > verification_slot(clock.now()) {
+    if signature_slot > verification_slot(network, clock.now()) {
         return Err(BeaconApiError::StaleUpdate(format!(
             "finality update signed at slot {signature_slot} is ahead of the local clock"
         )));
@@ -1195,7 +1242,7 @@ async fn poll_endpoint(
 async fn attested_endpoint_head(
     transport: &dyn BeaconTransport,
     endpoint: &Url,
-    verifier: &MainnetLightClientVerifier,
+    verifier: &LightClientVerifier,
     clock: &Clock,
 ) -> Result<AttestedHead, String> {
     let update: OptimisticUpdateResponse<MainnetConsensusSpec> =
@@ -1226,12 +1273,13 @@ async fn attested_endpoint_head(
 /// Check an endpoint's network, then verify its bootstrap for `root`.
 async fn bootstrap_endpoint(
     transport: &dyn BeaconTransport,
+    network: &BeaconNetwork,
     endpoint: &Url,
     root: [u8; 32],
     max_checkpoint_age: Duration,
     clock: &Clock,
-) -> Result<MainnetLightClientVerifier, BeaconApiError> {
-    verify_mainnet_endpoint(transport, endpoint).await?;
+) -> Result<LightClientVerifier, BeaconApiError> {
+    verify_endpoint_network(transport, network, endpoint).await?;
     let bootstrap: BootstrapResponse<MainnetConsensusSpec> = get_json(
         transport,
         endpoint,
@@ -1241,7 +1289,13 @@ async fn bootstrap_endpoint(
         ),
     )
     .await?;
-    MainnetLightClientVerifier::bootstrap(root, &bootstrap.data, max_checkpoint_age, clock.now())
+    LightClientVerifier::bootstrap(
+        network,
+        root,
+        &bootstrap.data,
+        max_checkpoint_age,
+        clock.now(),
+    )
 }
 
 fn anchor_from_header(
@@ -1260,12 +1314,13 @@ fn anchor_from_header(
     })
 }
 
-async fn verify_mainnet_endpoint(
+async fn verify_endpoint_network(
     transport: &dyn BeaconTransport,
+    network: &BeaconNetwork,
     endpoint: &Url,
 ) -> Result<(), BeaconApiError> {
     let response: GenesisResponse = get_json(transport, endpoint, "eth/v1/beacon/genesis").await?;
-    if response.data.genesis_validators_root != MAINNET_GENESIS_ROOT {
+    if response.data.genesis_validators_root != network.genesis_validators_root {
         return Err(BeaconApiError::WrongNetwork(
             response.data.genesis_validators_root,
         ));
@@ -1289,12 +1344,14 @@ async fn get_json<T: DeserializeOwned>(
 }
 
 fn verify_checkpoint_age(
+    network: &BeaconNetwork,
     slot: u64,
     max_age: Duration,
     now: SystemTime,
 ) -> Result<(), BeaconApiError> {
-    let checkpoint_time = MAINNET_GENESIS_TIME
-        .checked_add(slot.saturating_mul(SLOT_SECONDS))
+    let checkpoint_time = network
+        .genesis_time
+        .checked_add(slot.saturating_mul(network.seconds_per_slot))
         .ok_or(BeaconApiError::InvalidCheckpointTime)?;
     let now = now
         .duration_since(UNIX_EPOCH)
@@ -1318,36 +1375,37 @@ pub const ATTESTED_POLL_OFFSETS_MS: [u64; 4] = [1_500, 3_000, 4_500, 6_000];
 /// Time until the next optimistic-update poll. Once the published head is
 /// the previous slot's, the window is done until the next slot.
 #[must_use]
-pub fn until_next_attested_poll(now: SystemTime, published_beacon_slot: Option<u64>) -> Duration {
+pub fn until_next_attested_poll(
+    network: &BeaconNetwork,
+    now: SystemTime,
+    published_beacon_slot: Option<u64>,
+) -> Duration {
+    let slot_seconds = network.seconds_per_slot;
     let since_genesis = now
-        .duration_since(UNIX_EPOCH + Duration::from_secs(MAINNET_GENESIS_TIME))
+        .duration_since(UNIX_EPOCH + Duration::from_secs(network.genesis_time))
         .unwrap_or_default();
-    let slot = since_genesis.as_secs() / SLOT_SECONDS;
-    let into_slot = since_genesis.saturating_sub(Duration::from_secs(slot * SLOT_SECONDS));
+    let slot = since_genesis.as_secs() / slot_seconds;
+    let into_slot = since_genesis.saturating_sub(Duration::from_secs(slot * slot_seconds));
     let slot_done =
         published_beacon_slot.is_some_and(|published| published.saturating_add(1) >= slot);
     let offsets = ATTESTED_POLL_OFFSETS_MS.map(Duration::from_millis);
     if !slot_done && let Some(offset) = offsets.iter().find(|offset| **offset > into_slot) {
         return offset.saturating_sub(into_slot);
     }
-    Duration::from_secs(SLOT_SECONDS).saturating_sub(into_slot) + offsets[0]
+    Duration::from_secs(slot_seconds).saturating_sub(into_slot) + offsets[0]
 }
 
-/// The mainnet beacon slot at `now`.
+/// The beacon slot of `network` at `now`.
 #[must_use]
-pub fn current_slot(now: SystemTime) -> u64 {
-    now.duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-        .saturating_sub(MAINNET_GENESIS_TIME)
-        / SLOT_SECONDS
+pub fn current_slot(network: &BeaconNetwork, now: SystemTime) -> u64 {
+    network.slot_at(now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
 }
 
 /// Latest slot an update may be signed in: the local clock's slot plus one
 /// slot of tolerated clock skew. Both finality sources verify against it.
 #[must_use]
-pub fn verification_slot(now: SystemTime) -> u64 {
-    current_slot(now).saturating_add(CLOCK_SKEW_SLOTS)
+pub fn verification_slot(network: &BeaconNetwork, now: SystemTime) -> u64 {
+    current_slot(network, now).saturating_add(CLOCK_SKEW_SLOTS)
 }
 
 /// Slots past [`verification_slot`] an update is merely early by: one epoch.
@@ -1357,8 +1415,12 @@ const EARLY_UPDATE_SLOTS: u64 = 32;
 /// clock, more than an epoch past [`verification_slot`]. Such a slot is the
 /// sender's own claim, so the update is fabricated rather than stale.
 #[must_use]
-pub fn signed_implausibly_ahead(signature_slot: u64, now: SystemTime) -> bool {
-    signature_slot > verification_slot(now).saturating_add(EARLY_UPDATE_SLOTS)
+pub fn signed_implausibly_ahead(
+    network: &BeaconNetwork,
+    signature_slot: u64,
+    now: SystemTime,
+) -> bool {
+    signature_slot > verification_slot(network, now).saturating_add(EARLY_UPDATE_SLOTS)
 }
 
 /// Classify a verification failure. An update the store already passed, one
@@ -1366,6 +1428,7 @@ pub fn signed_implausibly_ahead(signature_slot: u64, now: SystemTime) -> bool {
 /// cannot verify yet is stale. Any other failure, including slots that are
 /// inconsistent within the update or implausibly far ahead, is invalid.
 fn update_error(
+    network: &BeaconNetwork,
     kind: Option<&ConsensusError>,
     error: String,
     signature_slot: u64,
@@ -1376,8 +1439,8 @@ fn update_error(
             BeaconApiError::StaleUpdate(error)
         }
         Some(ConsensusError::InvalidTimestamp)
-            if signature_slot > verification_slot(now)
-                && !signed_implausibly_ahead(signature_slot, now) =>
+            if signature_slot > verification_slot(network, now)
+                && !signed_implausibly_ahead(network, signature_slot, now) =>
         {
             BeaconApiError::StaleUpdate(error)
         }
@@ -1473,6 +1536,33 @@ fn select_attested_head(heads: &[AttestedHead]) -> Option<AttestedHead> {
     Some(newest)
 }
 
+/// Helios's fork table for `network`. Forks Helios does not model are left
+/// out; Beacon responses naming them are refused as unsupported forks.
+#[must_use]
+pub fn helios_forks(network: &BeaconNetwork) -> Forks {
+    let fork = |name: &str| {
+        network.fork(name).map_or(
+            Fork {
+                epoch: u64::MAX,
+                fork_version: FixedBytes::<4>::ZERO,
+            },
+            |fork| Fork {
+                epoch: fork.epoch,
+                fork_version: FixedBytes::<4>::from(fork.version),
+            },
+        )
+    };
+    Forks {
+        genesis: fork("phase0"),
+        altair: fork("altair"),
+        bellatrix: fork("bellatrix"),
+        capella: fork("capella"),
+        deneb: fork("deneb"),
+        electra: fork("electra"),
+        fulu: fork("fulu"),
+    }
+}
+
 pub fn mainnet_forks() -> Forks {
     Forks {
         genesis: fork(0, "00000000"),
@@ -1551,7 +1641,7 @@ pub enum BeaconApiError {
         "beacon API {url} serves `{version}` light-client data, a fork this release cannot verify; the network may have forked, so upgrade Leani"
     )]
     UnsupportedFork { url: String, version: String },
-    #[error("expected Ethereum mainnet but endpoint reports genesis validators root {0:#x}")]
+    #[error("endpoint serves another beacon chain, genesis validators root {0:#x}")]
     WrongNetwork(B256),
     #[error("light-client proof verification failed: {0}")]
     Verification(String),
@@ -1637,6 +1727,12 @@ mod tests {
     use alloy_primitives::b256;
 
     use super::*;
+
+    const SLOT_SECONDS: u64 = 12;
+
+    fn mainnet() -> BeaconNetwork {
+        leani_chain::ethereum_mainnet().beacon().unwrap().clone()
+    }
 
     const BOOTSTRAP_ROOT: B256 =
         b256!("5afc212a7924789b2bc86acad3ab3a6ffb1f6e97253ea50bee7f4f51422c9275");
@@ -1931,7 +2027,7 @@ mod tests {
         let at = |millis: u64| {
             UNIX_EPOCH + Duration::from_secs(slot_time(current)) + Duration::from_millis(millis)
         };
-        let next = |millis, published| until_next_attested_poll(at(millis), published);
+        let next = |millis, published| until_next_attested_poll(&mainnet(), at(millis), published);
         assert_eq!(next(0, None), Duration::from_millis(1_500));
         assert_eq!(next(2_000, None), Duration::from_millis(1_000));
         // After the last offset, the next slot's first one.
@@ -1985,6 +2081,23 @@ mod tests {
             full_polls,
             "the head came from an optimistic-only poll"
         );
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_of_another_beacon_chain_is_refused() {
+        let transport = Arc::new(FixtureTransport::default());
+        let seconds = Arc::new(AtomicU64::new(slot_time(SIGNATURE_SLOT) + 60));
+        let hoodi = leani_chain::ChainRegistry::standard().get("hoodi").unwrap();
+        let config = BeaconApiConfig::new(hoodi, vec![Url::parse("https://a.example/").unwrap()]);
+        let source =
+            VerifiedBeaconApi::with_transport(config, transport.clone(), manual_clock(&seconds))
+                .expect("source");
+        assert_eq!(source.descriptor.chain_id, ChainId(560_048));
+        let report = source.probe_root(operator(BOOTSTRAP_ROOT)).await;
+        assert!(!report.accepted);
+        assert_eq!(transport.count("light_client/bootstrap/"), 0);
+        let error = format!("{:?}", report.endpoints[0].error);
+        assert!(error.contains("another beacon chain"), "{error}");
     }
 
     #[tokio::test]
@@ -2491,7 +2604,13 @@ mod tests {
         let checkpoint =
             |root: [u8; 32], slot: Option<u64>, origin| TrustedCheckpoint { root, slot, origin };
         let resolve = |checkpoint: TrustedCheckpoint, now: SystemTime| {
-            resolve_start_anchor(Some(&path), checkpoint, DEFAULT_MAX_CHECKPOINT_AGE, now)
+            resolve_start_anchor(
+                &mainnet(),
+                Some(&path),
+                checkpoint,
+                DEFAULT_MAX_CHECKPOINT_AGE,
+                now,
+            )
         };
         let expected = StartAnchor {
             root: [0xaa; 32],
@@ -2540,7 +2659,7 @@ mod tests {
         assert_eq!(resolve(lineage, expired), StartAnchor::configured(lineage));
         // Without an anchor file.
         assert_eq!(
-            resolve_start_anchor(None, lineage, DEFAULT_MAX_CHECKPOINT_AGE, now),
+            resolve_start_anchor(&mainnet(), None, lineage, DEFAULT_MAX_CHECKPOINT_AGE, now),
             StartAnchor::configured(lineage)
         );
     }
@@ -2594,7 +2713,8 @@ mod tests {
     fn bootstrap_anchor_preserves_the_mainnet_checkpoint_root() {
         let bootstrap: BootstrapResponse<MainnetConsensusSpec> =
             serde_json::from_str(BOOTSTRAP_JSON).expect("fixture bootstrap");
-        let verifier = MainnetLightClientVerifier::bootstrap(
+        let verifier = LightClientVerifier::bootstrap(
+            &mainnet(),
             BOOTSTRAP_ROOT.into(),
             &bootstrap.data,
             DEFAULT_MAX_CHECKPOINT_AGE,
@@ -2607,10 +2727,11 @@ mod tests {
         );
     }
 
-    fn fixture_verifier(now: SystemTime) -> MainnetLightClientVerifier {
+    fn fixture_verifier(now: SystemTime) -> LightClientVerifier {
         let bootstrap: BootstrapResponse<MainnetConsensusSpec> =
             serde_json::from_str(BOOTSTRAP_JSON).expect("fixture bootstrap");
-        let mut verifier = MainnetLightClientVerifier::bootstrap(
+        let mut verifier = LightClientVerifier::bootstrap(
+            &mainnet(),
             BOOTSTRAP_ROOT.into(),
             &bootstrap.data,
             DEFAULT_MAX_CHECKPOINT_AGE,
@@ -2691,10 +2812,11 @@ mod tests {
     #[test]
     fn an_update_signed_an_epoch_past_the_clock_is_invalid_not_stale() {
         let now = UNIX_EPOCH + Duration::from_secs(MAINNET_GENESIS_TIME + 12 * 1_000_000);
-        let early = verification_slot(now) + 1;
-        let fabricated = verification_slot(now) + EARLY_UPDATE_SLOTS + 1;
+        let early = verification_slot(&mainnet(), now) + 1;
+        let fabricated = verification_slot(&mainnet(), now) + EARLY_UPDATE_SLOTS + 1;
         let classify = |slot| {
             update_error(
+                &mainnet(),
                 Some(&ConsensusError::InvalidTimestamp),
                 "timestamp".to_owned(),
                 slot,
@@ -2703,7 +2825,7 @@ mod tests {
         };
         assert!(classify(early).is_stale_update());
         assert!(!classify(fabricated).is_stale_update());
-        assert!(signed_implausibly_ahead(u64::MAX, now));
+        assert!(signed_implausibly_ahead(&mainnet(), u64::MAX, now));
     }
 
     fn optimistic_update(encoded: &str) -> OptimisticUpdate<MainnetConsensusSpec> {
@@ -3397,7 +3519,7 @@ mod tests {
             BeaconApiConfig::mainnet(vec![Url::parse("https://a.example").expect("URL")]);
         config.minimum_agreement = 2;
         assert!(matches!(
-            VerifiedBeaconApi::mainnet(config),
+            VerifiedBeaconApi::new(config),
             Err(BeaconApiError::InvalidConfig(_))
         ));
     }

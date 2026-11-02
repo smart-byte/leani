@@ -17,6 +17,7 @@ async-trait.workspace = true
 futures.workspace = true
 helios-consensus-core.workspace = true
 hex.workspace = true
+leani-chain = { path = "../chain" }
 leani-primitives = { path = "../primitives" }
 leani-source-api = { path = "../source-api" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

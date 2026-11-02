@@ -1,0 +1,52 @@
+name = "Ink"
+public_rpc = "https://rpc-gel.inkonchain.com"
+sequencer_rpc = "https://rpc-gel.inkonchain.com"
+explorer = "https://explorer.inkonchain.com"
+governed_by_optimism = true
+superchain_time = 1742396400
+data_availability_type = "eth-da"
+chain_id = 57073
+batch_inbox_addr = "0x005969bf0EcbF6eDB6C47E5e94693b1C3651Be97"
+block_time = 1
+seq_window_size = 3600
+max_sequencer_drift = 600
+
+[hardforks]
+  canyon_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  delta_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  ecotone_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  fjord_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  granite_time = 0 # Thu 1 Jan 1970 00:00:00 UTC
+  holocene_time = 1742396400 # Wed 19 Mar 2025 15:00:00 UTC
+  isthmus_time = 1746806401 # Fri 9 May 2025 16:00:01 UTC
+  jovian_time = 1764691201 # Tue 2 Dec 2025 16:00:01 UTC
+  karst_time = 1783526401 # Wed 8 Jul 2026 16:00:01 UTC
+  keep_karst_upgrade_gas = true
+
+[optimism]
+  eip1559_elasticity = 6
+  eip1559_denominator = 250
+  eip1559_denominator_canyon = 250
+
+[genesis]
+  l2_time = 1733498411
+  [genesis.l1]
+    hash = "0x39e4e0c0c94f8076134b441a9dc18d10b595fd9777edeb763bb9f9bd8f922fd9"
+    number = 21344310
+  [genesis.l2]
+    hash = "0x23a2658170ba70d014ba0d0d2709f8fbfe2fa660cd868c5f282f991eecbe38ee"
+    number = 0
+  [genesis.system_config]
+    batcherAddress = "0x500d7Ea63CF2E501dadaA5feeC1FC19FE2Aa72Ac"
+    overhead = "0x0000000000000000000000000000000000000000000000000000000000000000"
+    scalar = "0x010000000000000000000000000000000000000000000000000c5fc500000558"
+    gasLimit = 30000000
+
+[roles]
+  ProxyAdminOwner = "0x5a0Aae59D09fccBdDb6C6CcEB07B7279367C3d2A"
+
+[addresses]
+  L1StandardBridgeProxy = "0x88FF1e5b602916615391F55854588EFcBB7663f0"
+  OptimismPortalProxy = "0x5d66C1782664115999C47c9fA5cd031f495D3e4F"
+  SystemConfigProxy = "0x62C0a111929fA32ceC2F76aDba54C16aFb6E8364"
+  DisputeGameFactoryProxy = "0x10d7B35078d3baabB96Dd45a9143B94be65b12CD"
