@@ -22,6 +22,7 @@ members = [
   "crates/source-archive",
   "crates/source-erae",
   "crates/source-p2p",
+  "crates/source-rpc",
   "crates/source-xatu",
   "crates/store-history",
   "crates/store-artifacts",

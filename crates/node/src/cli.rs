@@ -971,6 +971,18 @@ pub enum ProbeSource {
         #[arg(long, requires_all = ["from_date", "to_date"])]
         expected_export: Option<PathBuf>,
     },
+    /// Fetch blocks over JSON-RPC and check them against their own roots.
+    Rpc {
+        /// First block; omitted, 31 blocks before the last.
+        #[arg(long)]
+        from_block: Option<u64>,
+        /// Last block; omitted, the endpoint's head minus ten.
+        #[arg(long)]
+        to_block: Option<u64>,
+        /// Endpoint to ask instead of the chain entry's.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+    },
     /// Follow an op-stack chain's sequencer-signed block gossip.
     OpGossip {
         /// How long to listen.

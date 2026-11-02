@@ -266,7 +266,7 @@
       "properties": {
         "id": { "type": "string", "minLength": 1 },
         "kind": {
-          "enum": ["xatu", "era_e", "archive"]
+          "enum": ["xatu", "era_e", "archive", "json_rpc"]
         },
         "priority": {
           "type": "integer",
@@ -306,7 +306,7 @@
       "additionalProperties": false,
       "required": ["kind", "minimum_peers"],
       "properties": {
-        "kind": { "enum": ["p2p", "disabled"] },
+        "kind": { "enum": ["p2p", "json_rpc", "disabled"] },
         "minimum_peers": { "$ref": "#/$defs/nonNegativeInteger" },
         "body_serving_peer_target": { "$ref": "#/$defs/nonNegativeInteger" },
         "preferred_peers": { "$ref": "#/$defs/nonNegativeInteger" },
@@ -382,7 +382,21 @@
           "type": "array",
           "items": { "$ref": "#/$defs/historySource" }
         },
-        "live": { "$ref": "#/$defs/liveSource" }
+        "live": { "$ref": "#/$defs/liveSource" },
+        "json_rpc": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "endpoints": {
+              "type": "array",
+              "items": { "type": "string", "format": "uri" }
+            },
+            "quorum": { "$ref": "#/$defs/positiveInteger" },
+            "poll_interval_ms": { "$ref": "#/$defs/positiveInteger" },
+            "finality_poll_interval_ms": { "$ref": "#/$defs/positiveInteger" },
+            "calls_per_second": { "$ref": "#/$defs/positiveInteger" }
+          }
+        }
       }
     },
     "finality": {
@@ -391,7 +405,7 @@
       "required": ["kind", "checkpoint"],
       "properties": {
         "kind": {
-          "enum": ["beacon_api", "consensus_p2p", "disabled"]
+          "enum": ["beacon_api", "consensus_p2p", "json_rpc", "disabled"]
         },
         "checkpoint": { "type": "string" },
         "checkpoint_slot": { "$ref": "#/$defs/nonNegativeInteger" },

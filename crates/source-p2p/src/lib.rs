@@ -4063,10 +4063,12 @@ impl RethP2pSource {
         config.validate()?;
         let chain_spec = leani_chain::execution_chain_spec(&chain)
             .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
-        let cadence = chain.cadence();
+        let cadence = chain
+            .cadence()
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
         let header_rules = match chain.family {
             Family::Ethereum => HeaderRules::new(chain_spec.clone(), cadence),
-            Family::OpStack => HeaderRules::cadence_only(cadence),
+            Family::OpStack | Family::Arbitrum => HeaderRules::cadence_only(cadence),
         };
         config.network_telemetry.set_peer_targets(
             config.minimum_peers,

@@ -29,6 +29,7 @@ pub enum ChainError {
 pub enum Family {
     Ethereum,
     OpStack,
+    Arbitrum,
 }
 
 impl Family {
@@ -37,6 +38,7 @@ impl Family {
         match self {
             Self::Ethereum => "ethereum",
             Self::OpStack => "op-stack",
+            Self::Arbitrum => "arbitrum",
         }
     }
 }
@@ -107,6 +109,9 @@ pub struct ChainDefaults {
     /// History source kinds the compact config enables, in priority order.
     #[serde(default)]
     pub history_sources: Vec<String>,
+    /// JSON-RPC endpoints for chains without public execution P2P.
+    #[serde(default)]
+    pub rpc_endpoints: Vec<Url>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +143,7 @@ impl Chain {
         let (beacon_config, registry) = match entry.family {
             Family::Ethereum => (upstream, None),
             Family::OpStack => (None, upstream),
+            Family::Arbitrum => (None, None),
         };
         let op_stack = match (entry.op_stack, registry) {
             (Some(op_stack), Some(registry)) => Some(OpStackNetwork::from_registry(
@@ -187,17 +193,20 @@ impl Chain {
         })
     }
 
-    /// The chain's block cadence.
+    /// The chain's block cadence: whole seconds per block from genesis.
     ///
-    /// # Panics
+    /// # Errors
     ///
-    /// Never: entries of both families carry their cadence.
-    #[must_use]
-    pub fn cadence(&self) -> Cadence {
+    /// Returns an error for a chain whose blocks do not follow a whole-second
+    /// cadence, such as a Nitro chain's.
+    pub fn cadence(&self) -> Result<Cadence, ChainError> {
         match (&self.beacon, &self.op_stack) {
-            (Some(beacon), _) => beacon.cadence(),
-            (None, Some(op_stack)) => op_stack.cadence(),
-            (None, None) => unreachable!("an entry has a beacon chain or an op-stack schedule"),
+            (Some(beacon), _) => Ok(beacon.cadence()),
+            (None, Some(op_stack)) => Ok(op_stack.cadence()),
+            (None, None) => Err(ChainError::Unsupported(format!(
+                "{} has no whole-second block cadence",
+                self.name
+            ))),
         }
     }
 
@@ -294,6 +303,18 @@ const BUILT_IN: &[(&str, Option<&str>)] = &[
     (
         include_str!("../../../config/chains/mode-mainnet.toml"),
         Some(include_str!("../../../config/chains/op/mode.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/arbitrum-one.toml"),
+        None,
+    ),
+    (
+        include_str!("../../../config/chains/arbitrum-nova.toml"),
+        None,
+    ),
+    (
+        include_str!("../../../config/chains/robinhood-mainnet.toml"),
+        None,
     ),
 ];
 
@@ -398,6 +419,10 @@ pub fn execution_chain_spec(chain: &Chain) -> Result<Arc<reth_chainspec::ChainSp
         (Family::OpStack, Some(op_stack)) => Ok(Arc::new(op_stack_chain_spec(chain, op_stack))),
         (Family::OpStack, None) => Err(ChainError::Unsupported(format!(
             "{} has no op-stack schedule",
+            chain.name
+        ))),
+        (Family::Arbitrum, _) => Err(ChainError::Unsupported(format!(
+            "{} runs no public execution P2P; its blocks come from JSON-RPC",
             chain.name
         ))),
     }

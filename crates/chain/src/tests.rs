@@ -144,6 +144,9 @@ fn testnet_schedules_match_their_beacon_apis() {
 #[test]
 fn execution_specs_match_entry_genesis() {
     for chain in ChainRegistry::standard().iter() {
+        if chain.family == Family::Arbitrum {
+            continue;
+        }
         let spec = execution_chain_spec(chain).unwrap();
         assert_eq!(
             reth_chainspec::EthChainSpec::chain_id(spec.as_ref()),
@@ -214,12 +217,12 @@ fn op_stack_entries_carry_their_schedule() {
         "consensus-only forks are skipped"
     );
     // Block n of the rollup is due at its slot of the cadence.
-    let cadence = op.cadence();
+    let cadence = op.cadence().unwrap();
     assert_eq!(cadence.slot_start(10), 1_686_068_903 + 20);
     let base = ChainRegistry::standard().get("base").unwrap();
     assert!(!base.execution.discv4);
     assert_eq!(base.execution.discv5_protocol_id.as_deref(), Some("basev0"));
-    assert_eq!(base.cadence().slot_at(1_686_789_347 + 7), 3);
+    assert_eq!(base.cadence().unwrap().slot_at(1_686_789_347 + 7), 3);
 }
 
 #[test]
@@ -231,5 +234,23 @@ fn an_unknown_op_stack_fork_needs_a_release() {
     assert!(
         error.to_string().contains("unknown op-stack fork lagoon"),
         "{error}"
+    );
+}
+
+#[test]
+fn nitro_chains_name_their_rpc_endpoints() {
+    let robinhood = ChainRegistry::standard().get("robinhood").unwrap();
+    assert_eq!(
+        (robinhood.family, robinhood.chain_id),
+        (Family::Arbitrum, 4663)
+    );
+    assert_eq!(
+        robinhood.defaults.rpc_endpoints[0].as_str(),
+        "https://rpc.mainnet.chain.robinhood.com/"
+    );
+    assert!(execution_chain_spec(&robinhood).is_err());
+    assert_eq!(
+        ChainRegistry::standard().get("arb1").unwrap().chain_id,
+        42_161
     );
 }

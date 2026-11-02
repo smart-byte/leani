@@ -731,6 +731,7 @@ impl NativeBackfillControl {
             leani_primitives::SourceKind::ConsensusP2p => "consensus_p2p",
             leani_primitives::SourceKind::BeaconApi => "beacon_api",
             leani_primitives::SourceKind::Synthetic => "synthetic",
+            leani_primitives::SourceKind::JsonRpc => "json_rpc",
         }
     }
 
@@ -4615,6 +4616,14 @@ fn configured_history_candidates(
                 }
                 std::sync::Arc::new(XatuBlobsHistorySource::new(xatu)?)
             }
+            crate::config::HistorySourceKind::JsonRpc => {
+                std::sync::Arc::new(leani_source_rpc::RpcHistorySource::new(
+                    &configured.id,
+                    leani_primitives::ChainId(config.chain.chain_id),
+                    config.json_rpc_quorum().map_err(anyhow::Error::msg)?,
+                    configured.priority,
+                )?)
+            }
             crate::config::HistorySourceKind::Archive => {
                 std::sync::Arc::new(LocalArchiveSource::open_manifest(
                     configured
@@ -4796,6 +4805,16 @@ fn configured_rpc_history_sources(
                 }
                 sources.push(std::sync::Arc::new(XatuBlobsHistorySource::new(xatu)?));
             }
+            crate::config::HistorySourceKind::JsonRpc => {
+                sources.push(std::sync::Arc::new(
+                    leani_source_rpc::RpcHistorySource::new(
+                        &source.id,
+                        leani_primitives::ChainId(config.chain.chain_id),
+                        config.json_rpc_quorum().map_err(anyhow::Error::msg)?,
+                        source.priority,
+                    )?,
+                ));
+            }
             crate::config::HistorySourceKind::Archive => {
                 sources.push(std::sync::Arc::new(LocalArchiveSource::open_manifest(
                     source
@@ -4956,6 +4975,11 @@ async fn probe_source(source: ProbeSource, config_path: &Path) -> Result<Exit> {
             )
             .await
         }
+        ProbeSource::Rpc {
+            from_block,
+            to_block,
+            endpoint,
+        } => probe_rpc(config_path, from_block, to_block, endpoint).await,
         ProbeSource::OpGossip { seconds, output } => {
             probe_op_gossip(config_path, seconds, output.as_deref()).await
         }
@@ -5165,6 +5189,59 @@ fn p2p_probe_config(
     })
 }
 
+async fn probe_rpc(
+    config_path: &Path,
+    from_block: Option<u64>,
+    to_block: Option<u64>,
+    endpoint: Option<url::Url>,
+) -> Result<Exit> {
+    let config = Config::load(config_path)
+        .with_context(|| format!("load configuration {}", config_path.display()))?;
+    let chain = config.chain_entry()?;
+    let endpoint = endpoint
+        .or_else(|| chain.defaults.rpc_endpoints.first().cloned())
+        .with_context(|| format!("{} names no JSON-RPC endpoint; pass --endpoint", chain.name))?;
+    let client =
+        leani_source_rpc::RpcClient::new(endpoint, config.sources.json_rpc.calls_per_second)?;
+    let to_block = match to_block {
+        Some(block) => block,
+        None => client.head().await?.saturating_sub(10),
+    };
+    let from_block = from_block.unwrap_or_else(|| to_block.saturating_sub(31));
+    if from_block > to_block || to_block - from_block >= 1_000 {
+        bail!("probe at most 1000 blocks, from-block first");
+    }
+    let (mut verified, mut failed) = (0_u64, 0_u64);
+    for number in from_block..=to_block {
+        let (block, receipts) = client.block(number).await?;
+        let check = leani_source_rpc::decode_block(&block, &receipts)?.check;
+        if check.verified() {
+            verified += 1;
+        } else {
+            failed += 1;
+        }
+        println!(
+            "{}",
+            serde_json::json!({
+                "number": check.number,
+                "hash": check.hash,
+                "header": format!("{:?}", check.header),
+                "transactionsRoot": format!("{:?}", check.transactions_root),
+                "receiptsRoot": format!("{:?}", check.receipts_root),
+            })
+        );
+    }
+    eprintln!(
+        "{}",
+        serde_json::json!({"chain": chain.name, "verified": verified, "notVerified": failed})
+    );
+    Ok(if failed == 0 {
+        Exit::Success
+    } else {
+        Exit::Failure
+    })
+}
+
 async fn probe_op_gossip(config_path: &Path, seconds: u64, output: Option<&Path>) -> Result<Exit> {
     use std::io::Write as _;
 
@@ -5339,8 +5416,9 @@ async fn probe_finality(
             let report = source.probe_checkpoint(trusted_checkpoint).await;
             (report.accepted, serde_json::to_string_pretty(&report)?)
         }
-        crate::config::FinalitySourceKind::Disabled => {
-            bail!("finality probe cannot run while finality.kind = \"disabled\"");
+        crate::config::FinalitySourceKind::JsonRpc
+        | crate::config::FinalitySourceKind::Disabled => {
+            bail!("the finality probe checks beacon_api and consensus_p2p finality");
         }
     };
     if let Some(path) = report_path {
@@ -6003,7 +6081,11 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     }
     let live_required = matches!(
         config.get().sources.live.kind,
-        crate::config::LiveSourceKind::P2p
+        crate::config::LiveSourceKind::P2p | crate::config::LiveSourceKind::JsonRpc
+    );
+    let rpc_lanes = matches!(
+        config.get().sources.live.kind,
+        crate::config::LiveSourceKind::JsonRpc
     );
     let finality_required = !matches!(
         config.get().finality.kind,
@@ -6135,7 +6217,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         None
     };
     let (pipeline_budget, material_coordinator) = historical_services(config.get())?;
-    let network_lanes = live_required && finality_required;
+    let network_lanes = live_required && finality_required && !rpc_lanes;
     // The lanes and the feeds of ad-hoc Wasm runs share one execution P2P
     // source: a run's feed then reuses the lanes' peers.
     let attested_heads = leani_source_api::AttestedHeadPublisher::new();
@@ -6492,6 +6574,42 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
                 // non-zero so that the process supervisor restarts the node.
                 NetworkLanesEnd::Wedged => bail!("the live network lane stalled"),
                 NetworkLanesEnd::Cancelled => {}
+            }
+            Ok(())
+        });
+    }
+    if rpc_lanes {
+        let lane_config = config.get().clone();
+        let lane_store = store.clone();
+        let lane_processors = processors.clone();
+        let readiness = readiness.clone();
+        let rpc_readiness = rpc_readiness.clone();
+        let committed_events = committed_events.clone();
+        let lane_cancellation = cancellation.clone();
+        background.spawn("json-rpc lane supervisor", async move {
+            // A lane that fails restarts from the store after a pause: the
+            // endpoints' rate limits and outages are transient.
+            while !lane_cancellation.is_cancelled() {
+                let result = run_rpc_lanes(
+                    &lane_config,
+                    lane_store.clone(),
+                    lane_processors.clone(),
+                    &readiness,
+                    &rpc_readiness,
+                    committed_events.clone(),
+                    &lane_cancellation,
+                )
+                .await;
+                readiness.set_live_ready(false);
+                readiness.set_finality_ready(false);
+                rpc_readiness.set_live_ready(false);
+                if let Err(error) = result {
+                    warn!(error = %format!("{error:#}"), "json-rpc lanes failed; restarting");
+                }
+                tokio::select! {
+                    () = lane_cancellation.cancelled() => {}
+                    () = tokio::time::sleep(Duration::from_secs(5)) => {}
+                }
             }
             Ok(())
         });
@@ -7162,7 +7280,8 @@ async fn p2p_history_anchor(
                 .selected
                 .context("accepted consensus P2P report omitted its selected anchor")?
         }
-        crate::config::FinalitySourceKind::Disabled => {
+        crate::config::FinalitySourceKind::JsonRpc
+        | crate::config::FinalitySourceKind::Disabled => {
             bail!("execution P2P history requires a verified finality source");
         }
     };
@@ -7183,6 +7302,155 @@ async fn p2p_history_anchor(
             beacon_block_root: selected.beacon_block_root,
         },
     })
+}
+
+/// Follow a chain over JSON-RPC: live blocks and promotions from the endpoint
+/// quorum, finality from its `finalized` tag.
+#[allow(clippy::too_many_lines)]
+async fn run_rpc_lanes(
+    config: &Config,
+    store: leani_store_sqlite::SqliteStore,
+    processors: Vec<Arc<dyn leani_processor_api::Processor>>,
+    readiness: &leani_api::ReadinessHandle,
+    rpc_readiness: &leani_rpc::RpcReadiness,
+    committed_events: tokio::sync::broadcast::Sender<leani_source_api::ChainEvent>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    use leani_runtime::{
+        SharedFinalityRuntime, SharedFinalityRuntimeConfig, SharedLiveRuntime,
+        SharedLiveRuntimeConfig,
+    };
+
+    let chain_id = leani_primitives::ChainId(config.chain.chain_id);
+    let quorum = config.json_rpc_quorum().map_err(anyhow::Error::msg)?;
+    let rpc = &config.sources.json_rpc;
+    let finality = Arc::new(leani_source_rpc::RpcFinalitySource::new(
+        "json-rpc-finality",
+        chain_id,
+        quorum.clone(),
+        Duration::from_millis(rpc.finality_poll_interval_ms),
+    )?);
+    let live = Arc::new(leani_source_rpc::RpcLiveSource::new(
+        "json-rpc-live",
+        chain_id,
+        quorum.clone(),
+        Duration::from_millis(rpc.poll_interval_ms),
+    )?);
+    let anchor = quorum
+        .agreed_ref("finalized")
+        .await
+        .context("read the endpoints' finalized block")?;
+    info!(
+        finalized = anchor.number.0,
+        endpoints = quorum.endpoints().len(),
+        quorum = quorum.quorum(),
+        "json-rpc finalized anchor agreed"
+    );
+    let checkpoint = leani_source_api::ConsensusCheckpoint {
+        beacon_slot: anchor.number.0,
+        beacon_block_root: [0; 32],
+        execution_block_hash: anchor.hash,
+        obtained_at_unix_seconds: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+        source: format!("json-rpc quorum {}", quorum.quorum()),
+    };
+    let live_runtime = SharedLiveRuntime::new(
+        store.clone(),
+        live,
+        processors.clone(),
+        SharedLiveRuntimeConfig {
+            max_reorg_depth: 64,
+            pending_delta_bytes: config.budgets.pending_delta_bytes,
+            committed_events: Some(committed_events),
+            recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+            ..SharedLiveRuntimeConfig::default()
+        },
+    )?;
+    live_runtime
+        .reconcile_startup()
+        .await
+        .context("reconcile processor state with the canonical chain")?;
+    let finality_runtime = SharedFinalityRuntime::new(
+        store.clone(),
+        finality,
+        processors,
+        SharedFinalityRuntimeConfig {
+            minimum_recent_blocks: config.rpc.minimum_recent_blocks,
+            recent_soft_bytes: config.budgets.recent_raw_soft_bytes,
+            recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+        },
+    )?;
+    // A store that stopped below the endpoints' finalized block resumes from
+    // its own tip: the endpoints serve every block in between, and nothing
+    // else fills that gap.
+    let stored_tip = match store.recent_canonical_bounds(chain_id).await? {
+        Some(bounds) if bounds.end() < anchor.number => store
+            .recent_frame(chain_id, bounds.end())
+            .await?
+            .map(|frame| frame.block),
+        _ => None,
+    };
+    let live_start = match stored_tip {
+        Some(tip) => leani_source_api::LiveStart::Block(tip),
+        None => {
+            retained_live_start(
+                &store,
+                chain_id,
+                anchor,
+                config.sources.live.handoff_overlap_blocks,
+                64,
+                false,
+            )
+            .await?
+        }
+    };
+    let (live_ready, mut live_ready_updates) = tokio::sync::watch::channel(false);
+    let (finality_ready, mut finality_ready_updates) = tokio::sync::watch::channel(false);
+    let live = live_runtime.run_with_readiness(
+        live_start,
+        live_source_budget(config),
+        cancellation.clone(),
+        live_ready,
+    );
+    let finality = finality_runtime.run_resilient_with_readiness(
+        checkpoint,
+        cancellation.clone(),
+        finality_ready,
+    );
+    tokio::pin!(live);
+    tokio::pin!(finality);
+    loop {
+        tokio::select! {
+            () = cancellation.cancelled() => return Ok(()),
+            changed = live_ready_updates.changed() => {
+                if changed.is_err() {
+                    bail!("live readiness channel closed");
+                }
+                let ready = *live_ready_updates.borrow();
+                readiness.set_live_ready(ready);
+                rpc_readiness.set_live_ready(ready);
+                info!(ready, "json-rpc live readiness changed");
+            }
+            changed = finality_ready_updates.changed() => {
+                if changed.is_err() {
+                    bail!("finality readiness channel closed");
+                }
+                let ready = *finality_ready_updates.borrow();
+                readiness.set_finality_ready(ready);
+                info!(ready, "json-rpc finality readiness changed");
+            }
+            result = &mut live => {
+                let report = result?;
+                bail!("json-rpc live lane ended: {report:?}");
+            }
+            result = &mut finality => {
+                let report = result?;
+                bail!("json-rpc finality lane ended: {report:?}");
+            }
+        }
+    }
 }
 
 /// Supervise the network lanes until the node shuts down or they halt. A
@@ -7740,7 +8008,8 @@ async fn run_network_lanes(
                     .context("accepted P2P report omitted its checkpoint anchor")?,
             )
         }
-        crate::config::FinalitySourceKind::Disabled => {
+        crate::config::FinalitySourceKind::JsonRpc
+        | crate::config::FinalitySourceKind::Disabled => {
             bail!("network supervisor requires a verified finality source");
         }
     };

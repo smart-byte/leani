@@ -1358,7 +1358,9 @@ async fn embedded_config(
             config.finality.endpoints.clear();
             config.finality.minimum_peers = config.finality.minimum_peers.max(1);
         }
-        FinalitySourceKind::Disabled => unreachable!("subscription finality is always enabled"),
+        FinalitySourceKind::JsonRpc | FinalitySourceKind::Disabled => {
+            unreachable!("subscriptions choose beacon_api or consensus_p2p finality")
+        }
     }
     config.processors = vec![subscription_processor(
         options.protocol,

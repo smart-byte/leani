@@ -8854,6 +8854,7 @@ leani-runtime 0.1.1 — https://github.com/smart-byte/leani
 leani-source-archive 0.1.1 — https://github.com/smart-byte/leani
 leani-source-erae 0.1.1 — https://github.com/smart-byte/leani
 leani-source-p2p 0.1.1 — https://github.com/smart-byte/leani
+leani-source-rpc 0.1.1 — https://github.com/smart-byte/leani
 leani-source-xatu 0.1.1 — https://github.com/smart-byte/leani
 leani-store-artifacts 0.1.1 — https://github.com/smart-byte/leani
 leani-store-history 0.1.1 — https://github.com/smart-byte/leani

@@ -495,6 +495,53 @@ pub struct SourcesConfig {
     #[serde(default)]
     pub history: Vec<HistorySourceConfig>,
     pub live: LiveSourceConfig,
+    #[serde(default)]
+    pub json_rpc: JsonRpcSourceConfig,
+}
+
+/// JSON-RPC endpoints for chains without public execution P2P. A block
+/// counts as canonical once `quorum` endpoints serve the same hash; its
+/// contents are checked against its own roots.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JsonRpcSourceConfig {
+    /// Omitted, the chain entry's endpoints.
+    #[serde(default)]
+    pub endpoints: Vec<Url>,
+    /// Omitted, two where there are two endpoints, else one.
+    #[serde(default)]
+    pub quorum: Option<usize>,
+    #[serde(default = "default_json_rpc_poll_interval_ms")]
+    pub poll_interval_ms: u64,
+    #[serde(default = "default_json_rpc_finality_poll_interval_ms")]
+    pub finality_poll_interval_ms: u64,
+    /// Calls each endpoint gets per second; public endpoints rate-limit.
+    #[serde(default = "default_json_rpc_calls_per_second")]
+    pub calls_per_second: u32,
+}
+
+impl Default for JsonRpcSourceConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            quorum: None,
+            poll_interval_ms: default_json_rpc_poll_interval_ms(),
+            finality_poll_interval_ms: default_json_rpc_finality_poll_interval_ms(),
+            calls_per_second: default_json_rpc_calls_per_second(),
+        }
+    }
+}
+
+const fn default_json_rpc_poll_interval_ms() -> u64 {
+    500
+}
+
+const fn default_json_rpc_finality_poll_interval_ms() -> u64 {
+    12_000
+}
+
+const fn default_json_rpc_calls_per_second() -> u32 {
+    20
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -532,6 +579,7 @@ pub struct HistorySourceConfig {
 pub enum HistorySourceKind {
     Xatu,
     EraE,
+    JsonRpc,
     /// No source reads it. Decoded only so validation can refuse it and
     /// name `xatu`, which reads public Parquet history.
     Parquet,
@@ -545,6 +593,7 @@ impl HistorySourceKind {
         match self {
             Self::Xatu => "xatu",
             Self::EraE => "era_e",
+            Self::JsonRpc => "json_rpc",
             Self::Parquet => "parquet",
             Self::Archive => "archive",
         }
@@ -672,6 +721,7 @@ pub struct LiveSourceConfig {
 #[serde(rename_all = "snake_case")]
 pub enum LiveSourceKind {
     P2p,
+    JsonRpc,
     Disabled,
 }
 
@@ -716,6 +766,7 @@ pub struct FinalityConfig {
 pub enum FinalitySourceKind {
     BeaconApi,
     ConsensusP2p,
+    JsonRpc,
     Disabled,
 }
 
@@ -1477,6 +1528,37 @@ impl Config {
         Ok(entry)
     }
 
+    /// The JSON-RPC endpoints and quorum this configuration names, or the
+    /// chain entry's.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error without endpoints or with a quorum above them.
+    pub fn json_rpc_quorum(&self) -> Result<leani_source_rpc::RpcQuorum, String> {
+        let endpoints = if self.sources.json_rpc.endpoints.is_empty() {
+            self.chain_entry()
+                .map_err(|error| error.to_string())?
+                .defaults
+                .rpc_endpoints
+                .clone()
+        } else {
+            self.sources.json_rpc.endpoints.clone()
+        };
+        if endpoints.is_empty() {
+            return Err(format!(
+                "{} names no JSON-RPC endpoints; set sources.json_rpc.endpoints",
+                self.chain.name
+            ));
+        }
+        let quorum = self
+            .sources
+            .json_rpc
+            .quorum
+            .unwrap_or_else(|| endpoints.len().min(2));
+        leani_source_rpc::RpcQuorum::new(endpoints, quorum, self.sources.json_rpc.calls_per_second)
+            .map_err(|error| error.to_string())
+    }
+
     /// Read TOML without opening the configured data directory or any network
     /// connection. Relative paths in the file, its `data_dir`, archive
     /// `manifest`s, and Wasm processor `module`s, are resolved against the
@@ -1883,6 +1965,24 @@ impl Config {
             ));
         }
         validate_finality(&self.finality, &mut errors);
+        let rpc_live = matches!(self.sources.live.kind, LiveSourceKind::JsonRpc);
+        let rpc_finality = matches!(self.finality.kind, FinalitySourceKind::JsonRpc);
+        if rpc_live != rpc_finality {
+            errors.push(ValidationError::new(
+                "sources.live/finality",
+                "json_rpc live and json_rpc finality run together: both follow the same endpoint quorum",
+            ));
+        }
+        let rpc_history = self
+            .sources
+            .history
+            .iter()
+            .any(|source| matches!(source.kind, HistorySourceKind::JsonRpc));
+        if (rpc_live || rpc_history)
+            && let Err(error) = self.json_rpc_quorum()
+        {
+            errors.push(ValidationError::new("sources.json_rpc", error));
+        }
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && !matches!(
                 self.finality.kind,
@@ -2556,7 +2656,11 @@ fn validate_artifact_storage(
 }
 
 fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
-    if matches!(finality.kind, FinalitySourceKind::Disabled) {
+    // JSON-RPC finality starts from the endpoints' finalized block.
+    if matches!(
+        finality.kind,
+        FinalitySourceKind::Disabled | FinalitySourceKind::JsonRpc
+    ) {
         return;
     }
     if finality.checkpoint.trim().is_empty()
@@ -2639,7 +2743,7 @@ fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError
                 }
             }
         }
-        FinalitySourceKind::Disabled => {}
+        FinalitySourceKind::JsonRpc | FinalitySourceKind::Disabled => {}
     }
 }
 
@@ -4055,6 +4159,40 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
             HistoricalMode::Disabled
         ));
         assert_eq!(config.chain_entry().expect("entry").name, "ethereum-hoodi");
+    }
+
+    #[test]
+    fn json_rpc_lanes_follow_one_endpoint_quorum() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.chain.name = "robinhood".to_owned();
+        config.chain.chain_id = 4663;
+        config.sources.history.truncate(1);
+        config.sources.history[0].kind = HistorySourceKind::JsonRpc;
+        config.sources.history[0].chunk_blocks = None;
+        config.sources.live.kind = LiveSourceKind::JsonRpc;
+        let errors = config.validation_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.field == "sources.live/finality"),
+            "{errors:?}"
+        );
+        config.finality.kind = FinalitySourceKind::JsonRpc;
+        config.finality.checkpoint = String::new();
+        assert!(
+            config.validation_errors().is_empty(),
+            "{:?}",
+            config.validation_errors()
+        );
+        let quorum = config.json_rpc_quorum().expect("entry endpoints");
+        assert_eq!((quorum.endpoints().len(), quorum.quorum()), (2, 2));
+        config.sources.json_rpc.quorum = Some(3);
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "sources.json_rpc")
+        );
     }
 
     #[test]
