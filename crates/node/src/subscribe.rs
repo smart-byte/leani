@@ -1360,6 +1360,7 @@ async fn embedded_config(
         }
         FinalitySourceKind::JsonRpc
         | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::SequencerFeed
         | FinalitySourceKind::Disabled => {
             unreachable!("subscriptions choose beacon_api or consensus_p2p finality")
         }

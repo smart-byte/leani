@@ -225,6 +225,20 @@ pub enum L1Anchor {
     NitroRollup { rollup: Address },
 }
 
+/// A Nitro chain's sequencer feed: every message names its block's hash and
+/// carries the sequencer's signature over it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SequencerFeed {
+    pub url: Url,
+    /// The key that signs the feed, a batch poster of the chain's
+    /// `SequencerInbox`.
+    pub signer: Address,
+    /// The block of message 0: the chain's Nitro genesis.
+    #[serde(default)]
+    pub first_block: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chain {
     pub name: String,
@@ -239,6 +253,7 @@ pub struct Chain {
     pub op_stack: Option<OpStackNetwork>,
     pub public_dataset: Option<PublicDataset>,
     pub l1_anchor: Option<L1Anchor>,
+    pub sequencer_feed: Option<SequencerFeed>,
     pub defaults: ChainDefaults,
 }
 
@@ -304,6 +319,12 @@ impl Chain {
                 )));
             }
         }
+        if entry.sequencer_feed.is_some() && entry.family != Family::Arbitrum {
+            return Err(ChainError::InvalidEntry(format!(
+                "{}: only Nitro chains publish a sequencer feed",
+                entry.name
+            )));
+        }
         Ok(Self {
             name: entry.name,
             aliases: entry.aliases,
@@ -316,6 +337,7 @@ impl Chain {
             op_stack,
             public_dataset: entry.public_dataset,
             l1_anchor: entry.l1_anchor,
+            sequencer_feed: entry.sequencer_feed,
             defaults: entry.defaults,
         })
     }
@@ -378,6 +400,8 @@ struct EntryFile {
     public_dataset: Option<PublicDataset>,
     #[serde(default)]
     l1_anchor: Option<L1Anchor>,
+    #[serde(default)]
+    sequencer_feed: Option<SequencerFeed>,
     #[serde(default)]
     defaults: ChainDefaults,
 }

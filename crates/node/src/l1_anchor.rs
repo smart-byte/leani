@@ -306,6 +306,7 @@ async fn l1_finality(
         }
         FinalitySourceKind::JsonRpc
         | FinalitySourceKind::OpGossip
+        | FinalitySourceKind::SequencerFeed
         | FinalitySourceKind::Disabled => {
             bail!("the L1 anchor needs beacon_api or consensus_p2p finality")
         }
@@ -373,24 +374,45 @@ fn follow_dispute_games(
     Ok(receiver)
 }
 
+/// The blocks a Nitro chain's L1 anchor confirms: `confirmed` names the
+/// newest at once and across restarts, `finalized` once this node holds it.
+#[derive(Clone, Debug)]
+pub(crate) struct Assertions {
+    pub(crate) finalized: watch::Receiver<FinalizedBlock>,
+    pub(crate) confirmed: watch::Receiver<Option<BlockHash>>,
+}
+
 /// Finalize the Nitro block each confirmed assertion names, once this node
-/// holds it: a block it never followed cannot be finalized.
+/// holds it: a block it never followed cannot be finalized. The newest
+/// confirmed hash is kept at `confirmed_path`, since the L1 lane resumes
+/// past the assertions it already read.
 pub(crate) fn follow_assertions(
     store: leani_store_sqlite::SqliteStore,
     chain_id: ChainId,
     mut observations: mpsc::Receiver<Observation>,
+    confirmed_path: std::path::PathBuf,
     cancellation: CancellationToken,
-) -> watch::Receiver<FinalizedBlock> {
-    let (finalized, receiver) = watch::channel(None);
+) -> Assertions {
+    let kept = std::fs::read_to_string(&confirmed_path)
+        .ok()
+        .and_then(|text| text.trim().parse::<alloy_primitives::B256>().ok())
+        .map(|hash| BlockHash::new(hash.0));
+    let (finalized, finalized_receiver) = watch::channel(None);
+    let (confirmed, confirmed_receiver) = watch::channel(kept);
     tokio::spawn(async move {
-        let mut pending = None;
+        let mut pending = kept;
         let mut retry = tokio::time::interval(Duration::from_secs(30));
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 observation = observations.recv() => match observation {
                     Some(Observation::AssertionConfirmed { block_hash }) => {
-                        pending = Some(BlockHash::new(block_hash.0));
+                        if let Err(error) = std::fs::write(&confirmed_path, format!("{block_hash:#x}\n")) {
+                            warn!(%error, "could not keep the confirmed block");
+                        }
+                        let hash = BlockHash::new(block_hash.0);
+                        confirmed.send_replace(Some(hash));
+                        pending = Some(hash);
                     }
                     Some(_) => continue,
                     None => return,
@@ -411,5 +433,8 @@ pub(crate) fn follow_assertions(
             }
         }
     });
-    receiver
+    Assertions {
+        finalized: finalized_receiver,
+        confirmed: confirmed_receiver,
+    }
 }
