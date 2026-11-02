@@ -15,6 +15,7 @@ rpc_endpoints = [
   "https://arb1.arbitrum.io/rpc",
   "https://arbitrum-one-rpc.publicnode.com",
 ]
+history_sources = ["aws_public", "json_rpc"]
 
 # SonarX's export on AWS Open Data. Classic blocks before the Nitro
 # genesis hash differently.

@@ -8,6 +8,14 @@ record, and documented RPC contracts.
 
 ### Added
 
+- A chain is picked by name alone. `[chain] chain_id` may be left out: it
+  comes from the chain entry, and a given one must still match it. A compact
+  configuration's `network` takes every built-in chain or alias, and the
+  chain's family picks the live lane, finality, and history sources; on a
+  rollup, its `[finality]` checkpoint feeds the L1 anchor. `leani init
+  --network <chain>` writes either form, asking the chain's own checkpoint
+  providers, or Ethereum Mainnet's for a rollup's anchor; on a rollup a window
+  keeps days by block age.
 - `sources.json_rpc.public_endpoints` picks the public endpoints behind your
   own `sources.json_rpc.endpoints`: `chainlist` (default under the
   sequencer feed) adds chainlist.org's keyless HTTPS endpoints that track

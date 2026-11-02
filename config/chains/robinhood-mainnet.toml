@@ -15,6 +15,7 @@ rpc_endpoints = [
   "https://rpc.mainnet.chain.robinhood.com",
   "https://robinhood-rpc.publicnode.com",
 ]
+history_sources = ["json_rpc"]
 
 # The BoLD rollup, as the bridge's rollup() names it.
 [l1_anchor]

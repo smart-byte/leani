@@ -3184,6 +3184,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         Command::Init {
             protocol,
             targets,
+            network,
             data_dir,
             checkpoint_url,
             checkpoint_quorum,
@@ -3201,6 +3202,7 @@ pub async fn run_cli_with_registry(cli: Cli, registry: &ProcessorRegistry) -> Re
         } => {
             crate::init::init(
                 crate::init::InitOptions {
+                    network,
                     protocol,
                     targets,
                     data_dir,
@@ -6643,9 +6645,9 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
             }),
             config_build: Some({
                 let registry = registry.clone();
-                let finality = config.get().finality.clone();
+                let node = config.get().clone();
                 Arc::new(move |requirements: &serde_json::Value, head: Option<u64>| {
-                    crate::config_builder::build_json(requirements, head, &registry, &finality)
+                    crate::config_builder::build_json(requirements, head, &registry, &node)
                 })
             }),
             wasm_build: config

@@ -58,6 +58,7 @@ Written for agents and scripts. For tutorials and guides, see https://leani.dev/
     /// derived setting commented with why.
     #[command(after_help = "Examples:
   leani init blocks
+  leani init blocks --network base
   leani init uniswap-v3 ETH/USDC --data-dir data
   leani init uniswap-v3 ETH/USDC --keep window --window-days 30 --memory 1GiB --bandwidth 100
   leani init --requirements requirements.json --json
@@ -72,18 +73,19 @@ after the user has approved the checkpoint providers.")]
         /// Optional protocol targets; Uniswap requires one or more markets such as `ETH/USDC`.
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
+        /// Chain to follow: a built-in chain entry or its alias, such as
+        /// `base`, `op`, `arbitrum-one`, `robinhood`, or `hoodi`.
+        #[arg(long, default_value = "ethereum-mainnet")]
+        network: String,
         /// Data directory for the generated configuration [default: `data` beside it].
         #[arg(long)]
         data_dir: Option<PathBuf>,
-        /// Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited).
+        /// Checkpoint provider used for weak-subjectivity quorum (repeatable or
+        /// comma-delimited) [default: the providers the chain entry names; a
+        /// rollup's L1 anchor uses Ethereum Mainnet's].
         #[arg(
             long,
             value_delimiter = ',',
-            default_values = [
-                "https://ethereum-beacon-api.publicnode.com/",
-                "https://mainnet.checkpoint.sigp.io/",
-                "https://beaconstate-mainnet.chainsafe.io/"
-            ],
             env = "LEANI_CHECKPOINT_URLS",
             hide_env_values = true
         )]
@@ -1414,13 +1416,23 @@ mod tests {
         let init =
             Cli::try_parse_from(["leani", "init", "blocks", "--yes"]).expect("blocks init parses");
         let Command::Init {
-            protocol, targets, ..
+            protocol,
+            targets,
+            network,
+            ..
         } = init.command
         else {
             panic!("expected init command");
         };
         assert_eq!(protocol, Some(SubscribeProtocol::Blocks));
         assert!(targets.is_empty());
+        assert_eq!(network, "ethereum-mainnet");
+        let init = Cli::try_parse_from(["leani", "init", "blocks", "--network", "base"])
+            .expect("rollup init parses");
+        let Command::Init { network, .. } = init.command else {
+            panic!("expected init command");
+        };
+        assert_eq!(network, "base");
     }
 
     #[test]

@@ -76,6 +76,9 @@ const fn default_l1_anchor_lookback() -> u64 {
 /// The most finalized L1 blocks a cold start reads: one week.
 const MAX_L1_ANCHOR_LOOKBACK: u64 = 50_400;
 
+/// op-node's default consensus P2P port, which op-stack gossip peers dial.
+const OP_GOSSIP_PORT: u16 = 9222;
+
 /// Compact product-level configuration expanded into [`Config`] before
 /// validation. The `network` field deliberately discriminates this document
 /// from the fully explicit advanced schema.
@@ -87,7 +90,11 @@ pub(crate) struct StarterConfig {
     pub network: String,
     #[serde(default = "default_starter_data_dir")]
     pub data_dir: PathBuf,
-    pub finality: StarterFinalityConfig,
+    /// A verified Ethereum checkpoint: of the beacon chain an Ethereum chain
+    /// follows, or of the one a rollup's L1 anchor reads. A rollup without an
+    /// anchor has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finality: Option<StarterFinalityConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks: Option<StarterBlocksConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -146,19 +153,13 @@ impl StarterConfig {
     pub(crate) fn uniswap(
         data_dir: PathBuf,
         markets: Vec<String>,
-        checkpoint: String,
-        checkpoint_slot: u64,
-        endpoints: Vec<Url>,
+        finality: StarterFinalityConfig,
     ) -> Self {
         Self {
             config_version: CONFIG_VERSION,
             network: "ethereum-mainnet".to_owned(),
             data_dir,
-            finality: StarterFinalityConfig {
-                checkpoint,
-                checkpoint_slot,
-                endpoints,
-            },
+            finality: Some(finality),
             blocks: None,
             uniswap: Some(StarterUniswapConfig { markets }),
             api: StarterApiConfig::default(),
@@ -166,20 +167,15 @@ impl StarterConfig {
     }
 
     pub(crate) fn blocks(
+        network: String,
         data_dir: PathBuf,
-        checkpoint: String,
-        checkpoint_slot: u64,
-        endpoints: Vec<Url>,
+        finality: Option<StarterFinalityConfig>,
     ) -> Self {
         Self {
             config_version: CONFIG_VERSION,
-            network: "ethereum-mainnet".to_owned(),
+            network,
             data_dir,
-            finality: StarterFinalityConfig {
-                checkpoint,
-                checkpoint_slot,
-                endpoints,
-            },
+            finality,
             blocks: Some(StarterBlocksConfig::default()),
             uniswap: None,
             api: StarterApiConfig::default(),
@@ -187,34 +183,48 @@ impl StarterConfig {
     }
 
     fn expand(self) -> Result<Config, String> {
-        let mut config = Config::ethereum_mainnet_defaults()?;
         let chain = leani_chain::ChainRegistry::standard()
             .get(&self.network)
             .map_err(|error| error.to_string())?;
-        if chain.chain_id != config.chain.chain_id {
-            // Mainnet's dataset history sources do not serve other chains;
-            // the execution P2P source serves their finalized history.
-            config.chain = ChainConfig {
-                name: chain.name.clone(),
-                chain_id: chain.chain_id,
-                merge_block: chain.merge_block,
-            };
-            config.sources.history.retain(|source| {
-                chain
-                    .defaults
-                    .history_sources
-                    .iter()
-                    .any(|kind| kind == source.kind.name())
-            });
-            if config.sources.history.is_empty() {
-                config.rpc.historical_mode = HistoricalMode::Disabled;
+        let mut config = Config::chain_defaults(&chain)?;
+        let finality = self
+            .finality
+            .map(|finality| {
+                crate::config_builder::finality(
+                    finality.checkpoint,
+                    finality.checkpoint_slot,
+                    finality.endpoints,
+                )
+            })
+            .transpose()?;
+        match (finality, chain.family) {
+            (Some(finality), leani_chain::Family::Ethereum) => config.finality = finality,
+            (None, leani_chain::Family::Ethereum) => {
+                return Err(format!(
+                    "{} follows its beacon chain from a verified checkpoint in [finality]",
+                    chain.name
+                ));
             }
+            (Some(finality), _) if chain.l1_anchor.is_some() => config.anchor_to(finality),
+            (Some(_), _) => {
+                return Err(format!(
+                    "{} has no L1 anchor, so nothing reads a [finality] checkpoint",
+                    chain.name
+                ));
+            }
+            (None, _) => {}
         }
         let processor = match (self.blocks, self.uniswap) {
             (Some(_), None) => Ok(crate::block_summaries::processor_config(
                 crate::block_summaries::COMPACT_INSTANCE,
                 PublishMode::Unattested,
             )),
+            (None, Some(_)) if chain.chain_id != 1 => {
+                return Err(format!(
+                    "Uniswap markets are Ethereum Mainnet's; use [blocks] on {}",
+                    chain.name
+                ));
+            }
             (None, Some(uniswap)) => {
                 let markets = crate::uniswap_markets::resolve_markets(&uniswap.markets)
                     .map_err(|error| error.to_string())?;
@@ -234,9 +244,6 @@ impl StarterConfig {
 
         config.config_version = self.config_version;
         config.data_dir = self.data_dir;
-        config.finality.checkpoint = self.finality.checkpoint;
-        config.finality.checkpoint_slot = self.finality.checkpoint_slot;
-        config.finality.endpoints = self.finality.endpoints;
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
         config.api.allow_wasm_builds = self.api.allow_wasm_builds;
@@ -357,6 +364,8 @@ impl Default for RawHistoryConfig {
 #[serde(deny_unknown_fields)]
 pub struct ChainConfig {
     pub name: String,
+    /// The chain entry's id when omitted; a given one must match it.
+    #[serde(default)]
     pub chain_id: u64,
     /// Canonical execution-layer Merge block. Required before the node can
     /// accept the exact post-Merge execution-RPC raw-history profile.
@@ -1579,6 +1588,100 @@ impl Config {
         .map_err(|error| format!("built-in Ethereum Mainnet defaults are invalid: {error}"))
     }
 
+    /// The built-in defaults for following `chain`: Ethereum Mainnet's, with
+    /// the chain's identity, the history sources its entry names, and the
+    /// lanes its family follows. A rollup's L1 anchor needs a verified
+    /// Ethereum checkpoint, so [`Self::anchor_to`] adds it.
+    pub(crate) fn chain_defaults(chain: &leani_chain::Chain) -> Result<Self, String> {
+        let mut config = Self::ethereum_mainnet_defaults()?;
+        if chain.chain_id == config.chain.chain_id {
+            return Ok(config);
+        }
+        config.chain = ChainConfig {
+            name: chain.name.clone(),
+            chain_id: chain.chain_id,
+            merge_block: chain.merge_block,
+        };
+        let mainnet = std::mem::take(&mut config.sources.history);
+        for (name, rank) in chain.defaults.history_sources.iter().zip(1_u16..) {
+            let kind: HistorySourceKind = toml::Value::String(name.clone())
+                .try_into()
+                .map_err(|error| format!("{}: history source {name}: {error}", chain.name))?;
+            let source = mainnet
+                .iter()
+                .find(|source| source.kind.name() == kind.name())
+                .cloned()
+                .unwrap_or_else(|| HistorySourceConfig {
+                    id: match kind {
+                        HistorySourceKind::AwsPublic => "aws",
+                        HistorySourceKind::JsonRpc => "rpc",
+                        other => other.name(),
+                    }
+                    .to_owned(),
+                    kind,
+                    priority: rank * 10,
+                    trust: if matches!(kind, HistorySourceKind::JsonRpc) {
+                        HistoryTrust::VerifiedMaterial
+                    } else {
+                        HistoryTrust::TrustedDataset
+                    },
+                    chunk_blocks: None,
+                    blobs_chunk_blocks: None,
+                    batch_rows: None,
+                    manifest: None,
+                    endpoint: None,
+                    allow_insecure_http: false,
+                });
+            config.sources.history.push(source);
+        }
+        if config.sources.history.is_empty() {
+            config.rpc.historical_mode = HistoricalMode::Disabled;
+        }
+        let without_checkpoint = |finality: FinalityConfig, kind| FinalityConfig {
+            kind,
+            checkpoint: String::new(),
+            checkpoint_slot: 0,
+            endpoints: Vec::new(),
+            ..finality
+        };
+        match chain.family {
+            leani_chain::Family::Ethereum => {
+                config
+                    .finality
+                    .endpoints
+                    .clone_from(&chain.defaults.beacon_endpoints);
+            }
+            leani_chain::Family::OpStack => {
+                // Base's busy consensus nodes refuse new connections, so its
+                // gossip peers must reach this node at a fixed port.
+                config.finality = FinalityConfig {
+                    listen_port: OP_GOSSIP_PORT,
+                    discovery_port: OP_GOSSIP_PORT,
+                    ..without_checkpoint(config.finality, FinalitySourceKind::OpGossip)
+                };
+            }
+            leani_chain::Family::Arbitrum => {
+                config.sources.live.kind = LiveSourceKind::JsonRpc;
+                config.finality =
+                    without_checkpoint(config.finality, FinalitySourceKind::SequencerFeed);
+            }
+        }
+        Ok(config)
+    }
+
+    /// Finalize the rollup's blocks from its settlement contracts on
+    /// Ethereum, whose finality `ethereum` follows.
+    pub(crate) fn anchor_to(&mut self, ethereum: FinalityConfig) {
+        self.l1_anchor = Some(L1AnchorConfig {
+            finality: ethereum,
+            listener_port: 0,
+            discovery_port: 0,
+            discv5_port: 0,
+            nat: default_execution_nat(),
+            lookback_blocks: default_l1_anchor_lookback(),
+        });
+    }
+
     /// The built-in chain entry `[chain] name` names, checked against the
     /// configured chain id.
     ///
@@ -1721,6 +1824,11 @@ impl Config {
                 source,
             })?
         };
+        if config.chain.chain_id == 0
+            && let Ok(entry) = leani_chain::ChainRegistry::standard().get(&config.chain.name)
+        {
+            config.chain.chain_id = entry.chain_id;
+        }
         // Every relative path in the file is relative to the file.
         let written = std::mem::take(&mut config.data_dir);
         config.data_dir = resolve_relative_to_file(path, &written);
@@ -1802,12 +1910,6 @@ impl Config {
         }
         if self.chain.name.trim().is_empty() {
             errors.push(ValidationError::new("chain.name", "must not be empty"));
-        }
-        if self.chain.chain_id == 0 {
-            errors.push(ValidationError::new(
-                "chain.chain_id",
-                "must be greater than zero",
-            ));
         }
         match self.chain_entry() {
             Ok(entry) => {
@@ -4429,6 +4531,112 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
         assert_eq!(config.chain_entry().expect("entry").name, "ethereum-hoodi");
     }
 
+    fn compact_rollup_config(network: &str, checkpoint: bool) -> String {
+        let finality = if checkpoint {
+            r#"[finality]
+checkpoint = "0x1111111111111111111111111111111111111111111111111111111111111111"
+checkpoint_slot = 15000000
+endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
+
+"#
+        } else {
+            ""
+        };
+        format!("config_version = 1\nnetwork = \"{network}\"\n\n{finality}[blocks]\n")
+    }
+
+    #[test]
+    fn compact_rollup_configurations_follow_their_family() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let load = |network: &str, checkpoint: bool| {
+            let path = temp.path().join(format!("{network}.toml"));
+            fs::write(&path, compact_rollup_config(network, checkpoint)).expect("write config");
+            Config::load(&path)
+        };
+        for (network, anchored) in [
+            ("op", false),
+            ("base", true),
+            ("base-sepolia", false),
+            ("arbitrum-one", true),
+            ("nova", true),
+            ("robinhood", true),
+        ] {
+            let config =
+                load(network, anchored).unwrap_or_else(|error| panic!("{network}: {error}"));
+            config
+                .clone()
+                .validate()
+                .unwrap_or_else(|error| panic!("{network}: {error}"));
+            let nitro =
+                config.chain_entry().expect("entry").family == leani_chain::Family::Arbitrum;
+            assert_eq!(
+                (
+                    matches!(config.sources.live.kind, LiveSourceKind::JsonRpc),
+                    matches!(config.finality.kind, FinalitySourceKind::SequencerFeed),
+                    matches!(config.finality.kind, FinalitySourceKind::OpGossip),
+                    config.l1_anchor.is_some(),
+                ),
+                (nitro, nitro, !nitro, anchored),
+                "{network}"
+            );
+        }
+        let history = |network| {
+            load(network, true)
+                .expect("load")
+                .sources
+                .history
+                .iter()
+                .map(|source| source.kind.name())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(history("arbitrum-one"), ["aws_public", "json_rpc"]);
+        assert_eq!(history("robinhood"), ["json_rpc"]);
+        // Op-stack history comes through the live lane.
+        assert!(history("base").is_empty());
+        let error = load("op", true).expect_err("nothing reads the checkpoint");
+        assert!(error.to_string().contains("no L1 anchor"), "{error}");
+        let error = load("ethereum-hoodi", false).expect_err("no checkpoint");
+        assert!(error.to_string().contains("verified checkpoint"), "{error}");
+        let path = temp.path().join("uniswap.toml");
+        fs::write(
+            &path,
+            "config_version = 1\nnetwork = \"base\"\n\n[uniswap]\nmarkets = [\"ETH/USDC\"]\n",
+        )
+        .expect("write config");
+        let error = Config::load(&path).expect_err("Mainnet markets");
+        assert!(error.to_string().contains("Ethereum Mainnet's"), "{error}");
+    }
+
+    #[test]
+    fn a_chain_named_alone_takes_its_id_from_its_entry() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("leani.toml");
+        fs::write(
+            &path,
+            VALID_CONFIG_TOML.replace(
+                "name = \"ethereum-mainnet\"\nchain_id = 1\n",
+                "name = \"mainnet\"\n",
+            ),
+        )
+        .expect("write config");
+        let config = Config::load(&path).expect("load");
+        assert_eq!(config.chain.chain_id, 1);
+        config.validate().expect("validates");
+        // A given id must match the entry's.
+        fs::write(
+            &path,
+            VALID_CONFIG_TOML.replace("chain_id = 1\n", "chain_id = 10\n"),
+        )
+        .expect("write config");
+        let errors = Config::load(&path).expect("load").validation_errors();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.message.contains("but chain_id = 10 is configured")),
+            "{errors:?}"
+        );
+    }
+
     #[test]
     fn json_rpc_lanes_follow_one_endpoint_quorum() {
         let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
@@ -4745,9 +4953,11 @@ markets = ["LINK/ETH"]
         let starter = StarterConfig::uniswap(
             PathBuf::from("./data"),
             vec!["ETH/USDC".to_owned()],
-            format!("0x{}", "11".repeat(32)),
-            15_000_000,
-            vec![Url::parse("https://beacon.example/").expect("URL")],
+            StarterFinalityConfig {
+                checkpoint: format!("0x{}", "11".repeat(32)),
+                checkpoint_slot: 15_000_000,
+                endpoints: vec![Url::parse("https://beacon.example/").expect("URL")],
+            },
         );
         let encoded = toml::to_string_pretty(&starter).expect("serialize starter config");
         assert!(encoded.contains("network = \"ethereum-mainnet\""));
@@ -4761,10 +4971,13 @@ markets = ["LINK/ETH"]
     #[test]
     fn compact_blocks_configuration_expands_to_header_summary_processor() {
         let starter = StarterConfig::blocks(
+            "ethereum-mainnet".to_owned(),
             PathBuf::from("./data"),
-            format!("0x{}", "11".repeat(32)),
-            15_000_000,
-            vec![Url::parse("https://beacon.example/").expect("URL")],
+            Some(StarterFinalityConfig {
+                checkpoint: format!("0x{}", "11".repeat(32)),
+                checkpoint_slot: 15_000_000,
+                endpoints: vec![Url::parse("https://beacon.example/").expect("URL")],
+            }),
         );
         let encoded = toml::to_string_pretty(&starter).expect("serialize blocks config");
         assert!(encoded.contains("[blocks]"));

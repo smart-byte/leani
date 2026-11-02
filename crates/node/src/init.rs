@@ -8,11 +8,12 @@ use std::{
 };
 
 use anyhow::{Context as _, Result, bail};
+use leani_chain::{Chain, ChainRegistry, Family};
 use url::Url;
 
 use crate::{
     cli::{Follow, Keep, Recipe, SubscribeProtocol},
-    config::{HumanBytes, StarterConfig},
+    config::{HumanBytes, StarterConfig, StarterFinalityConfig},
     config_builder::{BuildContext, History, Limits, ProcessorChoice, Requirements},
     process::Exit,
     processors::ProcessorRegistry,
@@ -51,10 +52,13 @@ impl RequirementFlags {
 }
 
 pub(crate) struct InitOptions {
+    /// The chain entry, or an alias, to follow.
+    pub network: String,
     pub protocol: Option<SubscribeProtocol>,
     pub targets: Vec<String>,
     /// `--data-dir`; `None` for `./data` beside the configuration.
     pub data_dir: Option<PathBuf>,
+    /// Checkpoint providers; empty for the ones the chain entry names.
     pub checkpoint_urls: Vec<Url>,
     pub checkpoint_quorum: usize,
     pub accept_checkpoint: bool,
@@ -74,8 +78,9 @@ pub(crate) async fn init(options: InitOptions, registry: &ProcessorRegistry) -> 
     if options.protocol == Some(SubscribeProtocol::Blocks) && !options.targets.is_empty() {
         bail!("the blocks preset does not take market arguments");
     }
+    let chain = ChainRegistry::standard().get(&options.network)?;
     if options.flags.given() {
-        return build(options, &config_path, registry).await;
+        return build(options, &chain, &config_path, registry).await;
     }
     let Some(protocol) = options.protocol else {
         bail!("name a processor preset, or pass --requirements");
@@ -83,6 +88,12 @@ pub(crate) async fn init(options: InitOptions, registry: &ProcessorRegistry) -> 
     let market_names = match protocol {
         SubscribeProtocol::Blocks => Vec::new(),
         SubscribeProtocol::UniswapV3 => {
+            if chain.chain_id != 1 {
+                bail!(
+                    "Uniswap markets are Ethereum Mainnet's; use the blocks preset on {}",
+                    chain.name
+                );
+            }
             if options.targets.is_empty() {
                 bail!("the uniswap-v3 preset requires at least one market");
             }
@@ -97,24 +108,16 @@ pub(crate) async fn init(options: InitOptions, registry: &ProcessorRegistry) -> 
         options.data_dir.as_deref(),
         &options.working_directory,
     );
-    let checkpoint = initialize_checkpoint(
-        options.checkpoint_urls,
-        options.checkpoint_quorum,
-        options.accept_checkpoint,
-        &runtime_data_dir,
-    )
-    .await?;
-    let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
+    let finality = match checkpoint_chain(&chain)? {
+        Some(beacon) => Some(checkpoint(&options, &beacon, &runtime_data_dir).await?),
+        None => None,
+    };
     let config = match protocol {
-        SubscribeProtocol::Blocks => {
-            StarterConfig::blocks(data_dir, checkpoint.root, checkpoint.slot, endpoints)
-        }
+        SubscribeProtocol::Blocks => StarterConfig::blocks(chain.name.clone(), data_dir, finality),
         SubscribeProtocol::UniswapV3 => StarterConfig::uniswap(
             data_dir,
             market_names.clone(),
-            checkpoint.root,
-            checkpoint.slot,
-            endpoints,
+            finality.context("Uniswap follows Ethereum Mainnet from a checkpoint")?,
         ),
     };
     let encoded = toml::to_string_pretty(&config).context("render compact configuration")?;
@@ -140,8 +143,57 @@ pub(crate) async fn init(options: InitOptions, registry: &ProcessorRegistry) -> 
     Ok(Exit::Success)
 }
 
+/// The chain whose beacon chain a checkpoint is for: an Ethereum chain's
+/// own, or Ethereum Mainnet for a rollup's L1 anchor; `None` when nothing
+/// would read one.
+fn checkpoint_chain(chain: &std::sync::Arc<Chain>) -> Result<Option<std::sync::Arc<Chain>>> {
+    Ok(match chain.family {
+        Family::Ethereum => Some(chain.clone()),
+        _ if chain.l1_anchor.is_some() => Some(ChainRegistry::standard().get("ethereum-mainnet")?),
+        _ => None,
+    })
+}
+
+/// A checkpoint of `beacon`'s beacon chain that a quorum of providers agrees
+/// on: `--checkpoint-url`'s, or else the entry's first Beacon transport and
+/// its checkpoint providers.
+async fn checkpoint(
+    options: &InitOptions,
+    beacon: &Chain,
+    data_dir: &Path,
+) -> Result<StarterFinalityConfig> {
+    let providers = if options.checkpoint_urls.is_empty() {
+        beacon
+            .defaults
+            .beacon_endpoints
+            .iter()
+            .take(1)
+            .chain(&beacon.defaults.checkpoint_providers)
+            .cloned()
+            .collect()
+    } else {
+        options.checkpoint_urls.clone()
+    };
+    let checkpoint = initialize_checkpoint(
+        providers,
+        options.checkpoint_quorum,
+        options.accept_checkpoint,
+        data_dir,
+    )
+    .await?;
+    Ok(StarterFinalityConfig {
+        checkpoint: checkpoint.root,
+        checkpoint_slot: checkpoint.slot,
+        endpoints: starter_finality_endpoints(
+            &beacon.defaults.beacon_endpoints,
+            checkpoint.beacon_api_endpoints,
+        ),
+    })
+}
+
 async fn build(
     options: InitOptions,
+    chain: &std::sync::Arc<Chain>,
     config_path: &Path,
     registry: &ProcessorRegistry,
 ) -> Result<Exit> {
@@ -150,32 +202,32 @@ async fn build(
         None => flag_requirements(options.protocol, &options.targets, &options.flags)?,
     };
     // Before the checkpoint fetch, which may ask to confirm its providers.
-    crate::config_builder::check(&requirements, None).map_err(anyhow::Error::msg)?;
+    crate::config_builder::check(&requirements, None, chain).map_err(anyhow::Error::msg)?;
     let (data_dir, runtime_data_dir) = init_data_dir(
         config_path,
         options.data_dir.as_deref(),
         &options.working_directory,
     );
-    let finality = if requirements.follow == Follow::None {
-        None
-    } else {
-        let checkpoint = initialize_checkpoint(
-            options.checkpoint_urls,
-            options.checkpoint_quorum,
-            options.accept_checkpoint,
-            &runtime_data_dir,
-        )
-        .await?;
-        let endpoints = starter_finality_endpoints(checkpoint.beacon_api_endpoints)?;
-        Some(
-            crate::config_builder::finality(checkpoint.root, checkpoint.slot, endpoints)
+    let beacon = checkpoint_chain(chain)?.filter(|_| requirements.follow != Follow::None);
+    let finality = match beacon {
+        Some(beacon) => {
+            let checkpoint = checkpoint(&options, &beacon, &runtime_data_dir).await?;
+            Some(
+                crate::config_builder::finality(
+                    checkpoint.checkpoint,
+                    checkpoint.checkpoint_slot,
+                    checkpoint.endpoints,
+                )
                 .map_err(anyhow::Error::msg)?,
-        )
+            )
+        }
+        None => None,
     };
     let built = crate::config_builder::build(
         &requirements,
         &BuildContext {
             registry,
+            chain: chain.clone(),
             finality,
             head: None,
             data_dir: Some(data_dir),
@@ -263,11 +315,11 @@ fn flag_requirements(
     })
 }
 
-/// Beacon transports for a new compact configuration: the managed default
-/// pool plus every responding checkpoint provider that also serves the
-/// Beacon light-client API, without normalized duplicates.
-pub(crate) fn starter_finality_endpoints(responding: Vec<Url>) -> Result<Vec<Url>> {
-    let mut endpoints = crate::config::default_finality_endpoints().map_err(anyhow::Error::msg)?;
+/// Beacon transports for a new configuration: the chain's managed pool plus
+/// every responding checkpoint provider that also serves the Beacon
+/// light-client API, without normalized duplicates.
+pub(crate) fn starter_finality_endpoints(pool: &[Url], responding: Vec<Url>) -> Vec<Url> {
+    let mut endpoints = pool.to_vec();
     for endpoint in responding {
         let identity = crate::config::finality_endpoint_identity(&endpoint);
         if !endpoints
@@ -277,7 +329,7 @@ pub(crate) fn starter_finality_endpoints(responding: Vec<Url>) -> Result<Vec<Url
             endpoints.push(endpoint);
         }
     }
-    Ok(endpoints)
+    endpoints
 }
 
 /// The `data_dir` to write into the new configuration, and the directory it
@@ -341,11 +393,14 @@ mod tests {
 
     #[test]
     fn starter_endpoints_keep_the_default_pool_and_add_responding_providers() {
-        let endpoints = starter_finality_endpoints(vec![
-            Url::parse("https://ethereum-beacon-api.publicnode.com").expect("URL"),
-            Url::parse("https://beacon.example/").expect("URL"),
-        ])
-        .expect("starter endpoints");
+        let pool = crate::config::default_finality_endpoints().expect("default pool");
+        let endpoints = starter_finality_endpoints(
+            &pool,
+            vec![
+                Url::parse("https://ethereum-beacon-api.publicnode.com").expect("URL"),
+                Url::parse("https://beacon.example/").expect("URL"),
+            ],
+        );
         assert_eq!(
             endpoints.iter().map(Url::as_str).collect::<Vec<_>>(),
             [

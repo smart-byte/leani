@@ -308,6 +308,18 @@
             "possibleValues": []
           },
           {
+            "id": "network",
+            "long": "network",
+            "short": null,
+            "help": "Chain to follow: a built-in chain entry or its alias, such as `base`, `op`, `arbitrum-one`, `robinhood`, or `hoodi`",
+            "required": false,
+            "action": "Set",
+            "defaultValues": [
+              "ethereum-mainnet"
+            ],
+            "possibleValues": []
+          },
+          {
             "id": "data_dir",
             "long": "data-dir",
             "short": null,
@@ -321,14 +333,10 @@
             "id": "checkpoint_url",
             "long": "checkpoint-url",
             "short": null,
-            "help": "Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited)",
+            "help": "Checkpoint provider used for weak-subjectivity quorum (repeatable or comma-delimited) [default: the providers the chain entry names; a rollup's L1 anchor uses Ethereum Mainnet's]",
             "required": false,
             "action": "Append",
-            "defaultValues": [
-              "https://ethereum-beacon-api.publicnode.com/",
-              "https://mainnet.checkpoint.sigp.io/",
-              "https://beaconstate-mainnet.chainsafe.io/"
-            ],
+            "defaultValues": [],
             "possibleValues": []
           },
           {
