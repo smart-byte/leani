@@ -1988,6 +1988,121 @@
                 "subcommands": []
               },
               {
+                "name": "aws",
+                "about": "Read blocks from the chain's AWS public dataset and check their rows against the receipts root, and the block hash where the dataset carries every header field",
+                "usage": "Usage: leani source probe aws [OPTIONS] --from-block <FROM_BLOCK> --to-block <TO_BLOCK>",
+                "arguments": [
+                  {
+                    "id": "from_block",
+                    "long": "from-block",
+                    "short": null,
+                    "help": null,
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "to_block",
+                    "long": "to-block",
+                    "short": null,
+                    "help": "Last block; one UTC day of the dataset is read per day touched",
+                    "required": true,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "address",
+                    "long": "address",
+                    "short": null,
+                    "help": "Keep only logs from these contracts. Blocks whose bloom rules them out are then not read",
+                    "required": false,
+                    "action": "Append",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "endpoint",
+                    "long": "endpoint",
+                    "short": null,
+                    "help": "A mirror of the bucket with the same layout",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "max_input_bytes",
+                    "long": "max-input-bytes",
+                    "short": null,
+                    "help": "Bytes the probe may download per day",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "4294967296"
+                    ],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "config",
+                    "long": "config",
+                    "short": null,
+                    "help": "Path to the versioned TOML configuration",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "log_format",
+                    "long": "log-format",
+                    "short": null,
+                    "help": "Log rendering format",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [
+                      "pretty"
+                    ],
+                    "possibleValues": [
+                      "pretty",
+                      "json"
+                    ]
+                  },
+                  {
+                    "id": "log_filter",
+                    "long": "log-filter",
+                    "short": null,
+                    "help": "Tracing filter, e.g. `info,leani=debug`",
+                    "required": false,
+                    "action": "Set",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "help",
+                    "long": "help",
+                    "short": "h",
+                    "help": "Print help (see more with '--help')",
+                    "required": false,
+                    "action": "Help",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  },
+                  {
+                    "id": "version",
+                    "long": "version",
+                    "short": "V",
+                    "help": "Print version",
+                    "required": false,
+                    "action": "Version",
+                    "defaultValues": [],
+                    "possibleValues": []
+                  }
+                ],
+                "subcommands": []
+              },
+              {
                 "name": "op-gossip",
                 "about": "Follow an op-stack chain's sequencer-signed block gossip",
                 "usage": "Usage: leani source probe op-gossip [OPTIONS]",
@@ -2516,6 +2631,13 @@
                     "subcommands": []
                   },
                   {
+                    "name": "aws",
+                    "about": "Read blocks from the chain's AWS public dataset and check their rows against the receipts root, and the block hash where the dataset carries every header field",
+                    "usage": "Usage: leani source probe help aws",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
                     "name": "op-gossip",
                     "about": "Follow an op-stack chain's sequencer-signed block gossip",
                     "usage": "Usage: leani source probe help op-gossip",
@@ -2577,6 +2699,13 @@
                     "name": "rpc",
                     "about": "Fetch blocks over JSON-RPC and check them against their own roots",
                     "usage": "Usage: leani source help probe rpc",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "aws",
+                    "about": "Read blocks from the chain's AWS public dataset and check their rows against the receipts root, and the block hash where the dataset carries every header field",
+                    "usage": "Usage: leani source help probe aws",
                     "arguments": [],
                     "subcommands": []
                   },
@@ -4905,6 +5034,13 @@
                     "name": "rpc",
                     "about": "Fetch blocks over JSON-RPC and check them against their own roots",
                     "usage": "Usage: leani help source probe rpc",
+                    "arguments": [],
+                    "subcommands": []
+                  },
+                  {
+                    "name": "aws",
+                    "about": "Read blocks from the chain's AWS public dataset and check their rows against the receipts root, and the block hash where the dataset carries every header field",
+                    "usage": "Usage: leani help source probe aws",
                     "arguments": [],
                     "subcommands": []
                   },

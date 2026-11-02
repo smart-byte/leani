@@ -254,3 +254,28 @@ fn nitro_chains_name_their_rpc_endpoints() {
         42_161
     );
 }
+
+#[test]
+fn public_datasets_name_their_layout() {
+    let registry = ChainRegistry::standard();
+    let datasets = [
+        "ethereum-mainnet",
+        "base-mainnet",
+        "arbitrum-one",
+        "robinhood",
+    ]
+    .map(|name| registry.get(name).unwrap().public_dataset.clone());
+    let [Some(ethereum), Some(base), Some(arbitrum), None] = datasets else {
+        panic!("{datasets:?}");
+    };
+    assert_eq!(
+        (
+            ethereum.layout,
+            ethereum.prefix.as_str(),
+            ethereum.first_block
+        ),
+        (DatasetLayout::AwsEthereumV1, "v1.0/eth", 4_370_000)
+    );
+    assert_eq!(base.layout, DatasetLayout::SonarxEvmV1);
+    assert_eq!(arbitrum.first_block, 22_207_817);
+}

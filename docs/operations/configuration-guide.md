@@ -299,14 +299,27 @@ history ceiling until they are deleted (see the runbook's
 ## Sources and finality
 
 `[[sources.history]]` requires `id`, `kind`, `priority`, and `trust`.
-Supported kinds are `xatu`, `era_e`, and `archive`. `xatu` reads public
-Parquet history; validation refuses `parquet`, which no source reads. `archive`
-requires `manifest`; `era_e` alone accepts an `https` or `file` `endpoint`
-ending in `/`. A plain `http` endpoint is accepted on loopback, or elsewhere
+Supported kinds are `xatu`, `era_e`, `archive`, `json_rpc`, and `aws_public`.
+`xatu` reads public Parquet history; validation refuses `parquet`, which no
+source reads. `archive` requires `manifest`; `era_e` accepts an `https` or
+`file` `endpoint` ending in `/`, and `aws_public` an `https` bucket mirror. A plain `http` endpoint is accepted on loopback, or elsewhere
 only with `allow_insecure_http = true` on that source, which accepts a mirror
 whose catalog and archive bytes anyone on the path can replace. `xatu`
 sources are Ethereum mainnet only: another `chain.chain_id` fails
 validation.
+
+`aws_public` reads the chain entry's public dataset on AWS Open Data:
+Ethereum mainnet from AWS's own export, about a day behind, and Base and
+Arbitrum One from SonarX's, about a week behind. It serves headers, receipts,
+and logs. Transaction bodies are left to other sources, because the exports
+store values as floating-point numbers. Rows are unsorted within a day, so each
+chunk downloads its whole UTC day: in October 2026 about 2 GB for Ethereum,
+1.5 GB for Arbitrum One, and 9 GB for Base. That download counts against
+`budgets.temporary_disk_bytes`, and a chunk whose rows would decode to more
+than `budgets.memory_bytes` is refused before it downloads: an unfiltered
+Ethereum day took about 8.7 GB of memory. `chunk_blocks` caps the blocks one
+chunk holds, and each chunk reads its day again. With a log filter, only
+blocks whose logs bloom admits it are decoded.
 
 ### History source order
 
@@ -329,6 +342,7 @@ The shipped profiles list eraE at priority 10 and Xatu at priority 20:
 |---|---|---|---|
 | `era_e` | Whole blocks and receipts up to its mirror's last catalog update | Transactions and receipts roots against the header | The public mirror's catalog ended at block 24,518,655 (2026-02-26) when this was written |
 | `xatu` | Columnar projections, about one day behind the chain, until the day Glamsterdam activates | Transaction rows against the beacon payload count; log rows without a gap | Cannot prove a block's last logs complete; Ethereum mainnet only |
+| `aws_public` (opt-in) | Headers, receipts, and logs, one UTC day per chunk | Receipts root and logs bloom against the header; the block hash, where the export has every header field (Base, Arbitrum One) | The export names the canonical chain; no transaction bodies |
 | P2P (live source) | Recent and live blocks from peers | Commitments of every header, body, and receipt | Slowest for old history; peers may no longer serve very old blocks |
 
 So for blocks the eraE mirror covers, a backfill reads verified complete

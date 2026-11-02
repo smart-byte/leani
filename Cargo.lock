@@ -4314,6 +4314,7 @@ dependencies = [
  "leani-runtime",
  "leani-source-api",
  "leani-source-archive",
+ "leani-source-aws",
  "leani-source-erae",
  "leani-source-p2p",
  "leani-source-rpc",
@@ -4746,6 +4747,35 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+]
+
+[[package]]
+name = "leani-source-aws"
+version = "0.1.1"
+dependencies = [
+ "alloy-consensus",
+ "alloy-eips",
+ "alloy-primitives",
+ "alloy-rlp",
+ "alloy-trie",
+ "arrow-array",
+ "arrow-schema",
+ "async-trait",
+ "bytes",
+ "futures",
+ "leani-chain",
+ "leani-primitives",
+ "leani-source-api",
+ "object_store",
+ "parquet",
+ "postcard",
+ "reqwest 0.12.28",
+ "serde",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "url",
 ]
 
 [[package]]

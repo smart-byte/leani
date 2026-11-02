@@ -22,3 +22,10 @@ checkpoint_providers = [
   "https://beaconstate-mainnet.chainsafe.io/",
 ]
 history_sources = ["era_e", "xatu"]
+
+# AWS Open Data's Ethereum export. Before Byzantium receipts commit to
+# post-state roots the export does not carry.
+[public_dataset]
+layout = "aws-ethereum-v1"
+prefix = "v1.0/eth"
+first_block = 4370000

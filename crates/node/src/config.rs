@@ -580,6 +580,8 @@ pub enum HistorySourceKind {
     Xatu,
     EraE,
     JsonRpc,
+    /// The chain entry's public dataset on AWS Open Data.
+    AwsPublic,
     /// No source reads it. Decoded only so validation can refuse it and
     /// name `xatu`, which reads public Parquet history.
     Parquet,
@@ -594,6 +596,7 @@ impl HistorySourceKind {
             Self::Xatu => "xatu",
             Self::EraE => "era_e",
             Self::JsonRpc => "json_rpc",
+            Self::AwsPublic => "aws_public",
             Self::Parquet => "parquet",
             Self::Archive => "archive",
         }
@@ -1762,7 +1765,15 @@ impl Config {
             "sources.history",
             &mut errors,
         );
-        validate_history_sources(&self.sources.history, self.chain.chain_id, &mut errors);
+        let public_dataset = self
+            .chain_entry()
+            .is_ok_and(|chain| chain.public_dataset.is_some());
+        validate_history_sources(
+            &self.sources.history,
+            self.chain.chain_id,
+            public_dataset,
+            &mut errors,
+        );
         if matches!(self.sources.live.kind, LiveSourceKind::P2p)
             && self.sources.live.minimum_peers == 0
         {
@@ -2303,6 +2314,7 @@ pub(crate) fn allowed_origin(value: &str) -> Option<String> {
 fn validate_history_sources(
     sources: &[HistorySourceConfig],
     chain_id: u64,
+    public_dataset: bool,
     errors: &mut Vec<ValidationError>,
 ) {
     for (index, source) in sources.iter().enumerate() {
@@ -2354,10 +2366,38 @@ fn validate_history_sources(
                     }
                 }
             }
+            HistorySourceKind::AwsPublic => {
+                if !public_dataset {
+                    errors.push(ValidationError::new(
+                        format!("sources.history[{index}].kind"),
+                        "the chain entry names no public dataset on AWS",
+                    ));
+                }
+                if let Some(endpoint) = &source.endpoint
+                    && (endpoint.scheme() != "https" || !endpoint.path().ends_with('/'))
+                {
+                    errors.push(ValidationError::new(
+                        format!("sources.history[{index}].endpoint"),
+                        "an AWS bucket mirror must be an https URL ending with `/`",
+                    ));
+                }
+                if matches!(source.trust, HistoryTrust::VerifiedMaterial) {
+                    errors.push(ValidationError::new(
+                        format!("sources.history[{index}].trust"),
+                        "the dataset's rows are checked against each block's roots, but the dataset names the canonical chain: use trusted_dataset",
+                    ));
+                }
+                if source.chunk_blocks == Some(0) || source.batch_rows == Some(0) {
+                    errors.push(ValidationError::new(
+                        format!("sources.history[{index}]"),
+                        "chunk_blocks and batch_rows must be greater than zero",
+                    ));
+                }
+            }
             _ if source.endpoint.is_some() => {
                 errors.push(ValidationError::new(
                     format!("sources.history[{index}].endpoint"),
-                    "is currently only valid for an eraE source",
+                    "is currently only valid for eraE and aws_public sources",
                 ));
             }
             _ => {}
@@ -2393,15 +2433,16 @@ fn validate_history_sources(
                 ));
             }
         } else {
+            let aws = matches!(source.kind, HistorySourceKind::AwsPublic);
             for (field, configured) in [
-                ("chunk_blocks", source.chunk_blocks.is_some()),
+                ("chunk_blocks", source.chunk_blocks.is_some() && !aws),
                 ("blobs_chunk_blocks", source.blobs_chunk_blocks.is_some()),
-                ("batch_rows", source.batch_rows.is_some()),
+                ("batch_rows", source.batch_rows.is_some() && !aws),
             ] {
                 if configured {
                     errors.push(ValidationError::new(
                         format!("sources.history[{index}].{field}"),
-                        "is currently only valid for a Xatu source",
+                        "is currently only valid for Xatu and aws_public sources",
                     ));
                 }
             }
@@ -4192,6 +4233,40 @@ endpoints = ["https://ethereum-hoodi-beacon-api.publicnode.com/"]
                 .validation_errors()
                 .iter()
                 .any(|error| error.field == "sources.json_rpc")
+        );
+    }
+
+    #[test]
+    fn aws_public_history_needs_the_chain_dataset() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.sources.history.truncate(1);
+        config.sources.history[0].kind = HistorySourceKind::AwsPublic;
+        config.sources.history[0].chunk_blocks = Some(5_000);
+        let history_errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field.starts_with("sources.history"))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            history_errors(&config).is_empty(),
+            "{:?}",
+            history_errors(&config)
+        );
+        config.sources.history[0].trust = HistoryTrust::VerifiedMaterial;
+        assert!(!history_errors(&config).is_empty());
+        config.sources.history[0].trust = HistoryTrust::TrustedDataset;
+        config.chain.name = "robinhood".to_owned();
+        config.chain.chain_id = 4663;
+        assert!(
+            history_errors(&config)
+                .iter()
+                .any(|error| error.message.contains("no public dataset")),
+            "{:?}",
+            history_errors(&config)
         );
     }
 

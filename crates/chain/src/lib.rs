@@ -114,6 +114,32 @@ pub struct ChainDefaults {
     pub rpc_endpoints: Vec<Url>,
 }
 
+/// Column layout of a public Parquet copy of a chain's history.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatasetLayout {
+    /// AWS's own Ethereum export: `blocks`, `transactions` with receipt
+    /// columns, and `logs` with a topics list.
+    AwsEthereumV1,
+    /// `SonarX`'s EVM export: upper-case columns, decimal numbers, and
+    /// separate `receipts`.
+    SonarxEvmV1,
+}
+
+/// Where a chain's history sits in a public, daily-partitioned Parquet set.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PublicDataset {
+    pub layout: DatasetLayout,
+    /// Object prefix holding one `<table>/date=YYYY-MM-DD/` tree per table.
+    pub prefix: String,
+    /// First block the rows can be checked from: earlier blocks follow
+    /// rules the dataset cannot reproduce (Arbitrum Classic, pre-Byzantium
+    /// receipts).
+    #[serde(default)]
+    pub first_block: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chain {
     pub name: String,
@@ -126,6 +152,7 @@ pub struct Chain {
     pub execution: ExecutionNetwork,
     pub beacon: Option<BeaconNetwork>,
     pub op_stack: Option<OpStackNetwork>,
+    pub public_dataset: Option<PublicDataset>,
     pub defaults: ChainDefaults,
 }
 
@@ -189,6 +216,7 @@ impl Chain {
             execution: entry.execution,
             beacon,
             op_stack,
+            public_dataset: entry.public_dataset,
             defaults: entry.defaults,
         })
     }
@@ -247,6 +275,8 @@ struct EntryFile {
     beacon: Option<BeaconEntry>,
     #[serde(default)]
     op_stack: Option<op_stack::OpStackEntry>,
+    #[serde(default)]
+    public_dataset: Option<PublicDataset>,
     #[serde(default)]
     defaults: ChainDefaults,
 }

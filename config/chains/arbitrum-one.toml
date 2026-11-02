@@ -8,3 +8,10 @@ genesis_hash = "0x7ee576b35482195fc49205cec9af72ce14f003b9ae69f6ba0faef4514be8b4
 # are checked against their own header, transactions, and receipts roots.
 [defaults]
 rpc_endpoints = ["https://arb1.arbitrum.io/rpc"]
+
+# SonarX's export on AWS Open Data. Classic blocks before the Nitro
+# genesis hash differently.
+[public_dataset]
+layout = "sonarx-evm-v1"
+prefix = "v1.1/sonarx/arbitrum"
+first_block = 22207817

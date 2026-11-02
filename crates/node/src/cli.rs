@@ -983,6 +983,26 @@ pub enum ProbeSource {
         #[arg(long)]
         endpoint: Option<url::Url>,
     },
+    /// Read blocks from the chain's AWS public dataset and check their rows
+    /// against the receipts root, and the block hash where the dataset
+    /// carries every header field.
+    Aws {
+        #[arg(long)]
+        from_block: u64,
+        /// Last block; one UTC day of the dataset is read per day touched.
+        #[arg(long)]
+        to_block: u64,
+        /// Keep only logs from these contracts. Blocks whose bloom rules
+        /// them out are then not read.
+        #[arg(long)]
+        address: Vec<String>,
+        /// A mirror of the bucket with the same layout.
+        #[arg(long)]
+        endpoint: Option<url::Url>,
+        /// Bytes the probe may download per day.
+        #[arg(long, default_value_t = 4 * 1_024 * 1_024 * 1_024)]
+        max_input_bytes: u64,
+    },
     /// Follow an op-stack chain's sequencer-signed block gossip.
     OpGossip {
         /// How long to listen.
