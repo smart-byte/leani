@@ -42,3 +42,12 @@ consensus_bootnodes = [
 [public_dataset]
 layout = "sonarx-evm-v1"
 prefix = "v1.1/sonarx/base"
+
+# Base's multiproof games (type 621), as the OptimismPortal's
+# respectedGameType() and anchorStateRegistry() name them. A new respected
+# type stops the anchor until this entry follows it.
+[l1_anchor]
+kind = "dispute_games"
+factory = "0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"
+registry = "0x909f6cf47ed12f010a796527f562bfc26c7f4e72"
+game_type = 621

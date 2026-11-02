@@ -14,10 +14,13 @@ workspace = true
 
 [dependencies]
 alloy-primitives.workspace = true
+async-trait.workspace = true
 alloy-rlp.workspace = true
 discv5 = { git = "https://github.com/sigp/discv5", rev = "7663c00", features = ["libp2p"] }
 futures.workspace = true
 leani-chain = { path = "../chain" }
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
 libp2p.workspace = true
 op-alloy-rpc-types-engine.workspace = true
 sha2.workspace = true

@@ -8,6 +8,44 @@ record, and documented RPC contracts.
 
 ### Added
 
+- Op-stack history over P2P: a fresh store catches up from the lowest
+  `start_block` of the processors with automatic history, bounded by
+  `sources.live.history_fallback_blocks`, along the chain of the first signed
+  head. Long catch-ups prove each 1,024-header window once instead of again
+  from the newest head, a catch-up batch spans concurrent material requests,
+  and the settle depth counts from the newest signed head, so a catch-up's
+  frames no longer fill recent storage until ingestion stops. When an hour of
+  large blocks, such as Base's, outgrows the recent storage budget, the
+  budget wins over the settle depth.
+- A `base-sepolia` chain entry. Base's Denim upgrade moves to a block every
+  200 ms (Base Sepolia since 2026-10-21, Base mainnet scheduled for
+  2026-11-05). A peer-served op-stack head must carry its block number's
+  slot timestamp, at 200 ms after Denim; op-stack lanes size their reorg
+  window and settle depth by time at the current cadence and restart when a
+  signed head changes it, and the L1 anchor keeps four hours of signed
+  blocks at the fastest scheduled cadence.
+- Op-stack block gossip keeps the peers that carried signed blocks in
+  `op-gossip-peers.txt` in the data directory, dials them first after a
+  restart, and redials them whenever signed blocks stop for 10 seconds:
+  most consensus peers are full, and a mesh of one or two left a node
+  waiting minutes for a replacement.
+- `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
+  contracts, read in finalized Ethereum blocks over verified Ethereum
+  finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,
+  Arbitrum Nova, and Robinhood Chain, and, on Base, the dispute game the
+  anchor state registry moves to, once its claim matched the output root of
+  the block the sequencer signed. Chain entries name the contracts.
+- `finality.kind = "op_gossip"` follows an op-stack chain's sequencer-signed
+  block gossip: each signed block is the attested head the P2P live lane
+  follows. Recent frames are pruned `finality.settle_blocks` below the tip,
+  since `finalized` needs an L1 anchor. The gossip node advertises a
+  discovery record so peers can dial in (`finality.listen_port`), and
+  `leani source probe op-gossip` takes `--listen-port` and
+  `--discovery-port`.
+- The execution P2P lane drops a fresh peer whose eth/69 handshake head is
+  far behind the live target while it has fewer than
+  `body_serving_peer_target` peers serving the head, so syncing peers stop
+  holding its slots.
 - `kind = "aws_public"` history reads the chain's public Parquet dataset on
   AWS Open Data: Ethereum mainnet (AWS's export), Base and Arbitrum One
   (SonarX's). Each block's receipts are rebuilt from the receipt and log rows

@@ -121,6 +121,11 @@ const MAX_HISTORY_MATERIAL_WINDOW_BLOCKS: usize = 32;
 const NETWORK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DNS_RETRY_INTERVAL: Duration = Duration::from_secs(15);
 const PEER_QUALIFICATION_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+/// A fresh session whose handshake head is this many blocks below the live
+/// target belongs to a syncing peer.
+const SYNCING_PEER_LAG_BLOCKS: u64 = 1_024;
+/// How long a handshake head stays a fair account of the peer's progress.
+const SYNCING_PEER_WINDOW: Duration = Duration::from_secs(600);
 static SECRET_KEY_WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 // Mainnet ETH responses have a 2 MiB soft limit, so a peer may serve only a
 // request's first blocks. Those are kept and the rest is asked for again.
@@ -1249,6 +1254,20 @@ struct DirectPeer {
     peer_id: B512,
     eth_version: EthVersion,
     messages: PeerRequestSender<PeerRequest<WireNetworkPrimitives>>,
+    /// The newest block the peer's eth/69 handshake declared, and when.
+    advertised: Option<(u64, Instant)>,
+}
+
+impl DirectPeer {
+    /// Whether the session is new and its handshake head lies so far below
+    /// `target` that the peer is still syncing: it cannot serve the live
+    /// lane, and keeping it takes a slot from a peer that can.
+    fn syncing_below(&self, target: BlockNumber) -> bool {
+        self.advertised.is_some_and(|(latest, at)| {
+            at.elapsed() < SYNCING_PEER_WINDOW
+                && latest.saturating_add(SYNCING_PEER_LAG_BLOCKS) < target.0
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -2328,6 +2347,10 @@ struct AttestedAncestry {
     header_peer: Option<B512>,
     /// Its serve, settled once frames on these headers first complete.
     serve: Option<HeaderServe>,
+    /// Window tops a proof verified at least a window below its head, lowest
+    /// first. They are past any reorg, so a long catch-up proves each window
+    /// once, up to the rung above it, not again from the newest head.
+    rungs: Vec<AttestedHead>,
 }
 
 impl AttestedAncestry {
@@ -2339,7 +2362,17 @@ impl AttestedAncestry {
             headers: headers.into(),
             header_peer: Some(serve.peer_id),
             serve: Some(serve),
+            rungs: Vec::new(),
         }
+    }
+
+    /// Hold `proven`, keeping the rungs above its head.
+    fn advance(&mut self, mut proven: Self) {
+        let top = proven.head.map_or(0, |head| head.block_number.0);
+        proven
+            .rungs
+            .extend(self.rungs.iter().filter(|rung| rung.block_number.0 > top));
+        *self = proven;
     }
 
     /// The first proven block, if any.
@@ -2431,6 +2464,12 @@ fn live_step(
             },
         };
     }
+    let head = ancestry
+        .rungs
+        .iter()
+        .find(|rung| rung.block_number.0 >= next)
+        .copied()
+        .unwrap_or(head);
     LiveStep::Anchor {
         from: BlockNumber(next),
         head,
@@ -2465,10 +2504,18 @@ where
     let mut size = (total - 1) % MAX_ANCESTRY_HEADERS + 1;
     let mut top = head.block_number.0;
     let mut top_hash = head.block_hash;
+    let mut rungs = Vec::new();
     loop {
         let start = top.saturating_sub(size - 1).max(from.0);
         let range = BlockRange::new(BlockNumber(start), BlockNumber(top))
             .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        if head.block_number.0 - top >= MAX_ANCESTRY_HEADERS {
+            rungs.push(AttestedHead {
+                block_number: BlockNumber(top),
+                block_hash: top_hash,
+                ..head
+            });
+        }
         let (serve, headers) = fetch_window(range, top_hash).await?;
         let Some(lowest) = headers.first() else {
             return Err(P2pError::IncompleteResponse {
@@ -2478,7 +2525,11 @@ where
             });
         };
         if start == from.0 {
-            return Ok(AttestedAncestry::proven(head, serve, headers));
+            rungs.reverse();
+            return Ok(AttestedAncestry {
+                rungs,
+                ..AttestedAncestry::proven(head, serve, headers)
+            });
         }
         top_hash = block_hash(lowest.parent_hash);
         top = start - 1;
@@ -2913,7 +2964,16 @@ fn spawn_peer_qualification_worker(
                         let delay = PEER_QUALIFICATION_RETRY_INTERVAL
                             .saturating_mul(1_u32 << exponent);
                         retry_at.insert(result.peer_id, Instant::now() + delay);
-                        if matches!(result.outcome, PeerQualification::Rejected) {
+                        let advertised = direct_peers
+                            .get(result.peer_id)
+                            .filter(|(peer, _)| peer.syncing_below(target.number))
+                            .and_then(|(peer, _)| peer.advertised);
+                        let syncing = qualifications.ready(target) < body_serving_peer_target
+                            && advertised.is_some();
+                        if let (true, Some((latest, _))) = (syncing, advertised) {
+                            debug!(peer_id = %result.peer_id, latest, target = target.number.0, "dropping a syncing execution peer for its slot");
+                        }
+                        if matches!(result.outcome, PeerQualification::Rejected) || syncing {
                             handle.ban_peer(result.peer_id);
                             direct_peers.invalidate(result.peer_id, connection_id);
                             qualifications.remove(result.peer_id);
@@ -3422,6 +3482,10 @@ where
                                 peer_id: info.peer_id,
                                 eth_version: info.version,
                                 messages,
+                                advertised: info
+                                    .status
+                                    .latest_block
+                                    .map(|latest| (latest, Instant::now())),
                             });
                         }
                         Some(NetworkEvent::Peer(PeerEvent::SessionClosed { peer_id, reason })) => {
@@ -3651,6 +3715,10 @@ fn spawn_direct_peer_reconciler(
                     peer_id: session.remote_id,
                     eth_version: session.eth_version,
                     messages: manager_routed_peer_sender(handle.clone(), session.remote_id),
+                    advertised: session
+                        .status
+                        .latest_block
+                        .map(|latest| (latest, session.session_established)),
                 }) {
                     adopted = adopted.saturating_add(1);
                 }
@@ -4188,6 +4256,46 @@ impl RethP2pSource {
                 }
             });
         }
+    }
+
+    /// The hash of block `number`, proven by parent links down from `head`, so
+    /// it carries the trust of `head`'s hash, such as a sequencer's signature.
+    /// Only headers are fetched, so unlike history this needs no finalized
+    /// anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `number` is above `head` or the proof fails.
+    pub async fn ancestor_hash(
+        &self,
+        head: BlockRef,
+        number: BlockNumber,
+        cancellation: &CancellationToken,
+    ) -> Result<BlockHash, P2pError> {
+        let proof = BlockRange::new(number, head.number)
+            .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
+        let anchor = P2pHistoryAnchor {
+            block: head,
+            consensus: ConsensusAnchor {
+                finality: Finality::Attested,
+                execution_block_hash: head.hash,
+                beacon_slot: head.number.0,
+                beacon_block_root: [0; 32],
+            },
+        };
+        let (session, proven) = RethP2pHistorySource::anchored(self.clone(), proof, anchor, true)
+            .connect_and_fetch_anchored_headers(
+                proof,
+                BlockRange::single(number),
+                self.config.history_header_request_concurrency,
+                cancellation,
+            )
+            .await?;
+        session.set_range(None);
+        session.set_phase(NetworkPhase::Ready);
+        proven
+            .expected_hash(number)
+            .ok_or_else(|| P2pError::InvalidResponse("the header proof kept no hash".to_owned()))
     }
 
     #[must_use]
@@ -7538,6 +7646,20 @@ impl RethP2pHistorySource {
                 "P2P history bridge requires a matching finalized consensus anchor".to_owned(),
             ));
         }
+        Ok(Self::anchored(
+            source,
+            available,
+            anchor,
+            prefer_shared_live_session,
+        ))
+    }
+
+    fn anchored(
+        source: RethP2pSource,
+        available: BlockRange,
+        anchor: P2pHistoryAnchor,
+        prefer_shared_live_session: bool,
+    ) -> Self {
         let mut descriptor = source.descriptor.clone();
         descriptor.range = Some(available);
         descriptor.finality = FinalityModel::Finalized;
@@ -7546,7 +7668,7 @@ impl RethP2pHistorySource {
         descriptor.priority = u16::MAX;
         descriptor.schema_version =
             format!("reth-p2p-finalized-history.v4+{RETH_VERSION}.{RETH_REVISION}");
-        Ok(Self {
+        Self {
             source,
             descriptor,
             anchor,
@@ -7554,7 +7676,7 @@ impl RethP2pHistorySource {
             anchored_headers: Arc::new(tokio::sync::Mutex::new(None)),
             history_session: Arc::new(tokio::sync::Mutex::new(None)),
             acquisition_metrics: Arc::new(Mutex::new(SourceAcquisitionMetrics::default())),
-        })
+        }
     }
 
     async fn acquire_history_network(
@@ -9143,9 +9265,10 @@ async fn next_live_event(
             );
             return Some((Ok(ChainEvent::Block(Box::new(frame))), state));
         }
+        // A catch-up batch spans concurrent requests of
+        // `material_request_blocks` each.
         let batch_blocks = if state.pending_material_attempts == 0 {
-            u64::try_from(state.source.config.material_request_blocks)
-                .expect("material request block bound fits u64")
+            state.budget.max_frames
         } else {
             1
         };
@@ -9157,9 +9280,10 @@ async fn next_live_event(
         match live_step(state.last, attested, &state.ancestry, batch_blocks, gate) {
             LiveStep::Head { block } => {
                 state.head_unavailable_since = None;
+                let cadence = *state.source.cadence();
                 let delay = head_poll_delay(
-                    state.last.timestamp,
-                    state.source.cadence().seconds,
+                    cadence.next_slot_start_ms(state.last.number.0, state.last.timestamp),
+                    cadence.slot_ms(state.last.number.0),
                     unix_now_ms(),
                 );
                 if !delay.is_zero() {
@@ -9283,7 +9407,7 @@ async fn next_live_event(
                     .anchor_attested_ancestry(&state.session, from, head, &state.cancellation)
                     .await
                 {
-                    Ok(ancestry) => state.ancestry = ancestry,
+                    Ok(ancestry) => state.ancestry.advance(ancestry),
                     Err(P2pError::Cancelled) => return None,
                     Err(error) => {
                         // The next attempt proves the chain of the newest
@@ -9586,7 +9710,10 @@ async fn poll_unattested_head(
         return unattested_reorg(state, header).await;
     }
     let attested = state.attested.peek();
-    let Some(slot) = source.cadence().slot_starting_at(header.timestamp) else {
+    let Some(slot) = source
+        .cadence()
+        .header_slot(header.number, header.timestamp)
+    else {
         return Ok(HeadPoll::WaitForAttested);
     };
     if attested.is_none_or(|head| slot.saturating_sub(head.beacon_slot) > MAX_UNATTESTED_SLOTS) {
@@ -13307,6 +13434,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let responder = tokio::spawn(async move {
             let PeerRequest::GetBlockHeaders { response, .. } =
@@ -13388,6 +13516,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
 
         assert_eq!(pool.len(), 1, "the physical session satisfies the floor");
@@ -13874,6 +14003,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -13968,6 +14098,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
         }
@@ -13997,6 +14128,7 @@ mod tests {
             peer_id: fresh_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(fresh_peer, sender),
+            advertised: None,
         });
         pool.set_qualification(fresh_peer, PeerQualification::BodyServing);
         let lease = pool
@@ -14025,6 +14157,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         pool.set_qualification(peer_id, PeerQualification::HeadersOnly);
 
@@ -14068,6 +14201,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, first_sender),
+            advertised: None,
         });
         let mut stale_lease = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -14080,6 +14214,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, second_sender),
+            advertised: None,
         });
         let current = pool
             .try_acquire_excluding(PeerMaterialKind::Body, 1, &HashSet::new(), None)
@@ -14134,6 +14269,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         peer_store.record_success(
             peer_id,
@@ -14161,6 +14297,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let hash = B256::from([0x55; 32]);
         let responder = tokio::spawn(async move {
@@ -14195,6 +14332,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         };
         let hash = B256::from([0x77; 32]);
         let responder = tokio::spawn(async move {
@@ -14715,6 +14853,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
         }
         let proven = B512::from([0x52; 64]);
@@ -14746,6 +14885,24 @@ mod tests {
         pool.set_qualification(header_only, PeerQualification::HeadersOnly);
         assert_eq!(lanes(header_only), (true, false));
         drop(receivers);
+    }
+
+    #[test]
+    fn fresh_sessions_far_below_the_target_are_syncing() {
+        let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+        let peer_id = B512::from([0x11; 64]);
+        let peer = |advertised| DirectPeer {
+            peer_id,
+            eth_version: EthVersion::Eth69,
+            messages: PeerRequestSender::new(peer_id, sender.clone()),
+            advertised,
+        };
+        let target = BlockNumber(10_000);
+        assert!(peer(Some((8_000, Instant::now()))).syncing_below(target));
+        assert!(!peer(Some((9_500, Instant::now()))).syncing_below(target));
+        assert!(!peer(None).syncing_below(target));
+        let old = Instant::now().checked_sub(SYNCING_PEER_WINDOW + Duration::from_secs(1));
+        assert!(!peer(old.map(|at| (8_000, at))).syncing_below(target));
     }
 
     #[test]
@@ -14963,6 +15120,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         // The session ended without a close event.
         drop(receiver);
@@ -14978,6 +15136,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         assert!(!pool.remove_connection(peer_id, stale.connection_id));
         let (routed, _routed_receiver) = tokio::sync::mpsc::channel(1);
@@ -14985,6 +15144,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, routed),
+            advertised: None,
         }));
         let [current] = pool.sessions()[..] else {
             panic!("one pooled session");
@@ -15077,6 +15237,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth68,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             pool.set_qualification(peer_id, PeerQualification::BodyServing);
             peers.push(peer_id);
@@ -15315,6 +15476,7 @@ mod tests {
                     peer_id,
                     eth_version: EthVersion::Eth68,
                     messages: PeerRequestSender::new(peer_id, sender),
+                    advertised: None,
                 },
                 receiver,
             )
@@ -16156,6 +16318,7 @@ mod tests {
             peer_id,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(peer_id, sender),
+            advertised: None,
         });
         let [current] = pool.sessions()[..] else {
             panic!("one pooled session");
@@ -16202,6 +16365,7 @@ mod tests {
                 peer_id,
                 eth_version: EthVersion::Eth70,
                 messages: PeerRequestSender::new(peer_id, sender),
+                advertised: None,
             });
             peer_store.record_success(
                 peer_id,
@@ -16609,6 +16773,7 @@ mod tests {
             peer_id: header_peer,
             eth_version: EthVersion::Eth68,
             messages: PeerRequestSender::new(header_peer, sender),
+            advertised: None,
         });
         let strikes = || withheld_strike(&source.network.direct_peers, header_peer).0;
         let mut bound = LiveMaterialBound::new("bodies", 25_000_001, Some(header_peer));
@@ -16922,6 +17087,67 @@ mod tests {
             live_step(last, Some(head), &ancestry, 8, CLOSED_GATE),
             LiveStep::Anchor {
                 from: BlockNumber(110),
+                head
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_long_catch_up_proves_each_window_once() {
+        let chain = header_chain(B256::ZERO, 1..=5_000, 0);
+        let windows = std::sync::Mutex::new(Vec::new());
+        let fetch = |range: BlockRange, top: BlockHash| {
+            windows.lock().expect("windows").push(range.end().0);
+            let window = chain
+                .iter()
+                .filter(|header| range.contains(BlockNumber(header.number)))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(
+                window.last().map(|tip| block_hash(tip.hash_slow())),
+                Some(top)
+            );
+            async move { Ok((header_serve(0x62, range.end().0), window)) }
+        };
+        let head = attested(&chain[4_999], 40);
+        let proven = prove_attested_ancestry(BlockNumber(1), head, fetch)
+            .await
+            .expect("proven");
+        let rung_numbers = |ancestry: &AttestedAncestry| {
+            ancestry
+                .rungs
+                .iter()
+                .map(|rung| rung.block_number.0)
+                .collect::<Vec<_>>()
+        };
+        // The top two windows lie within a window of the head: no rungs.
+        assert_eq!(rung_numbers(&proven), [1_024, 2_048, 3_072]);
+        let mut ancestry = AttestedAncestry::default();
+        ancestry.advance(proven);
+        ancestry.take(1_024);
+        let last = block_ref(&chain[1_023]);
+        let rung = ancestry.rungs[1];
+        assert_eq!(rung.block_hash, block_hash(chain[2_047].hash_slow()));
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 64, CLOSED_GATE),
+            LiveStep::Anchor {
+                from: BlockNumber(1_025),
+                head: rung
+            }
+        );
+        windows.lock().expect("windows").clear();
+        let next = prove_attested_ancestry(BlockNumber(1_025), rung, fetch)
+            .await
+            .expect("next window");
+        assert_eq!(*windows.lock().expect("windows"), [2_048]);
+        ancestry.advance(next);
+        assert_eq!(rung_numbers(&ancestry), [3_072]);
+        // Invalidated, the lane proves from the newest head again.
+        ancestry.invalidate();
+        assert_eq!(
+            live_step(last, Some(head), &ancestry, 64, CLOSED_GATE),
+            LiveStep::Anchor {
+                from: BlockNumber(1_025),
                 head
             }
         );

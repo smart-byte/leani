@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, LazyLock};
 
-use alloy_primitives::B256;
+use alloy_primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
@@ -43,35 +43,104 @@ impl Family {
     }
 }
 
-/// When blocks are due: one per `seconds` from `genesis_time`. Beacon slots
-/// on Ethereum, L2 blocks on OP-stack chains.
+/// When blocks are due: a slot every `seconds` from `genesis_time`. On
+/// Ethereum these are beacon slots, which a block may leave empty. On an
+/// OP-stack chain every slot holds one block and carries its number from
+/// `first_block`; Base's Denim shortens the slots to 200 ms from `fast_from`.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Cadence {
     pub genesis_time: u64,
     pub seconds: u64,
+    /// OP-stack: the block due at `genesis_time`.
+    pub first_block: Option<u64>,
+    /// The first slot of the 200 ms cadence.
+    pub fast_from: Option<u64>,
 }
 
 impl Cadence {
+    /// Milliseconds per slot from `fast_from` on.
+    pub const FAST_SLOT_MS: u64 = 200;
+
+    /// When `slot` starts, in UNIX milliseconds.
     #[must_use]
-    pub const fn slot_start(&self, slot: u64) -> u64 {
-        self.genesis_time
-            .saturating_add(slot.saturating_mul(self.seconds))
+    pub fn slot_start_ms(&self, slot: u64) -> u64 {
+        let first = self.first_block.unwrap_or(0);
+        let legacy = |slot: u64| {
+            self.genesis_time
+                .saturating_add(slot.saturating_sub(first).saturating_mul(self.seconds))
+                .saturating_mul(1_000)
+        };
+        match self.fast_from {
+            Some(fast) if slot > fast => {
+                legacy(fast).saturating_add((slot - fast).saturating_mul(Self::FAST_SLOT_MS))
+            }
+            _ => legacy(slot),
+        }
     }
 
-    /// The slot that starts at `timestamp`, or `None` before genesis or off a
-    /// slot boundary.
+    /// When `slot` starts, in whole UNIX seconds.
     #[must_use]
-    pub const fn slot_starting_at(&self, timestamp: u64) -> Option<u64> {
-        match timestamp.checked_sub(self.genesis_time) {
-            Some(since) if since % self.seconds == 0 => Some(since / self.seconds),
-            _ => None,
+    pub fn slot_start(&self, slot: u64) -> u64 {
+        self.slot_start_ms(slot) / 1_000
+    }
+
+    /// Milliseconds from `slot`'s start to the next slot's.
+    #[must_use]
+    pub fn slot_ms(&self, slot: u64) -> u64 {
+        match self.fast_from {
+            Some(fast) if slot >= fast => Self::FAST_SLOT_MS,
+            _ => self.seconds.saturating_mul(1_000),
         }
+    }
+
+    /// The slot that starts at `timestamp`, or `None` before genesis, off a
+    /// slot boundary, or once several slots start in each second.
+    #[must_use]
+    pub fn slot_starting_at(&self, timestamp: u64) -> Option<u64> {
+        if self
+            .fast_from
+            .is_some_and(|fast| timestamp >= self.slot_start(fast))
+        {
+            return None;
+        }
+        let since = timestamp.checked_sub(self.genesis_time)?;
+        (since % self.seconds == 0).then(|| self.first_block.unwrap_or(0) + since / self.seconds)
     }
 
     /// The slot in progress at `timestamp`.
     #[must_use]
-    pub const fn slot_at(&self, timestamp: u64) -> u64 {
-        timestamp.saturating_sub(self.genesis_time) / self.seconds
+    pub fn slot_at(&self, timestamp: u64) -> u64 {
+        if let Some(fast) = self.fast_from {
+            let start = self.slot_start_ms(fast);
+            let now = timestamp.saturating_mul(1_000);
+            if now >= start {
+                return fast + (now - start) / Self::FAST_SLOT_MS;
+            }
+        }
+        self.first_block.unwrap_or(0) + timestamp.saturating_sub(self.genesis_time) / self.seconds
+    }
+
+    /// The slot a header fills, or `None` when its timestamp does not start
+    /// one: on Ethereum the slot its timestamp starts; on an OP-stack chain,
+    /// where every slot holds a block, its number, when the timestamp is that
+    /// slot's second.
+    #[must_use]
+    pub fn header_slot(&self, number: u64, timestamp: u64) -> Option<u64> {
+        match self.first_block {
+            Some(first) => {
+                (number >= first && self.slot_start(number) == timestamp).then_some(number)
+            }
+            None => self.slot_starting_at(timestamp),
+        }
+    }
+
+    /// When the slot after a block's starts, in UNIX milliseconds.
+    #[must_use]
+    pub fn next_slot_start_ms(&self, number: u64, timestamp: u64) -> u64 {
+        match self.first_block {
+            Some(_) => self.slot_start_ms(number.saturating_add(1)),
+            None => timestamp.saturating_add(self.seconds).saturating_mul(1_000),
+        }
     }
 }
 
@@ -140,6 +209,22 @@ pub struct PublicDataset {
     pub first_block: u64,
 }
 
+/// The Ethereum contracts that settle a rollup's chain, which the opt-in
+/// L1 anchor reads to finalize blocks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum L1Anchor {
+    /// Dispute games of `game_type` claim output roots; the anchor state
+    /// registry moves to a game once the chain's own rules treat it as final.
+    DisputeGames {
+        factory: Address,
+        registry: Address,
+        game_type: u32,
+    },
+    /// A Nitro rollup whose confirmed assertions name an L2 block hash.
+    NitroRollup { rollup: Address },
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Chain {
     pub name: String,
@@ -153,6 +238,7 @@ pub struct Chain {
     pub beacon: Option<BeaconNetwork>,
     pub op_stack: Option<OpStackNetwork>,
     pub public_dataset: Option<PublicDataset>,
+    pub l1_anchor: Option<L1Anchor>,
     pub defaults: ChainDefaults,
 }
 
@@ -206,6 +292,18 @@ impl Chain {
                 )));
             }
         };
+        match (entry.l1_anchor, entry.family) {
+            (None, _)
+            | (Some(L1Anchor::DisputeGames { .. }), Family::OpStack)
+            | (Some(L1Anchor::NitroRollup { .. }), Family::Arbitrum) => {}
+            (Some(_), family) => {
+                return Err(ChainError::InvalidEntry(format!(
+                    "{}: that l1_anchor kind does not settle {} chains",
+                    entry.name,
+                    family.name()
+                )));
+            }
+        }
         Ok(Self {
             name: entry.name,
             aliases: entry.aliases,
@@ -217,6 +315,7 @@ impl Chain {
             beacon,
             op_stack,
             public_dataset: entry.public_dataset,
+            l1_anchor: entry.l1_anchor,
             defaults: entry.defaults,
         })
     }
@@ -278,6 +377,8 @@ struct EntryFile {
     #[serde(default)]
     public_dataset: Option<PublicDataset>,
     #[serde(default)]
+    l1_anchor: Option<L1Anchor>,
+    #[serde(default)]
     defaults: ChainDefaults,
 }
 
@@ -309,6 +410,10 @@ const BUILT_IN: &[(&str, Option<&str>)] = &[
     (
         include_str!("../../../config/chains/base-mainnet.toml"),
         Some(include_str!("../../../config/chains/op/base.toml")),
+    ),
+    (
+        include_str!("../../../config/chains/base-sepolia.toml"),
+        Some(include_str!("../../../config/chains/op/base-sepolia.toml")),
     ),
     (
         include_str!("../../../config/chains/unichain-mainnet.toml"),

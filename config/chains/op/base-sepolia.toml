@@ -1,0 +1,30 @@
+# Base Sepolia in the superchain registry's format, from base/base's
+# ChainConfig::sepolia(). The Pectra blob schedule fork changes only
+# derivation and is left out.
+name = "Base Sepolia Testnet"
+public_rpc = "https://sepolia.base.org"
+chain_id = 84532
+block_time = 2
+
+[hardforks]
+  canyon_time = 1699981200
+  delta_time = 1703203200
+  ecotone_time = 1708534800
+  fjord_time = 1716998400
+  granite_time = 1723478400
+  holocene_time = 1732633200
+  isthmus_time = 1744905600
+  jovian_time = 1763568001
+  azul_time = 1776708000
+  beryl_time = 1781805600
+  cobalt_time = 1790186400
+  denim_time = 1792605600
+
+[genesis]
+  l2_time = 1695768288
+  [genesis.l2]
+    hash = "0x0dcc9e089e30b90ddfc55be9a37dd15bc551aeee999d2e2b51414c54eaf934e4"
+    number = 0
+
+[addresses]
+  SystemConfigProxy = "0xf272670eb55e895584501d564afeb048bed26194"

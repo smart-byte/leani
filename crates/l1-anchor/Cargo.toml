@@ -1,0 +1,29 @@
+[package]
+name = "leani-l1-anchor"
+description = "Rollup finality from the anchor events of the rollup's Ethereum contracts"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+leani-chain = { path = "../chain" }
+leani-primitives = { path = "../primitives" }
+leani-source-api = { path = "../source-api" }
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -15,3 +15,8 @@ rpc_endpoints = ["https://arb1.arbitrum.io/rpc"]
 layout = "sonarx-evm-v1"
 prefix = "v1.1/sonarx/arbitrum"
 first_block = 22207817
+
+# The BoLD rollup, as the bridge's rollup() names it.
+[l1_anchor]
+kind = "nitro_rollup"
+rollup = "0x4DCeB440657f21083db8aDd07665f8ddBe1DCfc0"

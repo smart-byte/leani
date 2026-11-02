@@ -8,6 +8,7 @@ pub mod config;
 mod config_builder;
 mod guide;
 mod init;
+mod l1_anchor;
 mod local_state;
 pub mod process;
 pub mod processors;

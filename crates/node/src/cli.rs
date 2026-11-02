@@ -1008,6 +1008,13 @@ pub enum ProbeSource {
         /// How long to listen.
         #[arg(long, default_value_t = 120)]
         seconds: u64,
+        /// TCP port for gossip connections, advertised in the discovery
+        /// record; 0 picks one and advertises none.
+        #[arg(long, default_value_t = 0)]
+        listen_port: u16,
+        /// UDP port for discovery; 0 picks one.
+        #[arg(long, default_value_t = 0)]
+        discovery_port: u16,
         /// Optional JSON lines destination for the verified blocks.
         #[arg(long)]
         output: Option<PathBuf>,

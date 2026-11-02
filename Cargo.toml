@@ -6,6 +6,7 @@ members = [
   "crates/finality-beacon-api",
   "crates/finality-consensus-p2p",
   "crates/finality-op-gossip",
+  "crates/l1-anchor",
   "crates/node",
   "crates/primitives",
   "crates/processor-api",

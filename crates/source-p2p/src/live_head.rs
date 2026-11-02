@@ -164,12 +164,14 @@ pub(crate) const fn late_reveal(slot_start: u64, seen: u64) -> bool {
     seen.saturating_sub(slot_start) > LATE_REVEAL_AFTER.as_secs()
 }
 
-/// How long to wait before polling the block after one at `last_timestamp`,
-/// at `now_ms` UNIX milliseconds.
-pub(crate) fn head_poll_delay(last_timestamp: u64, slot_seconds: u64, now_ms: u64) -> Duration {
-    let first_poll_ms = (last_timestamp + slot_seconds) * 1_000
-        + u64::try_from(HEAD_FIRST_POLL_OFFSET.as_millis()).unwrap_or(u64::MAX);
-    Duration::from_millis(first_poll_ms.saturating_sub(now_ms))
+/// How long to wait at `now_ms` before polling the block of a slot that
+/// starts at `slot_start_ms` and lasts `slot_ms`, UNIX milliseconds: the
+/// first-poll offset in, or half of a shorter slot.
+pub(crate) fn head_poll_delay(slot_start_ms: u64, slot_ms: u64, now_ms: u64) -> Duration {
+    let offset = u64::try_from(HEAD_FIRST_POLL_OFFSET.as_millis())
+        .unwrap_or(u64::MAX)
+        .min(slot_ms / 2);
+    Duration::from_millis((slot_start_ms + offset).saturating_sub(now_ms))
 }
 
 /// The header a P2P frame carries, decoded from its RLP.
@@ -334,9 +336,17 @@ mod tests {
         assert!(late_reveal(1_000, 1_008));
         // The next block's slot starts at 1_012; polls start a second in.
         assert_eq!(
-            head_poll_delay(1_000, 12, 1_005_000),
+            head_poll_delay(1_012_000, 12_000, 1_005_000),
             Duration::from_millis(8_000)
         );
-        assert_eq!(head_poll_delay(1_000, 12, 1_014_000), Duration::ZERO);
+        assert_eq!(
+            head_poll_delay(1_012_000, 12_000, 1_014_000),
+            Duration::ZERO
+        );
+        // A 200 ms slot is polled halfway in.
+        assert_eq!(
+            head_poll_delay(1_000_200, 200, 1_000_000),
+            Duration::from_millis(300)
+        );
     }
 }
