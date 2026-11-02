@@ -326,12 +326,12 @@ exposes any durable rows that remain afterward.
 
 `finality.kind = "consensus_p2p"` is the self-contained profile. Configure both
 the independently obtained checkpoint root and its finalized beacon slot.
-The node uses signed embedded mainnet bootnode ENRs unless `finality.bootnodes`
-overrides them, binds discv5 to `finality.discovery_port` (`0` selects an
-ephemeral port), performs the mandatory Status exchange, and locally verifies
-bootstrap, sync-committee, BLS, finality, and execution-payload proofs. Permit
-outbound TCP and UDP; an inbound UDP mapping improves discovery but is not a
-trust requirement.
+The node uses the signed bootnode ENRs embedded for its chain, Mainnet,
+Sepolia, or Hoodi, unless `finality.bootnodes` overrides them, binds discv5 to
+`finality.discovery_port` (`0` selects an ephemeral port), performs the
+mandatory Status exchange, and locally verifies bootstrap, sync-committee,
+BLS, finality, and execution-payload proofs. Permit outbound TCP and UDP; an
+inbound UDP mapping improves discovery but is not a trust requirement.
 
 `finality.kind = "beacon_api"` remains available when HTTP consensus
 transports are operationally preferable. Configure
@@ -618,13 +618,16 @@ most every five minutes.
 
 ### Network fork this release does not support
 
-Each release verifies the consensus forks it knows; Glamsterdam's Gloas is
-not among them yet. Once mainnet activates a fork a release does not know,
-finality stays unavailable and the live lane stops, fail-closed: consensus
-peers answer with a fork digest the node does not know, which it logs once as
+Each release verifies the consensus forks it knows. Both finality kinds know
+Glamsterdam's Gloas; consensus P2P finality also needs peers that serve its
+light-client data, and stays unavailable until enough consensus clients do,
+while Beacon API finality follows from endpoints that serve it. Once mainnet
+activates a fork a release does not know, finality stays unavailable and the
+live lane stops, fail-closed: consensus peers answer with a fork digest the
+node does not know, which it logs once as
 `consensus peers serve a fork this release cannot verify`, and a Beacon API
 endpoint fails with an error naming the fork, such as
-``serves `gloas` light-client data``. No peer is banned for it. Upgrade to a
+``serves `heze` light-client data``. No peer is banned for it. Upgrade to a
 release that supports the fork before its mainnet activation. Upgraded
 within 14 days, the node resumes from its persisted finality anchor; later,
 it needs a fresh `finality.checkpoint`.

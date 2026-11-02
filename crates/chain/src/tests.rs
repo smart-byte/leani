@@ -46,6 +46,22 @@ fn mainnet_entry_matches_its_beacon_chain() {
     );
     assert_eq!(beacon.blob_schedule, [(412_672, 15), (419_072, 21)]);
     assert_eq!(beacon.fork_digest(0), [0xb5, 0x30, 0x3f, 0x2a]);
+    assert_eq!(
+        beacon.fork_digest(269_568 * SLOTS_PER_EPOCH),
+        [0x6a, 0x95, 0xa1, 0xa9]
+    );
+    assert_eq!(
+        beacon.fork_digest(411_392 * SLOTS_PER_EPOCH),
+        [0xcc, 0x2c, 0x5c, 0xdb]
+    );
+    assert_eq!(
+        beacon.fork_digest(412_672 * SLOTS_PER_EPOCH),
+        [0xcb, 0x0d, 0x1a, 0xcc]
+    );
+    assert_eq!(
+        beacon.fork_digest(419_072 * SLOTS_PER_EPOCH),
+        [0x8c, 0x9f, 0x62, 0xfe]
+    );
     assert_eq!(beacon.slot_starting_at(1_606_824_023 + 24), Some(2));
     assert_eq!(beacon.slot_starting_at(1_606_824_023 + 25), None);
 }
@@ -55,16 +71,42 @@ fn hoodi_digest_matches_a_live_node_record() {
     let hoodi = ChainRegistry::standard().get("hoodi").unwrap();
     let beacon = hoodi.beacon().unwrap();
     // The `eth2` field of a Lodestar Hoodi node record at epoch 131409: Fulu
-    // with the second blob-parameter fork, Gloas next at 132352.
+    // with the second blob-parameter fork.
     assert_eq!(
         beacon.fork_digest(131_409 * SLOTS_PER_EPOCH),
         [0xc6, 0xec, 0xb7, 0x6c]
     );
-    assert_eq!(beacon.fork("gloas").unwrap().epoch, 132_352);
+}
+
+#[test]
+fn execution_and_consensus_glamsterdam_activate_together() {
+    use reth_chainspec::{EthereumHardfork, ForkCondition, Hardforks as _};
+
+    for chain in ChainRegistry::standard()
+        .iter()
+        .filter(|chain| chain.beacon.is_some())
+    {
+        let beacon = chain.beacon().unwrap();
+        let gloas = beacon.fork("gloas").map(|fork| {
+            beacon.genesis_time + fork.epoch * SLOTS_PER_EPOCH * beacon.seconds_per_slot
+        });
+        let amsterdam = match execution_chain_spec(chain)
+            .unwrap()
+            .fork(EthereumHardfork::Amsterdam)
+        {
+            ForkCondition::Timestamp(timestamp) => Some(timestamp),
+            _ => None,
+        };
+        assert_eq!(amsterdam, gloas, "{}", chain.name);
+    }
+    // Sepolia forked at epoch 353024; Hoodi's fork is not scheduled.
+    let sepolia = ChainRegistry::standard().get("sepolia").unwrap();
     assert_eq!(
-        beacon.fork("gloas").unwrap().version,
-        [0x80, 0x00, 0x09, 0x10]
+        sepolia.beacon().unwrap().fork("gloas").unwrap().epoch,
+        353_024
     );
+    let hoodi = ChainRegistry::standard().get("hoodi").unwrap();
+    assert!(hoodi.beacon().unwrap().fork("gloas").is_none());
 }
 
 #[test]

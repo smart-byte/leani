@@ -719,6 +719,10 @@ pub enum XatuError {
         column: String,
         actual: String,
     },
+    /// A beacon block of a fork after Fulu, whose execution payload Xatu's
+    /// beacon rows do not carry.
+    #[error("Xatu beacon block version {0:?} is a fork this release does not project")]
+    UnsupportedFork(String),
     #[error("Xatu withdrawals of {range:?} are incomplete: {detail}")]
     IncompleteWithdrawals { range: BlockRange, detail: String },
     #[error("Xatu logs of {range:?} are incomplete: {detail}")]

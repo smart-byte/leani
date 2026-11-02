@@ -93,6 +93,7 @@ const WITHDRAWAL_COLUMNS: &[&str] = &[
 const GENERIC_EXECUTION_BLOCK_COLUMNS: &[&str] = &["block_date_time", "block_number", "block_hash"];
 const GENERIC_BEACON_BLOCK_COLUMNS: &[&str] = &[
     "slot_start_date_time",
+    "block_version",
     "execution_payload_block_hash",
     "execution_payload_block_number",
     "execution_payload_parent_hash",
@@ -1210,6 +1211,7 @@ fn parse_generic_beacon_blocks(
 ) -> Result<u64, XatuError> {
     let mut selected = 0_u64;
     for row in 0..batch.num_rows() {
+        check_projected_fork(batch, row)?;
         let Some(number) = optional_u64(batch, "execution_payload_block_number", row)? else {
             continue;
         };
@@ -1860,6 +1862,7 @@ fn parse_beacon_blocks(
 ) -> Result<u64, XatuError> {
     let mut selected = 0_u64;
     for row in 0..batch.num_rows() {
+        check_projected_fork(batch, row)?;
         let Some(number) = optional_u64(batch, "execution_payload_block_number", row)? else {
             continue;
         };
@@ -2263,6 +2266,20 @@ fn validate_block_join(
         )));
     }
     Ok(())
+}
+
+/// Refuse a beacon block of a fork after Fulu. From Gloas the execution
+/// payload leaves the beacon block, and Xatu leaves its payload columns empty.
+/// The fork's day partition refuses the blocks before the fork as well.
+fn check_projected_fork(batch: &RecordBatch, row: usize) -> Result<(), XatuError> {
+    match required_bytes(batch, "block_version", row)? {
+        b"phase0" | b"altair" | b"bellatrix" | b"capella" | b"deneb" | b"electra" | b"fulu" => {
+            Ok(())
+        }
+        version => Err(XatuError::UnsupportedFork(
+            String::from_utf8_lossy(version).into_owned(),
+        )),
+    }
 }
 
 fn parse_execution_block_fork(value: &[u8]) -> Result<ExecutionBlockFork, XatuError> {
@@ -4548,6 +4565,45 @@ mod tests {
                 actual: 0,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn beacon_blocks_after_fulu_are_an_unsupported_fork() {
+        // Xatu's Gloas rows leave every execution payload column empty.
+        // Skipped as payload-less, they would read as a hole in every chunk
+        // after the fork.
+        let batch = |version: &str| {
+            RecordBatch::try_from_iter(vec![
+                (
+                    "block_version",
+                    Arc::new(BinaryArray::from_vec(vec![version.as_bytes()])) as ArrayRef,
+                ),
+                (
+                    "execution_payload_block_number",
+                    Arc::new(UInt32Array::from(vec![None])) as ArrayRef,
+                ),
+            ])
+            .expect("beacon block batch")
+        };
+        let range = BlockRange::single(BlockNumber(11_856_337));
+        for version in ["phase0", "fulu"] {
+            assert_eq!(
+                parse_beacon_blocks(&batch(version), range, &mut BTreeMap::new()).ok(),
+                Some(0)
+            );
+            assert_eq!(
+                parse_generic_beacon_blocks(&batch(version), range, &mut BTreeMap::new()).ok(),
+                Some(0)
+            );
+        }
+        assert!(matches!(
+            parse_beacon_blocks(&batch("gloas"), range, &mut BTreeMap::new()),
+            Err(XatuError::UnsupportedFork(version)) if version == "gloas"
+        ));
+        assert!(matches!(
+            parse_generic_beacon_blocks(&batch("gloas"), range, &mut BTreeMap::new()),
+            Err(XatuError::UnsupportedFork(version)) if version == "gloas"
         ));
     }
 
