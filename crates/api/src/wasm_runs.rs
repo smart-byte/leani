@@ -353,7 +353,7 @@ pub(crate) async fn swap_processor(
     Ok((StatusCode::ACCEPTED, Json(json!({ "version": version }))).into_response())
 }
 
-fn module_and_params(
+pub(crate) fn module_and_params(
     module: Option<&str>,
     template: Option<&str>,
     params: Option<&Value>,

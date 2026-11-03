@@ -4,6 +4,7 @@ mod browser_guard;
 mod extension;
 mod extensions;
 mod playground;
+mod processor_changes;
 mod wasm_runs;
 
 pub use extension::{
@@ -13,6 +14,7 @@ pub use extensions::{
     BlobsQueryExtension, BlockSummaryQueryExtension, Erc20QueryExtension,
     UniswapObservationsQueryExtension, UniswapQueryExtension,
 };
+pub use processor_changes::{ProcessorAdmin, ProcessorAdminError, ProcessorChange};
 
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
@@ -278,6 +280,9 @@ pub struct ApiConfig {
     pub backfill_control: Option<Arc<dyn BackfillControl>>,
     /// Optional independent raw-history control plane supplied by the node.
     pub raw_history_control: Option<Arc<dyn RawHistoryControl>>,
+    /// Adds and removes processors, when the node allows it: without it,
+    /// `/admin/v1/processors` answers 404 naming the switch.
+    pub processor_admin: Option<Arc<dyn ProcessorAdmin>>,
     /// Cancelled when the node shuts down: open change and delivery streams
     /// then end cleanly, so the shutdown need not wait for their clients,
     /// which reconnect from their last cursor.
@@ -358,6 +363,7 @@ impl Default for ApiConfig {
             application_subscription_processors: BTreeSet::new(),
             backfill_control: None,
             raw_history_control: None,
+            processor_admin: None,
             shutdown: CancellationToken::new(),
             live_events: None,
             config_check: None,
@@ -411,6 +417,10 @@ impl std::fmt::Debug for ApiConfig {
             .field(
                 "raw_history_control",
                 &self.raw_history_control.as_ref().map(|_| "[AVAILABLE]"),
+            )
+            .field(
+                "processor_admin",
+                &self.processor_admin.as_ref().map(|_| "[AVAILABLE]"),
             )
             .field("shutdown", &self.shutdown.is_cancelled())
             .field(
@@ -973,13 +983,57 @@ pub trait RawHistoryControl: std::fmt::Debug + Send + Sync {
     async fn delete(&self, id: &str) -> Result<RawHistoryJobDeletion, RawHistoryControlError>;
 }
 
+/// The processors the API serves, replaced as a whole when one is added or
+/// removed through it. Query extensions stay as the node started.
+struct ApiProcessors {
+    map: BTreeMap<String, Arc<dyn Processor>>,
+    capabilities: CapabilitiesResponse,
+    on_demand: BTreeSet<String>,
+    subscriptions: BTreeSet<String>,
+}
+
+impl ApiState {
+    fn processors(&self) -> Arc<ApiProcessors> {
+        self.processors
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn replace_processors(&self, change: &ProcessorChange) -> Result<(), ApiError> {
+        let mut map = BTreeMap::new();
+        for processor in &change.processors {
+            let instance = processor.descriptor().instance.to_string();
+            if map.insert(instance.clone(), processor.clone()).is_some() {
+                return Err(ApiError::internal(&format!(
+                    "processor instance {instance} is registered more than once"
+                )));
+            }
+        }
+        let capabilities =
+            capabilities_response(self.config.chain_id.0, &map, &self.query_extensions);
+        *self
+            .processors
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Arc::new(ApiProcessors {
+            map,
+            capabilities,
+            on_demand: change.on_demand.clone(),
+            subscriptions: change.subscriptions.clone(),
+        });
+        Ok(())
+    }
+}
+
 #[derive(Clone)]
 struct ApiState {
     store: SqliteStore,
     primary: Arc<dyn Processor>,
-    processors: Arc<BTreeMap<String, Arc<dyn Processor>>>,
+    processors: Arc<std::sync::RwLock<Arc<ApiProcessors>>>,
+    /// One processor change at a time, from the node's answer to the swap,
+    /// so an older answer never replaces a newer one.
+    processor_changes: Arc<tokio::sync::Mutex<()>>,
     query_extensions: Arc<Vec<MountedQueryExtension>>,
-    capabilities: Arc<CapabilitiesResponse>,
     config: ApiConfig,
     started: Instant,
     wasm_runs: wasm_runs::Runs,
@@ -991,7 +1045,10 @@ impl std::fmt::Debug for ApiState {
             .debug_struct("ApiState")
             .field("store", &self.store)
             .field("primary", &self.primary.descriptor())
-            .field("processors", &self.processors.keys().collect::<Vec<_>>())
+            .field(
+                "processors",
+                &self.processors().map.keys().collect::<Vec<_>>(),
+            )
             .field("query_extensions", &self.query_extensions)
             .field("config", &self.config)
             .finish_non_exhaustive()
@@ -1221,19 +1278,19 @@ pub fn router_with_processors(
         .iter()
         .map(PreparedQueryExtension::mounted)
         .collect::<Vec<_>>();
-    let processors = Arc::new(registry);
     let query_extensions = Arc::new(mounted_extensions);
-    let cached_capabilities = Arc::new(capabilities_response(
-        config.chain_id.0,
-        &processors,
-        &query_extensions,
-    ));
+    let processors = ApiProcessors {
+        capabilities: capabilities_response(config.chain_id.0, &registry, &query_extensions),
+        map: registry,
+        on_demand: config.on_demand_processors.clone(),
+        subscriptions: config.application_subscription_processors.clone(),
+    };
     let state = ApiState {
         store,
         primary,
-        processors,
+        processors: Arc::new(std::sync::RwLock::new(Arc::new(processors))),
+        processor_changes: Arc::default(),
         query_extensions,
-        capabilities: cached_capabilities,
         config,
         started: Instant::now(),
         wasm_runs: wasm_runs::Runs::default(),
@@ -1261,6 +1318,16 @@ pub fn router_with_processors(
             axum::routing::post(wasm_runs::start_run).layer(axum::extract::DefaultBodyLimit::max(
                 wasm_runs::MAX_REQUEST_BYTES,
             )),
+        )
+        .route(
+            "/admin/v1/processors",
+            axum::routing::post(processor_changes::add_processor).layer(
+                axum::extract::DefaultBodyLimit::max(wasm_runs::MAX_REQUEST_BYTES),
+            ),
+        )
+        .route(
+            "/admin/v1/processors/{processor}",
+            axum::routing::delete(processor_changes::remove_processor),
         )
         .route(
             "/admin/v1/wasm/runs/{run}/processor",
@@ -1622,9 +1689,10 @@ async fn network_status(
     } else {
         Vec::new()
     };
-    let mut processors = Vec::with_capacity(state.processors.len());
+    let view = state.processors();
+    let mut processors = Vec::with_capacity(view.map.len());
     let mut applied_blocks = 0_u64;
-    for processor in state.processors.values() {
+    for processor in view.map.values() {
         let coverage = coverage(&state, processor.as_ref(), None).await?;
         let store_stats = state
             .store
@@ -1646,7 +1714,7 @@ async fn network_status(
                 required_delivery_bytes: gap.required_delivery_bytes.to_string(),
             });
         let instance = processor.descriptor().instance.to_string();
-        let on_demand = state.config.on_demand_processors.contains(&instance);
+        let on_demand = view.on_demand.contains(&instance);
         let requested_ranges = diagnostic_ranges(
             on_demand,
             &instance,
@@ -1682,11 +1750,7 @@ async fn network_status(
         };
         processors.push(NetworkProcessorStatus {
             id: processor.descriptor().id.to_string(),
-            history_control: if state
-                .config
-                .application_subscription_processors
-                .contains(&instance)
-            {
+            history_control: if view.subscriptions.contains(&instance) {
                 "application_subscriptions"
             } else {
                 "node_owned"
@@ -1914,7 +1978,7 @@ fn processor_summary_with_extensions(
 }
 
 fn processor_summaries(state: &ApiState) -> Vec<ProcessorSummary> {
-    processor_summaries_with_extensions(&state.processors, &state.query_extensions)
+    processor_summaries_with_extensions(&state.processors().map, &state.query_extensions)
 }
 
 fn processor_summaries_with_extensions(
@@ -2111,7 +2175,7 @@ async fn replay_processor_artifacts(
 }
 
 async fn capabilities(State(state): State<ApiState>) -> Json<CapabilitiesResponse> {
-    Json(state.capabilities.as_ref().clone())
+    Json(state.processors().capabilities.clone())
 }
 
 fn backfill_control(state: &ApiState) -> Result<&Arc<dyn BackfillControl>, ApiError> {
@@ -3234,7 +3298,7 @@ fn append_history_metrics(
 async fn append_processor_metrics(output: &mut String, state: &ApiState) -> Result<(), ApiError> {
     use std::fmt::Write as _;
 
-    for processor in state.processors.values() {
+    for processor in state.processors().map.values() {
         let descriptor = processor.descriptor();
         let cursor = state.store.processor_cursor(descriptor).await?;
         let finalized = state.store.finalized_through(descriptor).await?;
@@ -8105,11 +8169,12 @@ fn validate_api_cursor(
 }
 
 fn configured_processor(state: &ApiState, processor: &str) -> Result<Arc<dyn Processor>, ApiError> {
-    if let Some(configured) = state.processors.get(processor) {
+    let view = state.processors();
+    if let Some(configured) = view.map.get(processor) {
         return Ok(configured.clone());
     }
-    let mut by_kind = state
-        .processors
+    let mut by_kind = view
+        .map
         .values()
         .filter(|configured| configured.descriptor().id.as_str() == processor);
     let configured = by_kind.next();
@@ -9519,8 +9584,13 @@ mod tests {
         let state = ApiState {
             store,
             primary: processor.clone(),
-            capabilities: Arc::new(capabilities_response(1, &processors, &query_extensions)),
-            processors,
+            processors: Arc::new(std::sync::RwLock::new(Arc::new(ApiProcessors {
+                capabilities: capabilities_response(1, &processors, &query_extensions),
+                map: Arc::unwrap_or_clone(processors),
+                on_demand: BTreeSet::new(),
+                subscriptions: BTreeSet::new(),
+            }))),
+            processor_changes: Arc::default(),
             query_extensions,
             config: ApiConfig::default(),
             started: Instant::now(),
@@ -9573,6 +9643,327 @@ mod tests {
             ApiConfig::default(),
         )
         .expect("router");
+    }
+
+    /// The node's side of processor changes: it adds `added`, refuses
+    /// `taken`, and removes only `added`.
+    struct FakeAdmin {
+        base: Arc<dyn Processor>,
+        added: Arc<dyn Processor>,
+        calls: std::sync::Mutex<Vec<(Value, usize)>>,
+    }
+
+    #[async_trait]
+    impl ProcessorAdmin for FakeAdmin {
+        async fn add(
+            &self,
+            processor: Value,
+            module: Option<Vec<u8>>,
+        ) -> Result<ProcessorChange, ProcessorAdminError> {
+            let taken = processor["instance"] == "taken";
+            self.calls
+                .lock()
+                .expect("calls")
+                .push((processor, module.map_or(0, |module| module.len())));
+            if taken {
+                return Err(ProcessorAdminError::Conflict(
+                    "leani.toml configures taken".to_owned(),
+                ));
+            }
+            let instance = self.added.descriptor().instance.to_string();
+            Ok(ProcessorChange {
+                instance: instance.clone(),
+                processors: vec![self.base.clone(), self.added.clone()],
+                on_demand: BTreeSet::from([instance]),
+                subscriptions: BTreeSet::new(),
+            })
+        }
+
+        async fn remove(&self, instance: &str) -> Result<ProcessorChange, ProcessorAdminError> {
+            if instance != self.added.descriptor().instance.as_str() {
+                return Err(ProcessorAdminError::NotFound(format!(
+                    "{instance} was not added through the API"
+                )));
+            }
+            Ok(ProcessorChange {
+                instance: instance.to_owned(),
+                processors: vec![self.base.clone()],
+                on_demand: BTreeSet::new(),
+                subscriptions: BTreeSet::new(),
+            })
+        }
+    }
+
+    async fn call(
+        app: &Router,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::AUTHORIZATION, "Bearer secret-token-for-tests")
+            .header(header::CONTENT_TYPE, "application/json");
+        let request = request
+            .body(body.map_or_else(Body::empty, |body| Body::from(body.to_string())))
+            .expect("request");
+        let response = app.clone().oneshot(request).await.expect("response");
+        let status = response.status();
+        let body = to_bytes(response.into_body(), 1 << 20).await.expect("body");
+        (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+    }
+
+    fn instances(body: &Value) -> Vec<String> {
+        body.as_array()
+            .expect("processors")
+            .iter()
+            .map(|processor| processor["instance"].as_str().expect("instance").to_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn processors_added_and_removed_through_the_api_change_what_it_serves() {
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let base: Arc<dyn Processor> = Arc::new(BlockLocalCounter::named("base"));
+        let added: Arc<dyn Processor> = Arc::new(BlockLocalCounter::named("added"));
+        let (base_instance, added_instance) = (
+            base.descriptor().instance.to_string(),
+            added.descriptor().instance.to_string(),
+        );
+        let admin = Arc::new(FakeAdmin {
+            base: base.clone(),
+            added: added.clone(),
+            calls: std::sync::Mutex::default(),
+        });
+        let app = router_with_processors(
+            store,
+            vec![base.clone()],
+            Vec::new(),
+            ApiConfig {
+                bearer_token: Some(Arc::from("secret-token-for-tests")),
+                processor_admin: Some(admin.clone()),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+
+        let unauthorized = app
+            .clone()
+            .oneshot(
+                Request::post("/admin/v1/processors")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{}"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/admin/v1/processors",
+            Some(json!({ "processor": { "id": "wasm", "instance": "added" }, "module": "0x0061736d" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(body["instance"], added_instance.as_str());
+        assert_eq!(
+            admin
+                .calls
+                .lock()
+                .expect("calls")
+                .last()
+                .map(|(_, bytes)| *bytes),
+            Some(4)
+        );
+        let (_, listed) = call(&app, "GET", "/v1/processors", None).await;
+        assert_eq!(
+            instances(&listed["data"]),
+            [added_instance.clone(), base_instance.clone()]
+        );
+        let (_, capabilities) = call(&app, "GET", "/v1/capabilities", None).await;
+        assert_eq!(instances(&capabilities["processors"]).len(), 2);
+        let (_, network) = call(&app, "GET", "/v1/network/status", None).await;
+        let modes = network["processors"]
+            .as_array()
+            .expect("processors")
+            .iter()
+            .map(|processor| {
+                (
+                    processor["id"].as_str().expect("id").to_owned(),
+                    processor["historyMode"]
+                        .as_str()
+                        .expect("history mode")
+                        .to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(modes[added.descriptor().id.as_str()], "on_demand");
+        assert_eq!(modes[base.descriptor().id.as_str()], "automatic");
+
+        let calls = admin.calls.lock().expect("calls").len();
+        let (status, _) = call(
+            &app,
+            "POST",
+            "/admin/v1/processors",
+            Some(json!({ "processor": { "instance": "added" }, "module": "not hex" })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            admin.calls.lock().expect("calls").len(),
+            calls,
+            "refused before the node"
+        );
+        let (status, body) = call(
+            &app,
+            "POST",
+            "/admin/v1/processors",
+            Some(json!({ "processor": { "instance": "taken" } })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+        let (status, body) = call(&app, "DELETE", "/admin/v1/processors/elsewhere", None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+        let (status, body) = call(
+            &app,
+            "DELETE",
+            &format!("/admin/v1/processors/{added_instance}"),
+            None,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (_, listed) = call(&app, "GET", "/v1/processors", None).await;
+        assert_eq!(instances(&listed["data"]), [base_instance]);
+    }
+
+    /// A node's side that serializes its changes as the node does, then
+    /// takes a while to answer for `slow`, as a busy node may.
+    #[derive(Default)]
+    struct SerialAdmin {
+        added: tokio::sync::Mutex<Vec<Arc<dyn Processor>>>,
+    }
+
+    #[async_trait]
+    impl ProcessorAdmin for SerialAdmin {
+        async fn add(
+            &self,
+            processor: Value,
+            _module: Option<Vec<u8>>,
+        ) -> Result<ProcessorChange, ProcessorAdminError> {
+            let instance = processor["instance"].as_str().expect("instance").to_owned();
+            let processors = {
+                let mut added = self.added.lock().await;
+                added.push(Arc::new(leani_testkit::BlockLocalCounter::named(&instance)));
+                added.clone()
+            };
+            if instance == "slow" {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Ok(ProcessorChange {
+                instance: processors
+                    .last()
+                    .expect("added")
+                    .descriptor()
+                    .instance
+                    .to_string(),
+                processors,
+                on_demand: BTreeSet::new(),
+                subscriptions: BTreeSet::new(),
+            })
+        }
+
+        async fn remove(&self, instance: &str) -> Result<ProcessorChange, ProcessorAdminError> {
+            Err(ProcessorAdminError::NotFound(instance.to_owned()))
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_processor_changes_leave_the_newest_view() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let app = router_with_processors(
+            store,
+            vec![Arc::new(leani_testkit::BlockLocalCounter::named("base"))],
+            Vec::new(),
+            ApiConfig {
+                bearer_token: Some(Arc::from("secret-token-for-tests")),
+                processor_admin: Some(Arc::new(SerialAdmin::default())),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let add = |instance: &'static str| {
+            let app = app.clone();
+            async move {
+                call(
+                    &app,
+                    "POST",
+                    "/admin/v1/processors",
+                    Some(json!({ "processor": { "instance": instance } })),
+                )
+                .await
+            }
+        };
+        // Paused after the store opens: its SQLite connections answer on
+        // threads of their own, so a clock paused while they work runs ahead
+        // into their pool timeouts.
+        tokio::time::pause();
+        let slow = tokio::spawn(add("slow"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let (status, body) = add("fast").await;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        assert_eq!(slow.await.expect("slow").0, StatusCode::CREATED);
+        let (_, listed) = call(&app, "GET", "/v1/processors", None).await;
+        assert_eq!(instances(&listed["data"]).len(), 2, "{listed}");
+    }
+
+    #[tokio::test]
+    async fn processor_changes_need_the_nodes_switch() {
+        use leani_testkit::BlockLocalCounter;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let app = router_with_processors(
+            store,
+            vec![Arc::new(BlockLocalCounter::named("base"))],
+            Vec::new(),
+            ApiConfig {
+                bearer_token: Some(Arc::from("secret-token-for-tests")),
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        for (method, path) in [
+            ("POST", "/admin/v1/processors"),
+            ("DELETE", "/admin/v1/processors/base"),
+        ] {
+            let (status, body) = call(&app, method, path, Some(json!({ "processor": {} }))).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}");
+            assert!(
+                body.to_string().contains("allow_processor_changes"),
+                "{method} {path}: {body}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -10173,8 +10564,13 @@ mod tests {
         let state = ApiState {
             store,
             primary: processor.clone(),
-            capabilities: Arc::new(capabilities_response(1, &processors, &query_extensions)),
-            processors,
+            processors: Arc::new(std::sync::RwLock::new(Arc::new(ApiProcessors {
+                capabilities: capabilities_response(1, &processors, &query_extensions),
+                map: Arc::unwrap_or_clone(processors),
+                on_demand: BTreeSet::new(),
+                subscriptions: BTreeSet::new(),
+            }))),
+            processor_changes: Arc::default(),
             query_extensions,
             config: ApiConfig::default(),
             started: Instant::now(),

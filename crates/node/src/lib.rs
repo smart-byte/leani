@@ -1,5 +1,6 @@
 //! Process configuration, command line interface, diagnostics, and lifecycle.
 
+mod added_processors;
 mod benchmark;
 mod block_summaries;
 mod builtin_processors;

@@ -329,6 +329,37 @@ parameters under an existing instance, so a new module version runs as a new
 instance, as a [processor rebuild](/docs/operations/runbook/#processor-rebuild-or-rollback)
 does.
 
+### Add it to a running node
+
+With `api.allow_processor_changes = true` under `[api]`, a running node takes a
+processor through its API, without a restart. The request carries the entry
+above as JSON, which needs only `instance` and `start_block`: the rest takes
+the values above, `id = "wasm"` and version 1.0.0 included. Your own module
+goes in `module`, its bytes as hex (`xxd -p processor.wasm | tr -d '\n'`), or
+name a bundled `template`:
+
+```bash
+curl -s http://127.0.0.1:8080/admin/v1/processors \
+  -H 'content-type: application/json' \
+  -d '{"processor": {"instance": "usdc-transfers", "start_block": 19426589,
+         "settings": {"params": {"tokens": ["0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"],
+                                  "minValue": "1000000000"}}},
+       "template": "erc20-transfers"}'
+```
+
+The node checks the entry as `leani doctor` checks the configuration, keeps it
+in its data directory's `processors.toml` and the module in `modules/`, named
+by its hash, and restarts its network or JSON-RPC lanes in-process to run it.
+Live processing pauses for every processor while the lanes restart and the
+added processor runs the unfinalized blocks the node keeps: about two seconds
+on Ethereum, longer on rollups. Every start loads `processors.toml` after the
+configuration file; an instance configured in both runs as the configuration
+file says, with a warning. `DELETE /admin/v1/processors/usdc-transfers`
+removes an added processor and keeps its stored data. The node refuses a
+second processor of one kind, version, and parameters, which its live lane
+could not tell apart. With `api.bearer_token_env`, send the token as for any
+`/admin/v1` route.
+
 ## The contract
 
 **Manifest.** `manifest(params)` returns the processor's name, its

@@ -1014,6 +1014,19 @@ proxy on the same machine that sets none of them, a remote client's request
 looks local. In production, build modules where you write them, or in CI, and
 configure the module file with its `blake3` hash.
 
+### Processor changes through the API
+
+`api.allow_processor_changes = true` lets `POST /admin/v1/processors` add a
+processor to the running node and `DELETE /admin/v1/processors/{processor}`
+remove one it added; the compact profile takes it under `[api]` too. The node
+keeps added processors in its data directory's `processors.toml`, in the
+`[[processors]]` schema, and their Wasm modules in `modules/`, and loads that
+file after the configuration file on every start. An instance both configure
+runs as the configuration file says, with a warning. Each change restarts the
+network or JSON-RPC lanes in-process: a live pause for every processor.
+Off by default, as a node configured as code should not change beside its
+configuration.
+
 ### Historical CLI and node backfill
 
 `leani backfill --processor INSTANCE --from-block N --to-block M` uses the

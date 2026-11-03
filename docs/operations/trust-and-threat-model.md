@@ -135,6 +135,10 @@ that instance's lane by failing.
   cryptographic completeness proof;
 - event-derived ERC-20 balances do not model rebases or non-standard hidden
   balance changes;
+- processor changes, off unless `api.allow_processor_changes = true`, let a
+  client the API admits run Wasm modules it sends, in the sandbox and limits
+  of configured ones, and keep them across restarts; set
+  `api.bearer_token_env` before the API serves anyone else;
 - node-side Wasm builds, off unless `api.allow_wasm_builds = true`, run the
   host's compilers on posted source. Rust's compiler reads files the source
   names, and only a denylist guards against that, so Rust builds only for
