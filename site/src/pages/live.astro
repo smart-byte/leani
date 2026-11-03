@@ -1,0 +1,499 @@
+---
+import Base from '../layouts/Base.astro';
+import Header from '../components/Header.astro';
+import Footer from '../components/Footer.astro';
+import TerminalFrame from '../components/TerminalFrame.astro';
+import { hlShell, hlToml, hlTs } from '../lib/highlight';
+import { CHAINS, FAMILY_LABELS, STAGES, type Family } from '../lib/live/model';
+
+const families: Family[] = ['op-stack', 'ethereum', 'arbitrum'];
+const anchored = CHAINS.filter((chain) => chain.finality === 'dispute-games' || chain.finality === 'bold');
+const unanchored = CHAINS.filter((chain) => chain.finality === 'none');
+
+const levels = [
+  {
+    level: 'unattested',
+    title: 'Fastest',
+    use: 'UIs that show activity the moment it happens and can take a block back.',
+    toml: 'publish = "unattested"  # the default',
+    cli: 'leani subscribe blocks',
+  },
+  {
+    level: 'attested',
+    title: 'Signed',
+    use: 'Apps that must never act on a block nobody vouched for: Ethereum’s sync committee, or the rollup’s sequencer.',
+    toml: 'publish = "attested"',
+    cli: 'leani subscribe blocks --finality attested',
+  },
+  {
+    level: 'finalized',
+    title: 'Final',
+    use: 'Accounting, bridges, and anything that cannot be undone: Ethereum finality, or Ethereum settling the rollup.',
+    toml: 'publish = "finalized"',
+    cli: 'leani subscribe blocks --finality finalized',
+  },
+];
+
+const sdk = `import { createLeaniClient } from "@smart-byte/leani-sdk";
+
+const leani = createLeaniClient({ baseUrl: "http://127.0.0.1:18080" });
+for await (const change of leani.blocks.subscribe()) {
+  switch (change.operation) {
+    case "apply":     show(change.data, change.finality); break;
+    case "attested":
+    case "finalized": promote(change.data, change.operation); break;
+    case "undo":      remove(change.block); break;
+  }
+}`;
+
+const blobs = `// On an Ethereum node that runs the blobs processor
+for await (const change of leani.blobs.subscribe()) {
+  for (const blob of change.data?.transactions ?? []) {
+    // OP Mainnet's batcher posts to 0xff…0010
+    if (blob.toAddress === OP_BATCH_INBOX) posted(change.block, blob.blobVersionedHashes);
+  }
+}`;
+
+const run = `cd leani/examples/finality-live
+./nodes.sh init ./nodes
+./nodes.sh start ./nodes
+bun hub.ts $(./nodes.sh hub ./nodes) \\
+  --beacon https://ethereum-beacon-api.publicnode.com \\
+  --fcr https://lodestar-mainnet.chainsafe.io --port 8797
+open "https://leani.dev/live?hub=http://127.0.0.1:8797"`;
+---
+<Base
+  title="Finality, live — leani"
+  description="Watch rollup blocks travel to Ethereum as blobs and settle there, live, as leani sees them."
+>
+  <Header slot="before-main" />
+  <section class="hero wrap" aria-labelledby="live-h">
+    <p class="eyebrow mono">Live · rollups on Ethereum</p>
+    <h1 id="live-h">Watch rollup blocks settle on Ethereum.</h1>
+    <p class="lede">
+      Rollup sequencers sign a block every second or faster. Their batchers post the blocks to
+      Ethereum as blobs, Base’s and Robinhood Chain’s every half minute, OP Mainnet’s every few
+      minutes. From then on the blocks are as final as the Ethereum block that carries them:
+      confirmed in about thirteen seconds by the fast confirmation rule, final in about fifteen
+      minutes. Settling them for withdrawals takes days. Every block below is one leani saw.
+    </p>
+    <div class="status mono" role="status">
+      <span class="dot" data-status-dot></span><span data-status>connecting…</span>
+    </div>
+  </section>
+
+  <section class="stage-wrap" aria-label="Live blocks and blobs">
+    <div class="legend wrap mono">
+      <span><i class="swatch block"></i>a rollup block, faint until signed</span>
+      <span><i class="swatch batch"></i>a batch, threaded to its Ethereum block</span>
+      <span><i class="swatch slab"><i></i><i></i><i></i></i>an Ethereum block and its blobs:</span>
+      <span><i class="swatch slab seen"></i>seen</span>
+      <span><i class="swatch slab attested"></i>attested</span>
+      <span><i class="swatch slab confirmed"></i>confirmed, fast confirmation rule</span>
+      <span><i class="swatch slab final"></i>finalized</span>
+      <span><i class="swatch reorg"></i>reorg</span>
+      <span class="buttons">
+        <button type="button" class="toggle" data-expand aria-pressed="false">days of settlement ▸</button>
+        <button type="button" class="toggle" data-toggle hidden>all chains</button>
+      </span>
+    </div>
+    <p class="read wrap">Everything enters at the left, now, and drifts right as it ages; the first minutes get the most room. Ethereum, the settlement layer, runs along the bottom: each block arrives as a capsule with a cell per blob, grey for others’ blobs, and a rollup’s cells fill with its colour once its batch lands in them. The block sinks and settles into a bar on the bed, which turns green once the block is final. Blocks none of these rollups posted in fade. A rollup’s blocks wait in its row until its batcher posts them; then they drop into Ethereum as a blob and leave a bar behind, threaded to the Ethereum block that carries them. Settlement takes days: open the right edge to see it. Hover anything to read it.</p>
+    <div class="stage">
+      <canvas data-canvas aria-hidden="true"></canvas>
+      <div class="tip mono" data-tip hidden></div>
+    </div>
+  </section>
+
+  <section class="section wrap" aria-labelledby="table-h">
+    <h2 id="table-h"><span class="mono"># </span>Right now</h2>
+    <p class="sub">Measured from the blocks above: how long after a block was made leani had it and its signature, and how long until the Ethereum block carrying it was there, confirmed, and final. Times marked ~ use Ethereum’s own until a batch seen live gets there.</p>
+    <div class="now">
+      <div class="table-scroll">
+        <table class="lanes mono">
+          <thead>
+            <tr><th scope="col">chain</th><th scope="col">head</th><th scope="col">block time</th><th scope="col">seen after</th><th scope="col">signed after</th><th scope="col">in a blob after</th><th scope="col">confirmed after</th><th scope="col">final after</th><th scope="col">settled</th></tr>
+          </thead>
+          <tbody data-table>
+            {CHAINS.map((chain) => (
+              <tr data-chain={chain.id}>
+                <th scope="row"><i class="chip" style={`--chain: ${chain.color}`}></i>{chain.label}</th>
+                <td data-cell="head">—</td><td data-cell="block">—</td><td data-cell="seen">—</td>
+                <td data-cell="attested">—</td><td data-cell="posted">—</td><td data-cell="confirmed">—</td>
+                <td data-cell="finalized">—</td><td data-cell="settled">—</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      <aside class="follow" data-follow aria-live="polite">
+        <p class="follow-title mono" data-follow-title>Following a block…</p>
+        <ol class="follow-stages mono" data-follow-stages></ol>
+        <p class="follow-hint">Click any rollup block to follow it.</p>
+      </aside>
+    </div>
+  </section>
+
+  <section class="section wrap" aria-labelledby="stages-h">
+    <h2 id="stages-h"><span class="mono"># </span>What each stage means</h2>
+    <p class="sub">Solid cards are levels leani reports; dashed ones are milestones it does not.</p>
+    <div class="tabs mono" role="tablist">
+      {families.map((family, index) => (
+        <button type="button" role="tab" id={`tab-${family}`} aria-controls={`panel-${family}`} aria-selected={index === 0 ? 'true' : 'false'} data-tab={family}>{FAMILY_LABELS[family]}</button>
+      ))}
+    </div>
+    {families.map((family, index) => (
+      <div class="panel" role="tabpanel" id={`panel-${family}`} aria-labelledby={`tab-${family}`} hidden={index !== 0} data-panel={family}>
+        <ol class="stages">
+          {STAGES[family].map((stage) => (
+            <li class:list={['stage-card', { milestone: stage.level === null }]}>
+              <p class="stage-level mono">{stage.level ?? 'milestone'}<span>{stage.typical}</span></p>
+              <h3>{stage.name}</h3>
+              <p>{stage.evidence}</p>
+              <p class="undo"><span class="mono">undone by</span> {stage.undo}</p>
+            </li>
+          ))}
+        </ol>
+      </div>
+    ))}
+  </section>
+
+  <section class="section wrap" aria-labelledby="consume-h">
+    <h2 id="consume-h"><span class="mono"># </span>Consume the level you need</h2>
+    <p class="sub">A processor publishes from one level up; its stream marks every later rise. Pick the first level your app may act on.</p>
+    <div class="levels">
+      {levels.map((item) => (
+        <article class="level-card">
+          <p class="stage-level mono">{item.level}</p>
+          <h3>{item.title}</h3>
+          <p>{item.use}</p>
+          <pre class="mono"><code set:html={hlToml(item.toml)} /></pre>
+          <pre class="mono"><code set:html={hlShell(item.cli)} /></pre>
+        </article>
+      ))}
+    </div>
+    <p class="sub note">The CLI follows Ethereum Mainnet; on any chain’s node, the SDK reads the same levels from one stream:</p>
+    <TerminalFrame title="every level from one stream">
+      <pre><code set:html={sdk.split('\n').map(hlTs).join('\n')} /></pre>
+    </TerminalFrame>
+    <p class="sub note">The blobs come from leani too: the Ethereum node runs the <code>blobs</code> processor, whose every blob transaction names its sender and the address it posts to. That is how the page knows a blob is OP Mainnet’s; the blobs themselves come from a Beacon API, which the page’s hub decodes into the blocks they carry.</p>
+    <TerminalFrame title="which Ethereum block carries a rollup’s blobs">
+      <pre><code set:html={blobs.split('\n').map(hlTs).join('\n')} /></pre>
+    </TerminalFrame>
+  </section>
+
+  <section class="section wrap bedrock" aria-labelledby="bedrock-h">
+    <h2 id="bedrock-h"><span class="mono"># </span>Two ways to rest on Ethereum</h2>
+    <div class="cols">
+      <div>
+        <p>
+          <strong>Data.</strong> Once the Ethereum block that carries a rollup block’s blob is final,
+          anyone can derive that block from Ethereum, and it can no longer change. Op-stack nodes call
+          such blocks finalized. It takes minutes; the page draws it as a dashed line in each rollup’s
+          row, and leani does not report it as a level.
+        </p>
+        <p>
+          <strong>Settlement.</strong> For withdrawals, Ethereum must also accept the rollup’s claim
+          about its state, after a challenge window of days. That is leani’s <code>finalized</code>
+          for a rollup: it reads the settlement contracts’ logs from finalized Ethereum blocks and
+          their receipts, no RPC trusted. Open the days of settlement at the right edge of the picture
+          to see each rollup’s newest settled block.
+        </p>
+      </div>
+      <ul class="anchors mono">
+        {anchored.map((chain) => <li><i class="chip" style={`--chain: ${chain.color}`}></i>{chain.label}<span>{chain.finality === 'bold' ? 'BoLD, ~6.4 d' : 'dispute games, ~5 d'}</span></li>)}
+        <li class="none">{unanchored.map((chain) => chain.label).join(', ')}<span>its games claim super roots, which leani does not read yet</span></li>
+      </ul>
+    </div>
+  </section>
+
+  <section class="section wrap" aria-labelledby="run-h">
+    <h2 id="run-h"><span class="mono"># </span>Run it yourself</h2>
+    <p class="sub">One node follows one chain. The repository’s example starts an Ethereum node with the blobs processor and one node per rollup, and its hub follows them with the SDK, decodes the op-stack batches, reads each Nitro batch’s blocks from its SequencerInbox call, reads fast confirmations from a beacon node, and streams this page. Op-stack nodes need their gossip port reachable from the internet, so run them on a host with a public address.</p>
+    <TerminalFrame title="shell">
+      <pre><code set:html={run.split('\n').map(hlShell).join('\n')} /></pre>
+    </TerminalFrame>
+  </section>
+  <Footer slot="after-main" />
+</Base>
+
+<script>
+  import { Scene, duration, type Journey, type Passage } from '../lib/live/scene';
+  import { liveFeed, replayFeed, type Feed, type Recording } from '../lib/live/feed';
+  import { CHAINS, STAGES, type Chain, type Level } from '../lib/live/model';
+
+  const canvas = document.querySelector<HTMLCanvasElement>('[data-canvas]')!;
+  const tip = document.querySelector<HTMLElement>('[data-tip]')!;
+  const status = document.querySelector<HTMLElement>('[data-status]')!;
+  const dot = document.querySelector<HTMLElement>('[data-status-dot]')!;
+  const toggle = document.querySelector<HTMLButtonElement>('[data-toggle]')!;
+  const expand = document.querySelector<HTMLButtonElement>('[data-expand]')!;
+  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+  let feed: Feed | null = null;
+  let present: string[] = CHAINS.map((chain) => chain.id);
+
+  const selectFamily = (family: string) => {
+    for (const tab of document.querySelectorAll<HTMLElement>('[data-tab]')) {
+      tab.setAttribute('aria-selected', String(tab.dataset.tab === family));
+    }
+    for (const panel of document.querySelectorAll<HTMLElement>('[data-panel]')) {
+      panel.hidden = panel.dataset.panel !== family;
+    }
+  };
+  for (const tab of document.querySelectorAll<HTMLElement>('[data-tab]')) {
+    tab.addEventListener('click', () => selectFamily(tab.dataset.tab!));
+  }
+
+  const number = (value: number) => value.toLocaleString('en-US');
+  const time = (seconds: number) => (seconds < 0.1 ? '<0.1 s' : duration(seconds));
+  const label = (id: string) => CHAINS.find((chain) => chain.id === id)?.label ?? id;
+  const levelName = (chain: Chain, level: Level) => ({
+    unattested: 'seen, unattested',
+    attested: chain.family === 'ethereum' ? 'attested by the sync committee' : 'signed by the sequencer',
+    confirmed: 'confirmed by the fast confirmation rule',
+    finalized: chain.family === 'ethereum' ? 'finalized' : 'settled on Ethereum',
+  })[level];
+  const scene = new Scene(canvas, {
+    now: () => feed?.now() ?? Date.now(),
+    reducedMotion,
+    onSelect: (chain) => {
+      selectFamily(chain.family);
+      document.getElementById('stages-h')?.scrollIntoView({ behavior: reducedMotion ? 'auto' : 'smooth' });
+    },
+    onExpand: (expanded) => {
+      expand.setAttribute('aria-pressed', String(expanded));
+      expand.textContent = expanded ? '◂ last 30 min' : 'days of settlement ▸';
+    },
+    onHover: (hover) => {
+      if (!hover) {
+        tip.hidden = true;
+        return;
+      }
+      const { block, chain, batch } = hover;
+      const lines = [`<b style="color:${chain.color}">${chain.label}</b> ${block ? `#${number(block.number)}` : 'batch'}`];
+      if (block) {
+        lines.push(`${levelName(chain, block.level)} · ${duration(block.age)} old`);
+        if (block.txs !== null) lines.push(`${block.txs} txs${block.gas === null ? '' : ` · ${Math.round(block.gas * 100)}% gas`}`);
+        const blobs = Object.entries(block.blobs ?? {});
+        if (blobs.length) lines.push(blobs.map(([source, count]) => `${count} blob${count === 1 ? '' : 's'} ${source === 'other' ? 'from others' : `from ${label(source)}`}`).join('<br>'));
+      }
+      if (batch) {
+        lines.push(`blocks #${number(batch.first)}–${number(batch.last)}: ${number(batch.last - batch.first + 1)}${batch.txs ? `, ${number(batch.txs)} txs` : ''}`);
+        lines.push(`${batch.blobs ? `${batch.blobs} blobs on ` : 'in '}Ethereum #${number(batch.l1)}${batch.bytes ? ` · ${(batch.raw / batch.bytes).toFixed(1)}× compressed` : ''}`);
+        if (batch.source === 'inbox') lines.push('named by its SequencerInbox call');
+        if (batch.verified) lines.push('its parent hash matches the block leani has');
+      }
+      if (block?.hash) lines.push(`${block.hash.slice(0, 10)}…${block.hash.slice(-6)}`);
+      tip.hidden = false;
+      tip.innerHTML = lines.join('<br>');
+      const left = Math.min(hover.x + 14, canvas.clientWidth - 230);
+      const top = Math.min(hover.y + 14, canvas.clientHeight - tip.offsetHeight - 8);
+      tip.style.transform = `translate(${left}px, ${top}px)`;
+    },
+  });
+  expand.addEventListener('click', () => scene.expand(expand.getAttribute('aria-pressed') !== 'true'));
+
+  const narrow = window.matchMedia('(max-width: 720px)');
+  const few = ['op-mainnet', 'base-mainnet', 'ethereum-mainnet', 'arbitrum-one'];
+  let all = !narrow.matches;
+  const applyVisible = () => {
+    const shown = all ? present : present.filter((chain) => few.includes(chain));
+    scene.show(shown);
+    toggle.hidden = !narrow.matches || shown.length === present.length;
+    toggle.textContent = all ? 'fewer chains' : 'all chains';
+  };
+  toggle.addEventListener('click', () => {
+    all = !all;
+    applyVisible();
+  });
+  narrow.addEventListener('change', () => {
+    all = !narrow.matches;
+    applyVisible();
+  });
+
+  const handlers = {
+    event: (event: Parameters<Scene['handle']>[0]) => scene.handle(event),
+    reset: () => scene.reset(),
+    state: (connected: boolean) => dot.classList.toggle('on', connected),
+    chains: (chains: string[]) => {
+      present = CHAINS.map((chain) => chain.id).filter((chain) => chains.includes(chain));
+      applyVisible();
+    },
+  };
+  const hub = new URLSearchParams(location.search).get('hub');
+  let source = '';
+  if (hub) {
+    feed = liveFeed(hub, handlers);
+    source = `live from ${new URL(hub).host}`;
+  } else {
+    try {
+      const response = await fetch('/live/replay.json.gz');
+      if (!response.ok || !response.body) throw new Error(String(response.status));
+      const recording = (await new Response(response.body.pipeThrough(new DecompressionStream('gzip'))).json()) as Recording;
+      feed = replayFeed(recording, handlers);
+      source = `replay of ${new Date(recording.recordedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
+    } catch {
+      source = 'no live hub and no recording';
+    }
+  }
+
+  const put = (element: HTMLElement | null | undefined, value: string) => {
+    if (element && element.textContent !== value) element.textContent = value;
+  };
+  const range = (pair: [number, number] | null) => (pair ? `${duration(pair[0])} – ${duration(pair[1])}` : '—');
+  const about = (estimated: boolean) => (estimated ? '~' : '');
+  const settleTypical = (chain: Chain) => STAGES[chain.family].find((stage) => stage.level === 'finalized')?.typical ?? '—';
+
+  const followTitle = document.querySelector<HTMLElement>('[data-follow-title]')!;
+  const followStages = document.querySelector<HTMLElement>('[data-follow-stages]')!;
+  const showJourney = (journey: Journey | null) => {
+    if (!journey) return;
+    const at = (ms: number | null) => (ms === null ? null : Math.max(0, ms / 1000 - journey.born));
+    const rows: [string, number | null, string][] = [
+      ['signed', at(journey.attestedAt ?? journey.seen), journey.chain.family === 'arbitrum' ? 'in the sequencer feed' : 'by the sequencer'],
+      ['in a blob', journey.batch ? Math.max(0, journey.batch.l1Time - journey.born) : null, journey.batch ? `Ethereum #${number(journey.batch.l1)}${journey.batch.blobs ? ` · ${journey.batch.blobs} blobs` : ''}` : 'waiting for the batcher'],
+      ['confirmed on Ethereum', at(journey.l1?.confirmedAt ?? null), journey.l1 ? 'fast confirmation rule' : ''],
+      ['final on Ethereum', at(journey.l1?.finalizedAt ?? null), journey.l1?.finalizedAt ? 'its data can no longer change' : 'about 15 min after posting'],
+      ['settled', null, journey.chain.finality === 'none' ? 'not read for this chain yet' : `${settleTypical(journey.chain)}, ${journey.chain.finality === 'bold' ? 'by BoLD' : 'by dispute game'}`],
+    ];
+    put(followTitle, `${journey.chain.label} #${number(journey.number)}${journey.txs === null ? '' : ` · ${journey.txs} txs`}`);
+    const html = rows.map(([name, seconds, detail]) =>
+      `<li class="${seconds === null ? 'pending' : 'done'}"><span>${name}</span><b>${seconds === null ? '…' : seconds < 0.1 ? time(seconds) : `+${time(seconds)}`}</b><em>${detail}</em></li>`).join('');
+    if (followStages.innerHTML !== html) followStages.innerHTML = html;
+  };
+
+  const cells = new Map(
+    [...document.querySelectorAll<HTMLElement>('[data-chain]')].map((row) => [row.dataset.chain!, row]),
+  );
+  const rollupCells = (passage: Passage | null) => {
+    if (!passage) return { posted: '—', confirmed: '—', finalized: '—' };
+    const posted = passage.postedAfter;
+    const confirmed = posted && passage.confirmedAfterPosting !== null
+      ? `${about(passage.estimated.confirmed)}${range([posted[0] + passage.confirmedAfterPosting, posted[1] + passage.confirmedAfterPosting])}`
+      : '—';
+    return {
+      posted: posted ? `${range(posted)}${passage.every ? ` · every ${duration(passage.every)}` : ''}` : 'no batch yet',
+      confirmed,
+      finalized: passage.finalAfter ? `${about(passage.estimated.final)}${range(passage.finalAfter)}` : '—',
+    };
+  };
+  const refresh = () => {
+    const summaries = scene.summaries();
+    const following = summaries.filter((summary) => summary.head !== null).length;
+    status.textContent = `${source} · ${following} of ${present.length} chains`;
+    for (const summary of summaries) {
+      const row = cells.get(summary.chain.id);
+      if (!row) continue;
+      row.hidden = !present.includes(summary.chain.id);
+      row.classList.toggle('quiet', summary.head === null);
+      const cell = (name: string) => row.querySelector<HTMLElement>(`[data-cell="${name}"]`);
+      put(cell('head'), summary.head === null ? '—' : `#${number(summary.head)}`);
+      put(cell('block'), summary.blockSeconds === null ? '—' : duration(summary.blockSeconds));
+      put(cell('seen'), summary.seen === null ? '—' : duration(summary.seen));
+      put(cell('attested'), summary.attested === null ? '—' : duration(summary.attested));
+      if (summary.chain.family === 'ethereum') {
+        put(cell('posted'), 'is the settlement layer');
+        put(cell('confirmed'), summary.confirmed === null ? '—' : duration(summary.confirmed));
+        put(cell('finalized'), summary.finalized === null ? '—' : duration(summary.finalized));
+        put(cell('settled'), '—');
+        continue;
+      }
+      const values = rollupCells(scene.passage(summary.chain.id));
+      put(cell('posted'), values.posted);
+      put(cell('confirmed'), values.confirmed);
+      put(cell('finalized'), values.finalized);
+      put(cell('settled'), summary.chain.finality === 'none'
+        ? 'not read yet'
+        : summary.finalizedAge !== null ? `newest ${duration(summary.finalizedAge)} old` : settleTypical(summary.chain));
+    }
+    const focus = summaries.find((summary) => summary.chain.family !== 'ethereum' && present.includes(summary.chain.id) && summary.connected);
+    showJourney(scene.journey(focus?.chain.id ?? 'op-mainnet'));
+  };
+  refresh();
+  window.setInterval(refresh, 1000);
+</script>
+
+<style>
+  .hero { padding-block: 3.5rem 1.5rem; }
+  .hero h1 { font-size: clamp(2rem, 5vw, 3.4rem); margin-block: 0.6rem 1rem; max-width: 22ch; }
+  .lede { max-width: 46rem; color: var(--ink-dim); font-size: 1.08rem; }
+  .status { margin-top: 1.25rem; display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; color: var(--ink-dim); border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; }
+  .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #536b5e; }
+  .status .dot:global(.on) { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+
+  .now { display: grid; grid-template-columns: minmax(0, 1fr) minmax(15rem, 20rem); gap: 1rem; align-items: start; }
+  .follow { background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 0.75rem 0.9rem; }
+  .follow-title { font-size: 0.8rem; color: #ff8a95; }
+  .follow-stages { list-style: none; padding: 0; margin: 0.45rem 0 0; font-size: 0.72rem; display: grid; gap: 0.25rem; }
+  .follow-stages :global(li) { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0 0.6rem; align-items: baseline; }
+  .follow-stages :global(li.pending) { color: #536b5e; }
+  .follow-stages :global(li b) { font-weight: 600; color: var(--accent); }
+  .follow-stages :global(li.pending b) { color: #536b5e; }
+  .follow-stages :global(li em) { grid-column: 1 / -1; font-style: normal; color: var(--ink-dim); font-size: 0.68rem; }
+  .follow-hint { font-size: 0.7rem; color: var(--ink-dim); margin-top: 0.5rem; }
+
+  .stage-wrap { border-block: 1px solid var(--panel-edge); background: #0b0f0d; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; padding-block: 0.8rem; font-size: 0.74rem; color: var(--ink-dim); align-items: center; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; }
+  .swatch.block { background: #ff4d5e; width: 8px; height: 8px; border-radius: 1px; }
+  .swatch.batch { width: 18px; height: 4px; border-radius: 1px; background: #ff4d5e; opacity: 0.7; }
+  .swatch.slab { width: 26px; height: 10px; border: 1.2px solid #9aa8ff; background: #9aa8ff2a; display: inline-flex; gap: 2px; padding: 1.5px; }
+  .swatch.slab i { width: 3px; background: #3d7bff; }
+  .swatch.slab i:first-child { background: #ff4d5e; }
+  .swatch.slab.seen { width: 18px; background: #9aa8ff10; }
+  .swatch.slab.attested { width: 18px; }
+  .swatch.slab.confirmed { width: 18px; background: #9aa8ff4d; border: 1.6px solid #d6dbff; }
+  .swatch.slab.final { width: 18px; background: #2b3c33; border-color: var(--accent); }
+  .swatch.reorg { background: #ff5c5c; transform: rotate(45deg) scale(0.75); }
+  .read { color: var(--ink-dim); font-size: 0.8rem; padding-bottom: 0.6rem; max-width: 70rem; }
+  .buttons { margin-left: auto; display: inline-flex; gap: 0.5rem; }
+  .toggle { font: inherit; color: var(--accent); background: none; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
+  .stage { position: relative; max-width: 96rem; margin-inline: auto; }
+  canvas { display: block; width: 100%; height: 552px; cursor: crosshair; }
+  .tip { position: absolute; top: 0; left: 0; pointer-events: none; background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--panel-edge); border-radius: 8px; padding: 0.45rem 0.6rem; font-size: 0.72rem; line-height: 1.45; color: var(--ink); min-width: 200px; max-width: 300px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.45); }
+
+  .sub { color: var(--ink-dim); max-width: 46rem; margin-block: 0.6rem 1.5rem; }
+  .sub code, .bedrock code { font-size: 0.85em; }
+  .table-scroll { overflow-x: auto; border: 1px solid var(--panel-edge); border-radius: 10px; }
+  .lanes { width: 100%; border-collapse: collapse; font-size: 0.78rem; }
+  .lanes th, .lanes td { padding: 0.5rem 0.75rem; text-align: right; white-space: nowrap; border-bottom: 1px solid var(--panel-edge); }
+  .lanes th:first-child, .lanes td.source { text-align: left; }
+  .lanes thead th { color: var(--ink-dim); font-weight: 500; }
+  .lanes tbody tr:last-child > * { border-bottom: 0; }
+  .lanes tr.quiet { color: #536b5e; }
+  .lanes .source { color: var(--ink-dim); }
+  .chip { display: inline-block; width: 9px; height: 9px; border-radius: 2px; background: var(--chain); margin-right: 0.55rem; }
+
+  .tabs { display: flex; gap: 0.4rem; flex-wrap: wrap; margin-bottom: 1rem; }
+  .tabs button { font: inherit; font-size: 0.82rem; color: var(--ink-dim); background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 8px; padding: 0.45rem 0.9rem; cursor: pointer; }
+  .tabs button[aria-selected='true'] { color: var(--bg); background: var(--accent); border-color: var(--accent); }
+  .stages { list-style: none; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(14rem, 1fr)); gap: 0.9rem; counter-reset: stage; }
+  .stage-card, .level-card { background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1rem 1.1rem; }
+  .stage-card.milestone { background: transparent; border-style: dashed; }
+  .stage-card h3, .level-card h3 { font-size: 1.05rem; margin-block: 0.3rem 0.5rem; }
+  .stage-card p, .level-card p { color: var(--ink-dim); font-size: 0.9rem; }
+  .stage-level { display: flex; justify-content: space-between; gap: 0.6rem; color: var(--accent); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .stage-level span { color: var(--ink-dim); text-transform: none; letter-spacing: 0; text-align: right; }
+  .milestone .stage-level { color: var(--ink-dim); }
+  .undo { margin-top: 0.6rem; font-size: 0.82rem !important; }
+  .undo .mono { color: var(--ink); font-size: 0.72rem; margin-right: 0.3rem; }
+
+  .levels { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.9rem; margin-bottom: 1.2rem; }
+  .level-card pre { margin-top: 0.7rem; font-size: 0.76rem; background: #0b0f0d; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.5rem 0.65rem; overflow-x: auto; }
+  .note { margin-top: 1.6rem; }
+  .term pre { font-size: 0.8rem; line-height: 1.6; overflow-x: auto; }
+
+  .bedrock .cols { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 2rem; }
+  .bedrock p { color: var(--ink-dim); max-width: 40rem; margin-bottom: 0.9rem; }
+  .bedrock strong { color: var(--ink); }
+  .anchors { list-style: none; padding: 0; font-size: 0.82rem; }
+  .anchors li { display: flex; align-items: center; flex-wrap: wrap; gap: 0.3rem 0.5rem; padding-block: 0.55rem; border-bottom: 1px solid var(--panel-edge); }
+  .anchors li span { margin-left: auto; color: var(--ink-dim); }
+  .anchors li.none { color: var(--ink-dim); }
+  @media (max-width: 1100px) {
+    .now { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 720px) {
+    .bedrock .cols { grid-template-columns: 1fr; }
+  }
+</style>
