@@ -51,6 +51,10 @@ const REDIAL_AFTER: Duration = Duration::from_secs(60);
 const KEPT_CARRIERS: usize = 32;
 /// Without a signed block this long, redial the peers that carried them.
 const STALL_AFTER: Duration = Duration::from_secs(10);
+/// While signed blocks arrive, discovery looks for peers only this often:
+/// each lookup asks fresh peers over UDP, and a home router keeps state for
+/// every one.
+const DELIVERING_REDISCOVERY: Duration = Duration::from_secs(60);
 /// Message-id domains for payloads that do and do not decompress.
 const VALID_SNAPPY_DOMAIN: [u8; 4] = [1, 0, 0, 0];
 const INVALID_SNAPPY_DOMAIN: [u8; 4] = [0, 0, 0, 0];
@@ -409,15 +413,15 @@ pub async fn follow(
 
     let (blocks, received) = mpsc::channel(256);
     let (found, mut candidates) = mpsc::channel(64);
+    let (delivering, delivering_for_discovery) = watch::channel(false);
     let discovery_cancellation = cancellation.clone();
     let rediscovery_interval = config.rediscovery_interval;
     let chain_id = config.chain_id;
     // A lookup takes seconds; the swarm must keep running meanwhile.
     tokio::spawn(async move {
-        let mut rediscover = tokio::time::interval(rediscovery_interval);
-        let round = async {
-            loop {
-                rediscover.tick().await;
+        let rounds = rediscover(rediscovery_interval, delivering_for_discovery, || {
+            let (discovery, found) = (&discovery, &found);
+            async move {
                 let lookups = (0..LOOKUPS).map(|_| discovery.find_node(NodeId::random()));
                 let records = futures::future::join_all(lookups)
                     .await
@@ -430,14 +434,15 @@ pub async fn follow(
                 debug!(candidates = records.len(), "op-stack gossip discovery");
                 for record in records {
                     if found.send(record).await.is_err() {
-                        return;
+                        return false;
                     }
                 }
+                true
             }
-        };
+        });
         tokio::select! {
             () = discovery_cancellation.cancelled() => {}
-            () = round => {}
+            () = rounds => {}
         }
         // Frees the UDP port for a restarted lane.
         discovery.shutdown();
@@ -465,11 +470,18 @@ pub async fn follow(
         let mut listening = HashMap::<PeerId, Multiaddr>::new();
         let mut last_block = Instant::now();
         let mut stalled = false;
+        let pace = |last_block: Instant| {
+            delivering.send_if_modified(|delivering| {
+                let next = last_block.elapsed() < STALL_AFTER;
+                std::mem::replace(delivering, next) != next
+            });
+        };
         let mut stall_check = tokio::time::interval(STALL_AFTER);
         loop {
             tokio::select! {
                 () = cancellation.cancelled() => return,
                 _ = stall_check.tick() => {
+                    pace(last_block);
                     if last_block.elapsed() < STALL_AFTER {
                         continue;
                     }
@@ -553,6 +565,7 @@ pub async fn follow(
                                 if std::mem::replace(&mut stalled, false) {
                                     info!("signed blocks arrive again");
                                 }
+                                pace(last_block);
                                 if let Some(address) = listening.get(&propagation_source)
                                     && carriers.record(propagation_source, address.clone())
                                     && let Some(path) = &config.peers_path
@@ -586,6 +599,30 @@ pub async fn follow(
         }
     });
     Ok(received)
+}
+
+/// Run a discovery `round`, then the next one `interval` later, or
+/// [`DELIVERING_REDISCOVERY`] later while signed blocks are `delivering`. A
+/// change of `delivering` starts the next round at once. Ends when a round
+/// returns `false` or the swarm drops `delivering`.
+async fn rediscover<Round: Future<Output = bool>>(
+    interval: Duration,
+    mut delivering: watch::Receiver<bool>,
+    mut round: impl FnMut() -> Round,
+) {
+    loop {
+        if !round().await {
+            return;
+        }
+        let pace = if *delivering.borrow_and_update() {
+            DELIVERING_REDISCOVERY
+        } else {
+            interval
+        };
+        if let Ok(Err(_)) = tokio::time::timeout(pace, delivering.changed()).await {
+            return;
+        }
+    }
 }
 
 /// Publish every signed block as the live lane's attested head, and keep the
@@ -778,6 +815,37 @@ mod tests {
         let (peer_id, address) = peer_address(&record).expect("dialable");
         assert_eq!(peer_id, keypair.public().to_peer_id());
         assert_eq!(address.to_string(), "/ip4/1.2.3.4/tcp/9222");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn discovery_slows_down_while_signed_blocks_arrive() {
+        let (delivering, receiver) = watch::channel(false);
+        let (rounds, mut ran) = mpsc::unbounded_channel();
+        let discovery = tokio::spawn(rediscover(Duration::from_secs(5), receiver, move || {
+            let rounds = rounds.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                rounds.send(()).is_ok()
+            }
+        }));
+        let mut count = move || std::iter::from_fn(|| ran.try_recv().ok()).count();
+        tokio::time::sleep(Duration::from_secs(11)).await;
+        assert_eq!(count(), 3, "every 5 s while no signed block arrives");
+        delivering.send_replace(true);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(count(), 1, "a round as signed blocks start");
+        tokio::time::sleep(Duration::from_secs(58)).await;
+        assert_eq!(count(), 0, "none for a minute while they arrive");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(count(), 1, "one a minute while they arrive");
+        delivering.send_replace(false);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(count(), 1, "a round at once when they stop");
+        drop(delivering);
+        tokio::time::timeout(Duration::from_secs(60), discovery)
+            .await
+            .expect("discovery ends with the swarm")
+            .expect("discovery task");
     }
 
     #[test]
