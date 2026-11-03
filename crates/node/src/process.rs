@@ -5319,6 +5319,8 @@ fn aws_public_source(
         .with_context(|| format!("{} has no public dataset", chain.name))?;
     aws.priority = source.priority;
     aws.chunk_blocks = source.chunk_blocks;
+    aws.cache_directory = Some(config.data_dir.clone());
+    aws.cache_bytes = config.budgets.temporary_disk_bytes;
     if let Some(endpoint) = &source.endpoint {
         aws.bucket = endpoint.clone();
     }
@@ -5349,6 +5351,8 @@ async fn probe_aws(
     if let Some(endpoint) = endpoint {
         aws.bucket = endpoint;
     }
+    aws.cache_directory = Some(std::env::temp_dir());
+    aws.cache_bytes = max_input_bytes;
     let source = leani_source_aws::AwsPublicSource::new(&aws)?;
     let mut filters = leani_source_api::FilterSet::default();
     for address in addresses {

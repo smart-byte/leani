@@ -982,9 +982,6 @@ pub(crate) async fn run_real_source(
         .validate()
         .map_err(|errors| anyhow!(errors))?
         .into_inner();
-    if config.chain.chain_id != 1 {
-        bail!("real-source benchmarks currently support Ethereum mainnet only");
-    }
     let database_path = options.data_dir.join("leani.sqlite");
     if database_path.exists() {
         bail!(
@@ -1056,6 +1053,7 @@ pub(crate) async fn run_real_source(
     let (job, stream_id) = create_real_source_subscription(
         &store,
         processor.as_ref(),
+        ChainId(config.chain.chain_id),
         range,
         verification_policy,
         &limits,
@@ -1083,9 +1081,14 @@ pub(crate) async fn run_real_source(
             &limits,
         ),
     };
-    let server =
-        BenchmarkApiServer::start_with(store.clone(), processor.clone(), control, limits.api)
-            .await?;
+    let server = BenchmarkApiServer::start_with(
+        store.clone(),
+        processor.clone(),
+        job.request.chain_id,
+        control,
+        limits.api,
+    )
+    .await?;
     let pruner =
         BenchmarkDeliveryPruner::start(store.clone(), processor.descriptor().clone(), stream_id);
     let sampler = Sampler::start_real(
@@ -1561,6 +1564,7 @@ fn configured_real_delivery_limits(
 async fn create_real_source_subscription(
     store: &SqliteStore,
     processor: &dyn Processor,
+    chain_id: ChainId,
     range: BlockRange,
     verification_policy: VerificationPolicy,
     limits: &RealDeliveryLimits,
@@ -1581,7 +1585,7 @@ async fn create_real_source_subscription(
     let mut job = BackfillJob::for_processor(
         subscription_id.clone(),
         processor,
-        ChainId(1),
+        chain_id,
         range,
         verification_policy,
     )?;
@@ -4407,6 +4411,7 @@ impl BenchmarkApiServer {
         Self::start_with(
             fixture.store.clone(),
             processor,
+            fixture.job.request.chain_id,
             control,
             api_delivery_batch_limits(options),
         )
@@ -4416,6 +4421,7 @@ impl BenchmarkApiServer {
     async fn start_with(
         store: SqliteStore,
         processor: Arc<dyn Processor>,
+        chain_id: ChainId,
         control: BenchmarkBackfillControl,
         history_batch_limits: DeliveryBatchLimits,
     ) -> Result<Self> {
@@ -4424,6 +4430,7 @@ impl BenchmarkApiServer {
             vec![processor],
             Vec::new(),
             ApiConfig {
+                chain_id,
                 stream_batch_size: 10_000,
                 stream_poll_interval: Duration::from_millis(1),
                 heartbeat_interval: Duration::from_secs(1),
@@ -4639,6 +4646,8 @@ async fn consume_subscription_http(
     };
     let mut hasher = blake3::Hasher::new();
     let mut session_token = None;
+    // The lease's length and when it was last renewed.
+    let mut lease: Option<(Duration, Instant)> = None;
     let mut buffer = Vec::new();
     let mut gzip_decoder = gzip_response.then(|| flate2::write::GzDecoder::new(Vec::new()));
     let mut chunks = response.bytes_stream();
@@ -4694,6 +4703,13 @@ async fn consume_subscription_http(
                             .context("benchmark hello has no session token")?
                             .to_owned(),
                     );
+                    let ttl = record
+                        .get("leaseTtlMs")
+                        .and_then(serde_json::Value::as_str)
+                        .context("benchmark hello has no lease TTL")?
+                        .parse::<u64>()
+                        .context("benchmark hello lease TTL is invalid")?;
+                    lease = Some((Duration::from_millis(ttl), Instant::now()));
                 }
                 "batch" => {
                     measurement
@@ -4806,6 +4822,14 @@ async fn consume_subscription_http(
                 }
                 other => bail!("unexpected benchmark delivery record {other}"),
             }
+            // As the SDK does: a stream that waits longer than the lease for
+            // its next batch would otherwise lose its session.
+            if let (Some((ttl, renewed)), Some(token)) = (lease.as_mut(), session_token.as_deref())
+                && renewed.elapsed() >= *ttl / 3
+            {
+                renew_http_lease(&client, base_url, subscription_id, consumer_id, token).await?;
+                *renewed = Instant::now();
+            }
         }
         if stream_ended {
             break;
@@ -4827,6 +4851,32 @@ fn drain_gzip_output(decoder: &mut flate2::write::GzDecoder<Vec<u8>>, destinatio
     let output_bytes = decoder.get_mut();
     destination.extend_from_slice(output_bytes);
     output_bytes.clear();
+}
+
+async fn renew_http_lease(
+    client: &reqwest::Client,
+    base_url: &str,
+    subscription_id: &str,
+    consumer_id: &str,
+    session_token: &str,
+) -> Result<()> {
+    let url = format!(
+        "{base_url}v1/backfill-subscriptions/{subscription_id}/consumers/{consumer_id}/lease"
+    );
+    let response = client
+        .post(url)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header("x-leani-request", "1")
+        .header("x-leani-consumer-session", session_token)
+        .send()
+        .await
+        .context("renew benchmark consumer lease")?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        bail!("benchmark lease renewal returned {status}: {body}");
+    }
+    Ok(())
 }
 
 async fn acknowledge_http_cursor(
@@ -8090,5 +8140,139 @@ mod tests {
             assert_eq!(microbatched.digest, isolated.digest);
             assert_eq!(microbatched.payload_bytes, isolated.payload_bytes);
         }
+    }
+
+    fn fixture_rollup_processor() -> Arc<dyn Processor> {
+        let rollup = leani_processor_rollup_txs::RollupTxsProcessor::new(
+            leani_processor_rollup_txs::RollupTxsConfig {
+                network: "mainnet".to_owned(),
+                start_block: BlockNumber(20_000_000),
+                rules: vec![leani_processor_rollup_txs::Rule {
+                    rollup: "fixture".to_owned(),
+                    purpose: leani_processor_rollup_txs::Purpose::Data,
+                    to: leani_primitives::Address::new([7; 20]),
+                    from: None,
+                    selector: None,
+                    chain_id_arg: None,
+                    since: None,
+                    until: None,
+                }],
+            },
+        )
+        .expect("rollup-txs");
+        let descriptor = rollup.descriptor().clone();
+        let rollup = rollup.with_contract(
+            leani_processor_api::ProcessorInstanceId::new("rollup-fixture").expect("instance"),
+            descriptor.publication,
+            descriptor.lifecycle,
+        );
+        externalized_real_source_processor(&rollup).expect("real-source processor")
+    }
+
+    #[tokio::test]
+    async fn real_source_jobs_request_the_configured_chain() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let processor = fixture_rollup_processor();
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register");
+        let limits = RealDeliveryLimits {
+            api: DeliveryBatchLimits::history_default(),
+            store: BackfillDeliveryBatchLimits::default(),
+        };
+        let range =
+            BlockRange::new(BlockNumber(20_000_000), BlockNumber(20_000_009)).expect("range");
+        let (job, _) = create_real_source_subscription(
+            &store,
+            processor.as_ref(),
+            ChainId(8_453),
+            range,
+            VerificationPolicy::TrustedDataset,
+            &limits,
+            "destination",
+        )
+        .await
+        .expect("subscription");
+        assert_eq!(job.request.chain_id, ChainId(8_453));
+    }
+
+    #[tokio::test]
+    async fn http_consumer_renews_its_lease_while_the_stream_waits() {
+        let renewals = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&renewals);
+        let consumer = "/v1/backfill-subscriptions/fixture/consumers/destination";
+        let router = axum::Router::new()
+            .route(
+                &format!("{consumer}/stream"),
+                axum::routing::get(|| async {
+                    let mut records =
+                        vec![r#"{"type":"hello","sessionToken":"session","leaseTtlMs":"300"}"#];
+                    records.extend(std::iter::repeat_n(r#"{"type":"heartbeat"}"#, 10));
+                    records.push(r#"{"type":"backfill_complete","cursor":"1"}"#);
+                    axum::body::Body::from_stream(futures::stream::iter(records).then(
+                        |record| async move {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            Ok::<_, std::convert::Infallible>(format!("{record}\n"))
+                        },
+                    ))
+                }),
+            )
+            .route(
+                &format!("{consumer}/lease"),
+                axum::routing::post(move |headers: axum::http::HeaderMap| {
+                    // As the node does, refuse a mutating request without
+                    // its marker.
+                    let marked = headers
+                        .get("x-leani-request")
+                        .is_some_and(|value| value == "1");
+                    if marked {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    }
+                    async move {
+                        if marked {
+                            axum::http::StatusCode::OK
+                        } else {
+                            axum::http::StatusCode::UNSUPPORTED_MEDIA_TYPE
+                        }
+                    }
+                }),
+            )
+            .route(
+                &format!("{consumer}/ack"),
+                axum::routing::post(|| async {
+                    axum::Json(serde_json::json!({ "acknowledgedSequence": "1" }))
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let base_url = format!("http://{}/", listener.local_addr().expect("address"));
+        tokio::spawn(async move { axum::serve(listener, router).await });
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        consume_subscription_http(
+            &store,
+            &base_url,
+            "fixture",
+            "destination",
+            0,
+            BenchmarkCompression::None,
+            Instant::now(),
+        )
+        .await
+        .expect("delivery completes");
+        // About a second of heartbeats against a 300 ms lease.
+        let renewed = renewals.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(renewed >= 2, "renewed {renewed} times");
     }
 }

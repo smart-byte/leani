@@ -18,11 +18,13 @@ rpc_endpoints = [
 history_sources = ["aws_public", "json_rpc"]
 
 # SonarX's export on AWS Open Data. Classic blocks before the Nitro
-# genesis hash differently.
+# genesis hash differently. A day of about 320,000 blocks fits the default
+# memory budget, but chunks of 100,000 overlap and deliver sooner.
 [public_dataset]
 layout = "sonarx-evm-v1"
 prefix = "v1.1/sonarx/arbitrum"
 first_block = 22207817
+chunk_blocks = 100000
 
 # The BoLD rollup, as the bridge's rollup() names it.
 [l1_anchor]

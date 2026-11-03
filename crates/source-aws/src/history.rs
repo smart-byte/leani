@@ -3,7 +3,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use alloy_primitives::{B256, Bloom, BloomInput, U256};
@@ -17,8 +17,9 @@ use leani_primitives::{
     TrustModel, VerificationCheck, VerificationReport,
 };
 use leani_source_api::{
-    BlockFrameStream, DataRequest, FinalityModel, HistorySource, Partitioning, SourceBudget,
-    SourceChunk, SourceDescriptor, SourceError, SourcePlan, VerificationPolicy,
+    BlockFrameStream, DataRequest, FinalityModel, HistorySource, Partitioning,
+    SourceAcquisitionMetrics, SourceBudget, SourceChunk, SourceDescriptor, SourceError, SourcePlan,
+    VerificationPolicy,
 };
 use object_store::{ObjectStore, http::HttpBuilder};
 use serde::{Deserialize, Serialize};
@@ -27,14 +28,18 @@ use url::Url;
 
 use crate::{
     AWS_PUBLIC_BLOCKCHAIN, AwsError,
+    cache::RangeCache,
     catalog::{Catalog, Listing, S3Listing},
     layout::Table,
-    read::{self, BlockRow, InputBudget, LogRow, ReceiptRow, TableRead},
+    read::{self, BlockRow, InputBudget, LogRow, RangeRequests, ReceiptRow, TableRead},
     verify,
 };
 
 const SCHEMA_VERSION: &str = "aws-public.v1";
 const IDENTITY_VERSION: u8 = 1;
+/// Ranged GETs a chunk may have in flight per concurrent read: a read's
+/// parts go out together, as an object store fans one read out into several.
+const GETS_PER_READ: usize = 4;
 
 /// Header and complete receipts, with their logs and outcomes.
 const CAPABILITIES: CapabilitySet =
@@ -50,9 +55,17 @@ pub struct AwsPublicConfig {
     pub priority: u16,
     /// Parquet rows decoded per Arrow batch.
     pub batch_rows: usize,
-    /// Most blocks one chunk holds in memory. Each chunk reads its whole
+    /// Most blocks one chunk holds in memory; `None` takes the dataset's.
+    /// Where the files do not index their pages, each chunk reads its whole
     /// day again, so splitting a day trades downloads for memory.
     pub chunk_blocks: Option<u64>,
+    /// Directory of the temporary file that keeps the byte ranges chunks
+    /// read, so the chunks of one day read each footer, page index, and
+    /// dictionary page once; `None` keeps none. The sources of one process
+    /// share the file of a directory and bucket.
+    pub cache_directory: Option<std::path::PathBuf>,
+    /// Most bytes that file holds.
+    pub cache_bytes: u64,
 }
 
 impl AwsPublicConfig {
@@ -68,6 +81,8 @@ impl AwsPublicConfig {
             priority: 30,
             batch_rows: 8_192,
             chunk_blocks: None,
+            cache_directory: None,
+            cache_bytes: 0,
         })
     }
 }
@@ -80,6 +95,8 @@ pub struct AwsPublicSource {
     catalog: Arc<Catalog>,
     batch_rows: usize,
     chunk_blocks: u64,
+    cache: Option<Arc<RangeCache>>,
+    metrics: Arc<std::sync::Mutex<SourceAcquisitionMetrics>>,
 }
 
 impl AwsPublicSource {
@@ -136,7 +153,15 @@ impl AwsPublicSource {
             prefix: config.dataset.prefix.trim_matches('/').to_owned(),
             catalog: Arc::new(Catalog::new(layout, &config.dataset.prefix, listing, store)),
             batch_rows: config.batch_rows.max(1),
-            chunk_blocks: config.chunk_blocks.unwrap_or(u64::MAX).max(1),
+            chunk_blocks: config
+                .chunk_blocks
+                .or(config.dataset.chunk_blocks)
+                .unwrap_or(u64::MAX)
+                .max(1),
+            cache: config.cache_directory.as_deref().map(|directory| {
+                RangeCache::shared(directory, config.bucket.as_str(), config.cache_bytes)
+            }),
+            metrics: Arc::default(),
         })
     }
 }
@@ -156,6 +181,15 @@ struct ChunkIdentity {
 impl HistorySource for AwsPublicSource {
     fn descriptor(&self) -> &SourceDescriptor {
         &self.descriptor
+    }
+
+    fn acquisition_metrics(&self) -> Option<SourceAcquisitionMetrics> {
+        Some(
+            self.metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone(),
+        )
     }
 
     async fn plan(&self, request: &DataRequest) -> Result<SourcePlan, SourceError> {
@@ -264,10 +298,45 @@ impl HistorySource for AwsPublicSource {
                 observed: chunk.range.len(),
             });
         }
-        let frames = self
-            .read_day(&identity, chunk.expected_parent, &budget, &cancellation)
-            .await
-            .map_err(|error| source_error(&error, chunk.range))?;
+        let started = Instant::now();
+        let requests = Arc::new(RangeRequests::new(
+            budget.max_in_flight_requests.saturating_mul(GETS_PER_READ),
+            budget.max_input_bytes,
+        ));
+        let read = self
+            .read_day(
+                &identity,
+                chunk.expected_parent,
+                &budget,
+                &requests,
+                &cancellation,
+            )
+            .await;
+        {
+            let mut metrics = self
+                .metrics
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            metrics.opened_chunks = metrics.opened_chunks.saturating_add(1);
+            metrics.opened_ranges.push(chunk.range);
+            let (reads, bytes) = requests.transferred();
+            metrics.physical_reads =
+                Some(metrics.physical_reads.unwrap_or(0).saturating_add(reads));
+            metrics.fetched_bytes = Some(metrics.fetched_bytes.unwrap_or(0).saturating_add(bytes));
+            if let Ok(frames) = &read {
+                metrics.acquired_frames =
+                    metrics.acquired_frames.saturating_add(frames.len() as u64);
+                metrics.normalized_bytes = frames
+                    .iter()
+                    .fold(metrics.normalized_bytes, |total, frame| {
+                        total.saturating_add(frame.estimated_heap_bytes())
+                    });
+            }
+            metrics.operation_elapsed_ms = metrics
+                .operation_elapsed_ms
+                .saturating_add(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        }
+        let frames = read.map_err(|error| source_error(&error, chunk.range))?;
         for frame in &frames {
             let bytes = frame.estimated_heap_bytes();
             if bytes > budget.max_frame_bytes {
@@ -289,6 +358,7 @@ impl AwsPublicSource {
         identity: &ChunkIdentity,
         expected_parent: Option<BlockHash>,
         budget: &SourceBudget,
+        requests: &Arc<RangeRequests>,
         cancellation: &CancellationToken,
     ) -> Result<Vec<BlockFrame>, AwsError> {
         let input = InputBudget::new("input_bytes", budget.max_input_bytes);
@@ -312,9 +382,12 @@ impl AwsPublicSource {
                     keep,
                     batch_rows: self.batch_rows,
                     concurrency: budget.max_in_flight_requests,
+                    requests,
+                    cache: self.cache.as_ref(),
                     budget: input,
                     resident,
                     share: (kept, day),
+                    blocks: range,
                     cancellation,
                 })
                 .await
@@ -787,6 +860,33 @@ mod tests {
     ];
 
     async fn source(tables: &[(&str, &[u8])], extra_logs: bool) -> AwsPublicSource {
+        source_with(&config(), tables, extra_logs).await
+    }
+
+    fn config() -> AwsPublicConfig {
+        AwsPublicConfig {
+            id: "aws-public".to_owned(),
+            chain_id: 8453,
+            dataset: PublicDataset {
+                layout: DatasetLayout::SonarxEvmV1,
+                prefix: PREFIX.to_owned(),
+                first_block: 0,
+                chunk_blocks: None,
+            },
+            bucket: Url::parse(AWS_PUBLIC_BLOCKCHAIN).unwrap(),
+            priority: 0,
+            batch_rows: 2,
+            chunk_blocks: None,
+            cache_directory: None,
+            cache_bytes: 0,
+        }
+    }
+
+    async fn source_with(
+        config: &AwsPublicConfig,
+        tables: &[(&str, &[u8])],
+        extra_logs: bool,
+    ) -> AwsPublicSource {
         let store = Arc::new(InMemory::new());
         for (table, bytes) in tables {
             store
@@ -806,21 +906,8 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let config = AwsPublicConfig {
-            id: "aws-public".to_owned(),
-            chain_id: 8453,
-            dataset: PublicDataset {
-                layout: DatasetLayout::SonarxEvmV1,
-                prefix: PREFIX.to_owned(),
-                first_block: 0,
-            },
-            bucket: Url::parse(AWS_PUBLIC_BLOCKCHAIN).unwrap(),
-            priority: 0,
-            batch_rows: 2,
-            chunk_blocks: None,
-        };
         let listing = Arc::new(StoreListing(store.clone()));
-        AwsPublicSource::with_store(&config, store, listing).unwrap()
+        AwsPublicSource::with_store(config, store, listing).unwrap()
     }
 
     fn request(required: CapabilitySet, addresses: Vec<Address>) -> DataRequest {
@@ -987,6 +1074,66 @@ mod tests {
                 }
             ),
             "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_chunk_reports_what_it_fetched_and_built() {
+        let source = source(TABLES, false).await;
+        let all = CapabilitySet::of(Capability::Header).with(Capability::Receipts);
+        let frames = frames(&source, &request(all, Vec::new())).await.unwrap();
+        let metrics = source.acquisition_metrics().expect("metrics");
+        assert_eq!(metrics.opened_chunks, 1);
+        assert_eq!(metrics.acquired_frames, frames.len() as u64);
+        let stored = TABLES
+            .iter()
+            .map(|(_, bytes)| bytes.len() as u64)
+            .sum::<u64>();
+        let fetched = metrics.fetched_bytes.expect("fetched bytes");
+        assert!(fetched > 0 && fetched <= stored, "{fetched} of {stored}");
+        assert!(metrics.physical_reads.expect("reads") >= TABLES.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn the_dataset_chunk_size_splits_days_unless_the_source_sets_one() {
+        let all = CapabilitySet::of(Capability::Header).with(Capability::Receipts);
+        let mut config = config();
+        config.dataset.chunk_blocks = Some(1);
+        let split = source_with(&config, TABLES, false).await;
+        let plan = split.plan(&request(all, Vec::new())).await.unwrap();
+        assert_eq!(plan.chunks.len(), 2);
+        config.chunk_blocks = Some(2);
+        let whole = source_with(&config, TABLES, false).await;
+        let plan = whole.plan(&request(all, Vec::new())).await.unwrap();
+        assert_eq!(plan.chunks.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_chunks_of_one_day_download_what_they_share_once() {
+        let all = CapabilitySet::of(Capability::Header).with(Capability::Receipts);
+        let mut config = config();
+        config.dataset.chunk_blocks = Some(1);
+        config.bucket = Url::parse("https://chunks-of-one-day.example/").unwrap();
+        config.cache_directory = Some(std::env::temp_dir());
+        config.cache_bytes = 1 << 30;
+        let source = source_with(&config, TABLES, false).await;
+        let plan = source.plan(&request(all, Vec::new())).await.unwrap();
+        let mut fetched = Vec::new();
+        for chunk in &plan.chunks {
+            let stream = source
+                .open(chunk, budget(), CancellationToken::new())
+                .await
+                .unwrap();
+            assert_eq!(stream.collect::<Vec<_>>().await.len(), 1);
+            fetched.push(source.acquisition_metrics().unwrap().fetched_bytes.unwrap());
+        }
+        // Only the second block has logs: its chunk downloads their pages,
+        // and every footer, page index, and other page from the cache.
+        let second = fetched[1] - fetched[0];
+        assert!(
+            second < fetched[0] / 10,
+            "the second chunk downloaded {second} bytes, the first {}",
+            fetched[0]
         );
     }
 
