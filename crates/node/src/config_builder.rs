@@ -828,17 +828,10 @@ fn recipes_for(limits: &Limits, reads_logs: bool, config: &Config) -> Vec<Recipe
     let bandwidth = limits.bandwidth_mbit;
     match limits.memory.map(HumanBytes::bytes) {
         Some(memory) if memory < GIB => recipes.push(Recipe::LimitedMemory),
-        Some(memory) => {
-            if has(HistorySourceKind::EraE) {
-                recipes.push(Recipe::FasterErae);
-            }
-            // Xatu backfills hold about 450 MiB per active chunk, and the
-            // defaults keep 8 chunks.
-            if memory < 4 * GIB {
-                recipes.push(Recipe::LessMemory);
-            }
-        }
-        None => {}
+        // Xatu backfills hold about 450 MiB per active chunk, and the
+        // defaults keep 8 chunks.
+        Some(memory) if memory < 4 * GIB => recipes.push(Recipe::LessMemory),
+        _ => {}
     }
     if !reads_logs
         && bandwidth.is_some_and(|mbit| mbit < SLOW_LINK_MBIT)
@@ -865,22 +858,6 @@ fn apply(recipe: Recipe, config: &mut Config, decisions: &mut Decisions) {
                 "budgets.history_pipeline.maximum_active_chunks",
                 2,
                 "limited memory: 2 chunks in flight",
-            );
-        }
-        Recipe::FasterErae => {
-            budgets.history_material.memory_bytes = HumanBytes::from_bytes(512 * MIB);
-            budgets
-                .history_material
-                .maximum_buffered_frames_per_acquisition = 512;
-            decisions.add(
-                "budgets.history_material.memory_bytes",
-                "512MiB",
-                "512 MiB: eraE backfills a quarter to a half faster",
-            );
-            decisions.add(
-                "budgets.history_material.maximum_buffered_frames_per_acquisition",
-                512,
-                "at the same peak memory as the default",
             );
         }
         Recipe::LessMemory => {
@@ -1344,6 +1321,34 @@ mod tests {
             config.processors[0].history_mode,
             crate::config::ProcessorHistoryMode::Automatic
         ));
+    }
+
+    #[test]
+    fn memory_to_spare_keeps_the_default_erae_frame_buffer() {
+        let (build, config) = built(
+            serde_json::json!({
+                "processor": { "preset": "uniswap", "markets": ["ETH/USDC"] },
+                "limits": { "memory": "8GiB" },
+            }),
+            None,
+        );
+        assert!(
+            config
+                .sources
+                .history
+                .iter()
+                .any(|source| matches!(source.kind, HistorySourceKind::EraE))
+        );
+        assert_eq!(
+            config
+                .budgets
+                .history_material
+                .maximum_buffered_frames_per_acquisition,
+            crate::config::HistoryMaterialBudgetConfig::default()
+                .maximum_buffered_frames_per_acquisition,
+            "{:?}",
+            build.tuning
+        );
     }
 
     #[test]

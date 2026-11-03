@@ -165,7 +165,7 @@ impl Default for HistoricalMaterialCoordinatorConfig {
         Self {
             mode: HistoricalMaterialCoordinatorMode::Enabled,
             memory_bytes: 256 * 1_024 * 1_024,
-            maximum_buffered_frames_per_acquisition: 128,
+            maximum_buffered_frames_per_acquisition: 1_024,
             minimum_physical_chunk_blocks: 128,
             maximum_overfetch_ratio: 1.25,
         }

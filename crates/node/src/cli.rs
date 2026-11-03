@@ -533,7 +533,6 @@ pub enum Follow {
 #[serde(rename_all = "camelCase")]
 pub enum Recipe {
     LimitedMemory,
-    FasterErae,
     LessMemory,
     TransactionsFromXatu,
     SlowDisk,

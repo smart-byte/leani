@@ -457,7 +457,6 @@
             "defaultValues": [],
             "possibleValues": [
               "limited-memory",
-              "faster-erae",
               "less-memory",
               "transactions-from-xatu",
               "slow-disk"

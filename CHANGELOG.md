@@ -244,6 +244,13 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- EraE backfills run about 1.5 to 2.5 times as fast:
+  `budgets.history_material.maximum_buffered_frames_per_acquisition` defaults
+  to 1,024 frames instead of 128, so chunks read ahead keep downloading while
+  the job commits. On a 25,000-block `rollup-txs` backfill, 8 reads and 4
+  chunks went from 323 to 559 blocks/s, at about a tenth more peak memory.
+  `leani init` no longer has a `fasterErae` recipe: the default does more than
+  it did.
 - The live lane keeps every block's header, which the P2P source fetches
   anyway, so header-only processors run ad hoc on any node.
 - The live subscriptions of one P2P source share their downloads: a block's
