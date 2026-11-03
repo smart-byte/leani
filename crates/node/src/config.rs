@@ -5151,6 +5151,11 @@ bind = "127.0.0.1:18080"
         );
         assert_eq!(config.rpc.http_bind.port(), 18_545);
         assert_eq!(config.api.bind.port(), 18_080);
+        // A Base day's byte ranges fit the AWS range cache.
+        assert_eq!(
+            config.budgets.temporary_disk_bytes,
+            4 * 1_024 * 1_024 * 1_024
+        );
         assert_eq!(config.processors.len(), 1);
         let pools = config.processors[0].settings["pools"]
             .as_array()

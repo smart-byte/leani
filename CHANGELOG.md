@@ -257,6 +257,9 @@ record, and documented RPC contracts.
   it did.
 - The live lane keeps every block's header, which the P2P source fetches
   anyway, so header-only processors run ad hoc on any node.
+- `budgets.temporary_disk_bytes` defaults to 4 GiB instead of 2 GiB, which
+  holds the byte ranges the chunks of a Base day share: with 2 GiB, a Base
+  day downloaded 5 GB instead of 4.3 GB and ran 13% slower.
 - The live subscriptions of one P2P source share their downloads: a block's
   bodies or receipts that two of them need are downloaded once.
 - Xatu reads a chunk's tables at once, and a long range as parallel parts,

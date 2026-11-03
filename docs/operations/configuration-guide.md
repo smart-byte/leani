@@ -85,7 +85,7 @@ Compact Ethereum Mainnet configurations expand to:
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
 | processor | selected built-in feed, unattested publication, checkpointed state, 256-block undo safety |
-| resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
+| resources | 512 MiB memory, 4 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
 
@@ -341,7 +341,9 @@ pages of its files. The node keeps the byte ranges it reads in one temporary
 file in `data_dir`, at most `budgets.temporary_disk_bytes` for each bucket,
 which the system frees when the node exits, and downloads a range that
 several chunks need at once only once: for a log-filtered processor a Base
-day took about 5 GB, and an Arbitrum One day about 0.9 GB. What a chunk
+day took about 4.3 GB, and an Arbitrum One day about 0.9 GB. A Base day's
+ranges fill most of the default 4 GiB: with 2 GiB, chunks downloaded some
+again, and the day took 5 GB and ran 13% slower. What a chunk
 downloads counts against `budgets.temporary_disk_bytes`, and a chunk whose
 rows would decode to more than `budgets.memory_bytes` is refused before it
 downloads: an unfiltered Ethereum day took about 8.7 GB of memory. Each
