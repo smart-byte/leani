@@ -1,0 +1,6 @@
+{
+  "extends": "../sdk-subscription/tsconfig.json",
+  "include": [
+    "*.ts"
+  ]
+}
