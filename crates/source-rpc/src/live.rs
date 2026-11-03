@@ -377,14 +377,11 @@ async fn next_event(mut state: LiveState) -> Option<(Result<ChainEvent, SourceEr
             () = cancellation.cancelled() => continue,
             advanced = state.advance() => advanced,
         };
-        match advanced {
-            Ok(()) if state.pending.is_empty() || state.next > state.head => {
-                tokio::select! {
-                    () = state.cancellation.cancelled() => {}
-                    () = tokio::time::sleep(state.source.poll_interval) => {}
-                }
-            }
-            Ok(()) => {}
+        // What a round fetched goes out at once; only a round with nothing
+        // new waits before the next, so a moving head is followed round
+        // after round.
+        let wait = match advanced {
+            Ok(()) => state.source.poll_interval,
             Err(error @ SourceError::Disconnected(_)) => {
                 state.terminal = true;
                 return Some((Err(error), state));
@@ -392,10 +389,13 @@ async fn next_event(mut state: LiveState) -> Option<(Result<ChainEvent, SourceEr
             Err(error) => {
                 // A rate limit or an endpoint falling behind is transient.
                 debug!(%error, "json-rpc live poll failed; retrying");
-                tokio::select! {
-                    () = state.cancellation.cancelled() => {}
-                    () = tokio::time::sleep(state.source.poll_interval * 2) => {}
-                }
+                state.source.poll_interval * 2
+            }
+        };
+        if state.pending.is_empty() {
+            tokio::select! {
+                () = state.cancellation.cancelled() => {}
+                () = tokio::time::sleep(wait) => {}
             }
         }
     }

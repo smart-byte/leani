@@ -37,6 +37,9 @@ const PROOF_WINDOW: u64 = 4_096;
 const SLOWEST_CALL_INTERVAL: Duration = Duration::from_secs(2);
 /// The longest `Retry-After` an endpoint's calls wait for.
 const LONGEST_RETRY_AFTER: Duration = Duration::from_secs(30);
+/// How long the quorum waits for the other endpoints' answers once enough
+/// answered: a slow or rate-limited one must not hold up what they agree on.
+const ANSWER_GRACE: Duration = Duration::from_millis(250);
 
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
@@ -1046,17 +1049,16 @@ impl RpcQuorum {
     }
 
     /// The hash at `number` when at least `quorum` endpoints serve the same
-    /// one; `None` while too few endpoints serve the block yet.
+    /// one; `None` while too few endpoints serve the block yet. Endpoints
+    /// still answering [`ANSWER_GRACE`] after `quorum` answered are not
+    /// waited for.
     ///
     /// # Errors
     ///
     /// Returns an error when endpoints that serve the block disagree such
     /// that no quorum can form.
     pub async fn agreed_hash(&self, number: u64) -> Result<Option<B256>, RpcError> {
-        let tag = format!("{number:#x}");
-        let served =
-            futures::future::join_all(self.clients.iter().map(|client| client.block_id(&tag)))
-                .await;
+        let served = self.answers(&format!("{number:#x}")).await;
         let hashes = served
             .into_iter()
             .filter_map(Result::ok)
@@ -1132,16 +1134,46 @@ impl RpcQuorum {
         )))
     }
 
+    /// Each endpoint's block at `tag`, as the endpoints answer, until all
+    /// did or [`ANSWER_GRACE`] after `quorum` of them answered.
+    async fn answers(&self, tag: &str) -> Vec<Result<(u64, B256), RpcError>> {
+        let mut pending = self
+            .clients
+            .iter()
+            .map(|client| client.block_id(tag))
+            .collect::<futures::stream::FuturesUnordered<_>>();
+        let mut served = Vec::with_capacity(self.clients.len());
+        let mut grace = None;
+        loop {
+            let answer = match &mut grace {
+                None => pending.next().await,
+                Some(deadline) => tokio::select! {
+                    answer = pending.next() => answer,
+                    () = deadline => None,
+                },
+            };
+            let Some(answer) = answer else {
+                return served;
+            };
+            served.push(answer);
+            if grace.is_none()
+                && served.iter().filter(|answer| answer.is_ok()).count() >= self.quorum
+            {
+                grace = Some(Box::pin(tokio::time::sleep(ANSWER_GRACE)));
+            }
+        }
+    }
+
     /// The highest block at `tag` that at least `quorum` endpoints have
-    /// reached and agree on.
+    /// reached and agree on, among those answering within [`ANSWER_GRACE`]
+    /// after `quorum` did.
     ///
     /// # Errors
     ///
     /// Returns an error when fewer than `quorum` endpoints answer or they
     /// disagree.
     pub async fn agreed_tag(&self, tag: &str) -> Result<(u64, B256), RpcError> {
-        let served =
-            futures::future::join_all(self.clients.iter().map(|client| client.block_id(tag))).await;
+        let served = self.answers(tag).await;
         let mut numbers = served
             .iter()
             .filter_map(|served| served.as_ref().ok().map(|(number, _)| *number))
@@ -1388,6 +1420,92 @@ mod tests {
             })
             .collect();
         (served, hashes)
+    }
+
+    #[tokio::test]
+    async fn a_hung_endpoint_does_not_hold_up_what_the_quorum_agrees_on() {
+        let hash = B256::repeat_byte(0xa);
+        let fast = endpoint(vec![(10, hash)]).await;
+        let hung = delayed_endpoint(vec![(10, hash)], Duration::from_secs(20)).await;
+        let quorum = RpcQuorum::new(vec![fast, hung], 1, 1_000).unwrap();
+        let started = std::time::Instant::now();
+        assert_eq!(quorum.agreed_tag("latest").await.unwrap(), (10, hash));
+        assert_eq!(quorum.agreed_hash(10).await.unwrap(), Some(hash));
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_live_lane_hands_over_blocks_as_soon_as_it_fetched_them() {
+        use leani_source_api::LiveSource as _;
+
+        let (served, hashes) = header_chain(10, 0);
+        let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+        // A block must not wait out the poll interval once it is fetched.
+        let source = RpcLiveSource::new(
+            "rpc",
+            leani_primitives::ChainId(1),
+            pool,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        let request = leani_source_api::DataRequest {
+            chain_id: leani_primitives::ChainId(1),
+            range: leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(9),
+                leani_primitives::BlockNumber(u64::MAX - 1),
+            )
+            .unwrap(),
+            required: CapabilitySet::of(Capability::Header),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: leani_primitives::Finality::Unattested,
+            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
+        };
+        let budget = leani_source_api::SourceBudget {
+            max_input_bytes: 1 << 30,
+            max_frame_bytes: 1 << 20,
+            max_frames: 1_000,
+            max_buffered_frames: 64,
+            max_in_flight_requests: 4,
+            temporary_disk_bytes: 1,
+            max_resident_bytes: 1 << 30,
+        };
+        let start = leani_source_api::LiveStart::Block(leani_primitives::BlockRef {
+            number: leani_primitives::BlockNumber(8),
+            hash: leani_primitives::BlockHash::new(hashes[7].0),
+            parent_hash: leani_primitives::BlockHash::new(hashes[6].0),
+            timestamp: 0,
+        });
+        let mut events = source
+            .subscribe(
+                request,
+                start,
+                budget,
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let started = std::time::Instant::now();
+        let first = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("an event")
+            .expect("open stream")
+            .expect("a block");
+        assert!(
+            matches!(&first, leani_source_api::ChainEvent::Block(frame) if frame.block.number.0 == 9),
+            "{first:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
