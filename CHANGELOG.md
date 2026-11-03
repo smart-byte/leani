@@ -248,6 +248,12 @@ record, and documented RPC contracts.
   anyway, so header-only processors run ad hoc on any node.
 - The live subscriptions of one P2P source share their downloads: a block's
   bodies or receipts that two of them need are downloaded once.
+- Xatu reads a chunk's tables at once, and a long range as parallel parts,
+  within the chunk's request and memory budgets. A 1,000-block chunk takes
+  1.3 s instead of 2.3 s, so small backfills finish sooner, and a
+  `blobs-money` backfill, whose chunks join five tables, ran 24% faster (577
+  to 714 blocks/s with 8 chunks), its first block arriving after 7.8 s
+  instead of 13.6 s.
 - Consensus P2P discovery runs its lookups concurrently, looks for the
   chain's fork digest, and keeps every record they see, so it also finds the
   peers of a testnet, whose records are rare in the discovery network all

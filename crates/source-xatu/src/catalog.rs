@@ -609,7 +609,12 @@ async fn inspect_object(
         pinned.e_tag = None;
     }
     // Only the footer is read, and its metadata reads are capped.
-    let (mut reader, _) = ObjectStoreReader::new(store, &pinned, 1, InputBudget::new(u64::MAX, 0));
+    let (mut reader, _) = ObjectStoreReader::new(
+        store,
+        &pinned,
+        Arc::new(tokio::sync::Semaphore::new(1)),
+        InputBudget::new(u64::MAX),
+    );
     let metadata = reader
         .get_metadata(None)
         .await

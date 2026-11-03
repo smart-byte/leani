@@ -376,10 +376,10 @@ Measured with this release on a Hetzner EX44 (Intel i5-13500, 20 threads,
 |---|---|---|---|---|
 | `rollup-txs`, Feb 2026 | eraE | 122 KiB | 250–300 blocks/s, 170 MiB | 250–330 blocks/s, 280 MiB |
 | `blobs-money`, Feb 2026 | eraE | 122 KiB | 280 blocks/s, 160 MiB | 250–300 blocks/s, 250 MiB |
-| `rollup-txs`, Feb 2026 | Xatu | 61 KiB | 550–560 blocks/s, 230 MiB | 730–780 blocks/s, 340 MiB |
-| `blobs-money`, Feb 2026 | Xatu | 72 KiB | 410–420 blocks/s, 560 MiB | 500–570 blocks/s, 730 MiB |
-| `rollup-txs`, Oct 2026 | Xatu | 56 KiB | 490 blocks/s, 290 MiB | 620–890 blocks/s, 420 MiB |
-| `blobs-money`, Oct 2026 | Xatu | 46 KiB | 570 blocks/s, 420 MiB | 470–650 blocks/s, 620 MiB |
+| `rollup-txs`, Feb 2026 | Xatu | 61 KiB | 510–700 blocks/s, 310–320 MiB | 820–1,010 blocks/s, 430–550 MiB |
+| `blobs-money`, Feb 2026 | Xatu | 72 KiB | 570–610 blocks/s, 600–670 MiB | 620–640 blocks/s, 740–750 MiB |
+| `rollup-txs`, Oct 2026 | Xatu | 56 KiB | 730–770 blocks/s, 270–330 MiB | 1,080 blocks/s, 400–410 MiB |
+| `blobs-money`, Oct 2026 | Xatu | 46 KiB | 650–800 blocks/s, 420–430 MiB | 620–780 blocks/s, 680–860 MiB |
 
 "4 reads, 2 chunks" is `source_concurrency = 4` and `maximum_active_chunks =
 2`, as `deploy/container.toml` ships; the other shipped profiles read with 8
