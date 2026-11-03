@@ -67,6 +67,7 @@ jobs:
           rustup default "$(rustup show active-toolchain | cut -d ' ' -f 1)"
           cargo test --locked -p leani-processor-wasm -- --ignored --skip wasm_versus_native
           cargo test --locked -p leani --lib wasm_build -- --ignored
+          cargo test --locked -p leani --lib process::wasm_project -- --ignored
 
   sdk:
     name: TypeScript SDK

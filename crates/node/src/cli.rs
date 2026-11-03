@@ -435,18 +435,22 @@ and the processor contract.")]
     },
     /// Run a Wasm processor over finalized history and print its changes.
     #[command(after_help = "Examples:
-  leani processor run transfers.wasm --from-block 21000000 --to-block 21000099
+  leani processor run ./usdc-volume --from-block 21000000 --to-block 21000099
   leani processor run transfers.wasm --from-block 21000000 --to-block 21000099 --param minValue=1000000000
   leani processor run --template event-decoder --from 21000000 --to 21000009 \\
     --params '{\"events\":[\"Transfer(address indexed from, address indexed to, uint256 value)\"]}'
 
 Each change prints as one JSON line on stdout; progress and the report go to
-stderr. Sources, chain, and finality come from the configuration file; its
-processors are ignored. Build modules with the leani-wasm-guest crate, or run
+stderr. A project's directory, as `leani processor create` writes it, is built
+first with its own toolchain, cargo or npm: the build's output goes to stderr,
+and a failed build runs nothing. Sources, chain, and finality come from the
+configuration file; its processors are ignored. Build modules with the
+leani-wasm-guest crate, or run
 a bundled template: block-gas, erc20-transfers, token-volume, event-decoder.")]
     Run {
-        /// Wasm module built with leani-wasm-guest.
-        #[arg(required_unless_present = "template")]
+        /// A Wasm module built with leani-wasm-guest, or a processor project's
+        /// directory, which is built first.
+        #[arg(required_unless_present = "template", value_name = "MODULE|PROJECT")]
         module: Option<PathBuf>,
         /// A bundled template instead of a module file; without parameters
         /// it runs with its example parameters.
