@@ -14,7 +14,7 @@ ENV CFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 ENV CXXFLAGS="-ffile-prefix-map=/usr/local/cargo=/cargo"
 RUN cargo build --locked --release -p leani
 
-FROM debian:bookworm-slim@sha256:7ff6ba31527b9e336162fa061746c366c4b2032f4d2cff2078bea43f78efe3f8 AS runtime
+FROM debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3 AS runtime
 
 LABEL org.opencontainers.image.title="leani" \
       org.opencontainers.image.source="https://github.com/smart-byte/leani" \
