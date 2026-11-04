@@ -4878,7 +4878,7 @@ dependencies = [
  "alloy-rpc-types-eth",
  "alloy-trie",
  "async-trait",
- "base64 0.22.1",
+ "base64 0.23.1",
  "flate2",
  "futures",
  "leani-primitives",
