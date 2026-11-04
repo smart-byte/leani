@@ -1474,8 +1474,10 @@ mod tests {
             FinalitySourceKind::SequencerFeed
         ));
         assert!(arbitrum.l1_anchor.is_some());
-        // OP Mainnet's games claim super roots, so nothing finalizes its blocks.
-        let refused = build_for("op", "finalized").expect_err("no L1 anchor");
+        // OP Mainnet's games claim super roots, which hold its output root.
+        let op = parsed(&build_for("op", "finalized").expect("op"));
+        assert!(op.l1_anchor.is_some());
+        let refused = build_for("unichain-mainnet", "finalized").expect_err("no L1 anchor");
         assert!(refused.contains("follow the head"), "{refused}");
         let refused = check(
             &requirements(serde_json::json!({

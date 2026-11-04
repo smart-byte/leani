@@ -214,15 +214,31 @@ pub struct PublicDataset {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum L1Anchor {
-    /// Dispute games of `game_type` claim output roots; the anchor state
-    /// registry moves to a game once the chain's own rules treat it as final.
+    /// Dispute games of `game_type` claim output roots, or super roots that
+    /// hold one; the anchor state registry moves to a game once the chain's
+    /// own rules treat it as final.
     DisputeGames {
         factory: Address,
         registry: Address,
         game_type: u32,
+        #[serde(default)]
+        claims: GameClaims,
     },
     /// A Nitro rollup whose confirmed assertions name an L2 block hash.
     NitroRollup { rollup: Address },
+}
+
+/// What a chain's dispute games claim.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GameClaims {
+    /// The output root of the block the game's extra data names.
+    #[default]
+    OutputRoots,
+    /// A super root: one hash over the output roots of every chain in an
+    /// interop set at one time. The game's extra data is its preimage, which
+    /// holds this chain's output root.
+    SuperRoots,
 }
 
 /// A Nitro chain's sequencer feed: every message names its block's hash and
