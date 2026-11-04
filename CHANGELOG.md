@@ -99,6 +99,9 @@ record, and documented RPC contracts.
   root's preimage, which holds the chain's output root at a time. Chain
   entries name the contracts and, with `claims = "super_roots"`, that
   format.
+- Op-stack blocks served over JSON-RPC check against their transactions and
+  receipts roots: deposit transactions and receipts are re-encoded, and
+  Regolith's receipts roots, which leave deposit nonces out, are recognized.
 - `finality.kind = "op_gossip"` follows an op-stack chain's sequencer-signed
   block gossip: each signed block is the attested head the P2P live lane
   follows. Recent frames are pruned `finality.settle_blocks` below the tip,
