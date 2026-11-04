@@ -3308,7 +3308,7 @@ const fn default_raw_history_buffered_frames() -> usize {
 }
 
 const fn default_history_material_buffered_frames() -> usize {
-    128
+    1_024
 }
 
 const fn default_history_material_minimum_chunk_blocks() -> u64 {
@@ -3768,7 +3768,7 @@ verification_segment_blocks = 8192"#;
                 .budgets
                 .history_material
                 .maximum_buffered_frames_per_acquisition,
-            128
+            1_024
         );
         assert_eq!(
             config

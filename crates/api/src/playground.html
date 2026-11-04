@@ -1662,7 +1662,6 @@ const KEEPS = [
 // built configuration shows what each one sets.
 const TUNING = [
   ["limitedMemory", "Limited memory", "Under 1 GiB: 4 reads and 2 chunks; eraE needs the least memory."],
-  ["fasterErae", "Faster eraE backfills", "A quarter to a half faster, at the same peak memory."],
   ["lessMemory", "Less memory", "1 to 4 GiB: 4 chunks instead of 8; Xatu backfills hold about half as much."],
   ["transactionsFromXatu", "Limited bandwidth", "Xatu first on a slow link, for processors that read no logs; only eraE proves logs complete."],
   ["slowDisk", "Slow disk syncs", "On network-attached volumes, keep commit batches large."],

@@ -245,9 +245,10 @@ EX44 (RAID 1 over two NVMe drives, about 8 ms per sync), the former 20 ms
 target ran a `rollup-txs` backfill from Xatu at 53 blocks/s and wrote 104 KiB
 per block; the 250 ms target ran it at 799 blocks/s and wrote 11 KiB per
 block. A job holds at most `maximum_buffered_frames_per_acquisition` frames
-of `[budgets.history_material]`, 128 by default, that it has not committed,
+of `[budgets.history_material]`, 1,024 by default, that it has not committed,
 so a longer `maximum_delay` makes acquisition wait instead of filling larger
-batches: a one-second delay ran the same backfill at 127 blocks/s. A single
+batches: a one-second delay ran the same backfill at 127 blocks/s when the
+default was 128 frames, and at 743 blocks/s with 1,024. A single
 mapped delta or single-block commit that exceeds its byte limit fails
 immediately because waiting cannot make that item fit. A backfill that reuses
 retained recent frames reads them in batches of at most `commit.maximum_blocks`
@@ -374,8 +375,8 @@ Measured with this release on a Hetzner EX44 (Intel i5-13500, 20 threads,
 
 | Backfill | Source | Downloaded per block | 4 reads, 2 chunks | 8 reads, 4 chunks |
 |---|---|---|---|---|
-| `rollup-txs`, Feb 2026 | eraE | 122 KiB | 250–300 blocks/s, 170 MiB | 250–330 blocks/s, 280 MiB |
-| `blobs-money`, Feb 2026 | eraE | 122 KiB | 280 blocks/s, 160 MiB | 250–300 blocks/s, 250 MiB |
+| `rollup-txs`, Feb 2026 | eraE | 122 KiB | 410–450 blocks/s, 180 MiB | 560 blocks/s, 270–280 MiB |
+| `blobs-money`, Feb 2026 | eraE | 122 KiB | 410–450 blocks/s, 180 MiB | 540–570 blocks/s, 280–290 MiB |
 | `rollup-txs`, Feb 2026 | Xatu | 61 KiB | 510–700 blocks/s, 310–320 MiB | 820–1,010 blocks/s, 430–550 MiB |
 | `blobs-money`, Feb 2026 | Xatu | 72 KiB | 570–610 blocks/s, 600–670 MiB | 620–640 blocks/s, 740–750 MiB |
 | `rollup-txs`, Oct 2026 | Xatu | 56 KiB | 730–770 blocks/s, 270–330 MiB | 1,080 blocks/s, 400–410 MiB |
@@ -390,25 +391,22 @@ container image preloads, peak memory stayed within a fifth of these and fell
 back once a backfill finished. Execution P2P served 5,000 recent blocks at
 43–55 blocks/s.
 
-More reads and chunks made most Xatu backfills faster, at more memory, and
-left eraE unchanged. An eraE backfill is limited by the frames it may hold
-uncommitted: with `maximum_buffered_frames_per_acquisition = 512` and
-`memory_bytes = "512MiB"` in `[budgets.history_material]`, eraE backfills ran
-at 380–410 blocks/s, a quarter to a half faster, at the same peak memory.
-Profiles:
+More reads and chunks made most backfills faster, at more memory. An eraE
+backfill is also limited by the frames each chunk may hold before the job
+commits them, `maximum_buffered_frames_per_acquisition` in
+`[budgets.history_material]`: with the former default of 128, the eraE
+backfills above ran at 320–340 blocks/s with 8 reads and 4 chunks. More than
+1,024 frames, or a larger `memory_bytes`, made them no faster. Profiles:
 
 - **Default:** the shipped profiles, which try eraE before Xatu and read up
   to 8 chunks at once with 8 reads each.
-- **Faster eraE backfills:** set those two `[budgets.history_material]`
-  values. Concurrent backfills share that budget, so each can then hold more
-  of it.
 - **Less memory:** set `maximum_active_chunks = 4`, the "8 reads, 4 chunks"
   column. Xatu backfills then hold about half as much, and execution P2P
   backfills fetch about half as much at once.
 - **Limited memory**, such as a container under 1 GiB: use 4 reads and 2
   chunks. eraE needs the least memory.
 - **Limited bandwidth:** a backfill downloads blocks per second times bytes
-  per block, about 35 MiB/s from eraE at 300 blocks/s and 25–50 MiB/s from
+  per block, about 65 MiB/s from eraE at 550 blocks/s and 30–60 MiB/s from
   Xatu at the speeds above. On a slower link, the link sets the speed: at
   100 Mbit/s, about 12 MiB/s, eraE reaches about 100 blocks/s and Xatu
   170–270. There, list Xatu first for processors that read only

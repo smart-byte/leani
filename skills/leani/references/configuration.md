@@ -104,7 +104,6 @@ The builder applies only measured recipes from the configuration guide's
 sizing table:
 
 - `limitedMemory` (memory under 1 GiB): 4 reads, 2 chunks.
-- `fasterErae` (memory from 1 GiB): faster eraE backfills at the same peak memory.
 - `lessMemory` (memory from 1 GiB to under 4 GiB): 4 chunks instead of 8;
   Xatu backfills then hold about half as much.
 - `transactionsFromXatu` (link under 200 Mbit/s, processor reads no logs):

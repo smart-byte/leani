@@ -58,7 +58,7 @@ maximum_history_retained_bytes = "1GiB"
 [budgets.history_material]
 mode = "enabled"
 memory_bytes = "256MiB"
-maximum_buffered_frames_per_acquisition = 128
+maximum_buffered_frames_per_acquisition = 1024
 minimum_physical_chunk_blocks = 128
 maximum_overfetch_ratio = 1.25
 
