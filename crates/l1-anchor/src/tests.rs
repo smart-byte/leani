@@ -9,6 +9,13 @@ const BASE: L1Anchor = L1Anchor::DisputeGames {
     factory: address!("0x43edB88C4B80fDD2AdFF2412A7BebF9dF42cB40e"),
     registry: address!("0x909f6cf47ed12f010a796527f562bfc26c7f4e72"),
     game_type: 621,
+    claims: GameClaims::OutputRoots,
+};
+const OP_MAINNET: L1Anchor = L1Anchor::DisputeGames {
+    factory: address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
+    registry: address!("0x23b2c62946350f4246f9f9d027e071f0264fd113"),
+    game_type: 9,
+    claims: GameClaims::SuperRoots,
 };
 const ROBINHOOD: L1Anchor = L1Anchor::NitroRollup {
     rollup: address!("0x23A19d23e89166adedbDcB432518AB01e4272D94"),
@@ -16,6 +23,13 @@ const ROBINHOOD: L1Anchor = L1Anchor::NitroRollup {
 /// A Base game created in L1 tx 0x1fb4c09b…, claiming L2 block 53,042,760.
 const GAME: Address = address!("0xd286d94c1950ab8fe746b21d0c8e4b79e08461b4");
 const ROOT: B256 = b256!("0xcdefaf4edf04754c074d0bf29dc2c69c54003f4fb2c533ea33582de8d050911d");
+/// OP Mainnet's game created in L1 tx 0xec0aaf58…: a super root holding
+/// OP Mainnet's output root at block 159,073,087, made at 1,793,744,951.
+const SUPER_GAME: Address = address!("0xa8d35d50443471783eedeeeeefb1d751d0be76a0");
+const SUPER_ROOT: B256 =
+    b256!("0xb31a67f36e5f000742b986f81a174aae2c5cc99720cdb5dd0dc9548f16c15dc3");
+const OP_OUTPUT_ROOT: B256 =
+    b256!("0x5940406c69fa8dc5c2609b6d45bcdd424db059bceb732993db4146400b5e51b0");
 
 fn byte(number: u64) -> u8 {
     u8::try_from(number % 256).expect("one byte")
@@ -37,6 +51,28 @@ fn creation_call(l2_block: u64) -> Vec<u8> {
     input.extend(word(U256::from(l2_block)));
     input.extend([0x90; 32]);
     input.extend(word(U256::ZERO));
+    input
+}
+
+/// The preimage of `SUPER_ROOT`: version 1, its time, then OP Mainnet's
+/// chain id and output root.
+fn super_root_preimage() -> Vec<u8> {
+    let mut preimage = vec![1];
+    preimage.extend(1_793_744_951_u64.to_be_bytes());
+    preimage.extend(word(U256::from(10)));
+    preimage.extend(OP_OUTPUT_ROOT.0);
+    preimage
+}
+
+/// `create(9, SUPER_ROOT, preimage)`, as OP Mainnet's proposer calls it.
+fn super_root_call(preimage: &[u8]) -> Vec<u8> {
+    let mut input = vec![0x82, 0xec, 0xf2, 0xf6];
+    input.extend(word(U256::from(9)));
+    input.extend(SUPER_ROOT.0);
+    input.extend(word(U256::from(0x60)));
+    input.extend(word(U256::from(preimage.len())));
+    input.extend(preimage);
+    input.resize(4 + 128 + preimage.len().next_multiple_of(32), 0);
     input
 }
 
@@ -145,11 +181,11 @@ fn games_of_the_respected_type_name_their_block_and_claim() {
         vec![(7, creation_call(53_042_760))],
     );
     assert_eq!(
-        observe(&BASE, &block),
+        observe(&BASE, 8453, &block),
         vec![
             Observation::GameCreated {
                 game: GAME,
-                l2_block: 53_042_760,
+                l2_block: ClaimedBlock::Number(53_042_760),
                 root: ROOT,
             },
             Observation::AnchorUpdated { game: GAME },
@@ -157,7 +193,43 @@ fn games_of_the_respected_type_name_their_block_and_claim() {
     );
     // Without its creation call the game cannot be placed.
     let unreadable = frame(1, vec![created(621)], Vec::new());
-    assert!(observe(&BASE, &unreadable).is_empty());
+    assert!(observe(&BASE, 8453, &unreadable).is_empty());
+}
+
+#[test]
+fn super_root_games_name_their_block_by_time_and_hold_the_chains_output_root() {
+    let created = log(
+        address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
+        vec![
+            DISPUTE_GAME_CREATED,
+            SUPER_GAME.into_word(),
+            B256::from(U256::from(9)),
+            SUPER_ROOT,
+        ],
+        Vec::new(),
+        6,
+    );
+    let block = |preimage: &[u8]| {
+        frame(
+            26_337_378,
+            vec![created.clone()],
+            vec![(6, super_root_call(preimage))],
+        )
+    };
+    assert_eq!(
+        observe(&OP_MAINNET, 10, &block(&super_root_preimage())),
+        vec![Observation::GameCreated {
+            game: SUPER_GAME,
+            l2_block: ClaimedBlock::Time(1_793_744_951),
+            root: OP_OUTPUT_ROOT,
+        }]
+    );
+    // A preimage the claim does not hash to says nothing, and neither does
+    // one without the chain.
+    let mut forged = super_root_preimage();
+    forged[72] ^= 1;
+    assert!(observe(&OP_MAINNET, 10, &block(&forged)).is_empty());
+    assert!(observe(&OP_MAINNET, 8453, &block(&super_root_preimage())).is_empty());
 }
 
 #[test]
@@ -178,6 +250,7 @@ fn confirmed_assertions_name_their_block_hash() {
     assert_eq!(
         observe(
             &ROBINHOOD,
+            4663,
             &frame(1, vec![confirmed, elsewhere], Vec::new())
         ),
         vec![Observation::AssertionConfirmed {
@@ -206,17 +279,17 @@ fn a_game_finalizes_its_block_only_when_its_claim_matched_a_signed_block() {
     let path = directory.path().join("games.json");
     let hash = B256::repeat_byte(5);
     let mut ledger = GameLedger::load(Some(path.clone()), 4).expect("ledger");
-    ledger.record_block(100, hash, ROOT);
+    ledger.record_block(100, hash, ROOT, 1_000);
     let other = Address::repeat_byte(3);
     for observation in [
         Observation::GameCreated {
             game: GAME,
-            l2_block: 100,
+            l2_block: ClaimedBlock::Number(100),
             root: ROOT,
         },
         Observation::GameCreated {
             game: other,
-            l2_block: 100,
+            l2_block: ClaimedBlock::Number(100),
             root: B256::repeat_byte(9),
         },
     ] {
@@ -238,11 +311,45 @@ fn a_game_finalizes_its_block_only_when_its_claim_matched_a_signed_block() {
     );
     // Signed blocks beyond the capacity are forgotten, oldest first.
     for number in 0..6 {
-        ledger.record_block(number, hash, ROOT);
+        ledger.record_block(number, hash, ROOT, number);
     }
     assert_eq!(
         ledger.signed.keys().copied().collect::<Vec<_>>(),
         [2, 3, 4, 5]
+    );
+}
+
+#[test]
+fn a_super_root_game_finalizes_the_signed_block_made_at_its_time() {
+    // OP Mainnet block 159,073,087, whose header gives the output root the
+    // super root holds.
+    let output = output_root(
+        b256!("0xac77b135f179847082b8f199623c5c28bcf51e674f6fda4a5f3a76ff951e1b83"),
+        b256!("0xdb83ef9f8451e27b1a4bb15ca3140d7414f816b4f489ab8bb4ed5244ff3c5465"),
+        b256!("0x79e40e07815b96e2b5f0862030a135a94b4f3a91fe67d1105e9440b97824ce93"),
+    );
+    assert_eq!(output, OP_OUTPUT_ROOT);
+    assert_eq!(keccak256(super_root_preimage()), SUPER_ROOT);
+    let hash = b256!("0x79e40e07815b96e2b5f0862030a135a94b4f3a91fe67d1105e9440b97824ce93");
+    let mut ledger = GameLedger::load(None, 4).expect("ledger");
+    ledger.record_block(
+        159_073_086,
+        B256::repeat_byte(4),
+        B256::repeat_byte(8),
+        1_793_744_949,
+    );
+    ledger.record_block(159_073_087, hash, output, 1_793_744_951);
+    let created = Observation::GameCreated {
+        game: SUPER_GAME,
+        l2_block: ClaimedBlock::Time(1_793_744_951),
+        root: OP_OUTPUT_ROOT,
+    };
+    assert_eq!(ledger.observe(created).expect("observe"), None);
+    assert_eq!(
+        ledger
+            .observe(Observation::AnchorUpdated { game: SUPER_GAME })
+            .expect("observe"),
+        Some((159_073_087, hash))
     );
 }
 
@@ -326,6 +433,7 @@ async fn the_lane_reads_each_finalized_range_once_and_resumes_after_it() {
             blocks: ChainRef(chain.clone()),
             cursor_path: cursor_path.clone(),
             lookback: 2,
+            chain_id: 4663,
         };
         async move {
             let (sender, mut received) = mpsc::channel(64);

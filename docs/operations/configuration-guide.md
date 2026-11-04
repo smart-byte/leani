@@ -103,8 +103,7 @@ history comes through the live lane. A Nitro chain follows its sequencer feed
 over the entry's public JSON-RPC endpoints, with history from the sources the
 entry names: SonarX and then the endpoints for Arbitrum One, the endpoints
 for the others. On a rollup, `[finality]` holds the Ethereum Mainnet
-checkpoint its L1 anchor reads. OP Mainnet and Base Sepolia take none: the
-anchor does not read OP Mainnet's super roots, and Base Sepolia settles on
+checkpoint its L1 anchor reads. Base Sepolia takes none: it settles on
 Ethereum Sepolia. Uniswap markets are Ethereum Mainnet's.
 
 Validate a file without opening its database or any network connection:
@@ -617,16 +616,19 @@ an RPC endpoint.
   holds it. Confirmation takes about 6.4 days. The endpoints' `finalized`
   tag no longer finalizes anything, and recent frames are pruned
   `finality.settle_blocks` (default 3,600) below the tip.
-- Op-stack chains with output-root games (Base): a game of the respected type
-  is checked when it is created against the output root of the block the
+- Op-stack chains (Base, OP Mainnet): a game of the respected type is
+  checked when it is created against the output root of the block the
   sequencer signed, and that block is `finalized` once the anchor state
-  registry moves to the game, about five days later on Base. OP Mainnet's
-  games claim super roots, which the anchor does not read.
+  registry moves to the game, about five days later on Base and seven on OP
+  Mainnet. OP Mainnet's games claim super roots (`claims = "super_roots"`):
+  the creation call carries the super root's preimage, which holds OP
+  Mainnet's output root at a time, and the anchor checks the preimage
+  against the claim and that root against the block signed at that time.
 
 The lane reads the receipts of the finalized L1 blocks whose logs bloom may
-hold the contracts' logs, at most about 1 GB a day. Base's game creations
-also need their call data, so on Base it reads every block's receipts and
-body, about 2 GB a day. Where
+hold the contracts' logs, at most about 1 GB a day. Op-stack game creations
+also need their call data, so on Base and OP Mainnet it reads every block's
+receipts and body, about 2 GB a day. Where
 it stopped survives restarts (`l1-anchor-cursor.json`); a cold start reads
 `lookback_blocks` (600 by default) below the first finalized block. Its
 execution P2P uses its own ports, `listener_port`, `discovery_port`, and

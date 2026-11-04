@@ -179,6 +179,7 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
         blocks: P2pFinalizedBlocks { source, request },
         cursor_path: config.data_dir.join("l1-anchor-cursor.json"),
         lookback: l1.lookback_blocks,
+        chain_id: config.chain_entry()?.chain_id,
     })
 }
 
@@ -352,7 +353,7 @@ fn follow_dispute_games(
                     let Some(block) = block else { return };
                     if let Some(withdrawals_root) = block.withdrawals_root {
                         let root = leani_l1_anchor::output_root(block.state_root, withdrawals_root, block.hash);
-                        ledger.record_block(block.number, block.hash, root);
+                        ledger.record_block(block.number, block.hash, root, block.timestamp);
                     }
                 }
                 observation = observations.recv() => {

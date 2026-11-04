@@ -339,15 +339,26 @@ fn rollups_name_their_l1_anchor() {
                 .parse()
                 .unwrap(),
             game_type: 621,
+            claims: GameClaims::OutputRoots,
+        })
+    );
+    assert_eq!(
+        registry.get("op-mainnet").unwrap().l1_anchor,
+        Some(L1Anchor::DisputeGames {
+            factory: "0xe5965Ab5962eDc7477C8520243A95517CD252fA9"
+                .parse()
+                .unwrap(),
+            registry: "0x23b2c62946350f4246f9f9d027e071f0264fd113"
+                .parse()
+                .unwrap(),
+            game_type: 9,
+            claims: GameClaims::SuperRoots,
         })
     );
     assert!(matches!(
         registry.get("robinhood").unwrap().l1_anchor,
         Some(L1Anchor::NitroRollup { .. })
     ));
-    // OP Mainnet's respected games claim super roots, which the anchor does
-    // not read.
-    assert_eq!(registry.get("op-mainnet").unwrap().l1_anchor, None);
     let misplaced = include_str!("../../../config/chains/arbitrum-one.toml")
         .replace("family = \"arbitrum\"", "family = \"ethereum\"");
     assert!(Chain::from_entry(&misplaced, None).is_err());

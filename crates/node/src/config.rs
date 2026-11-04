@@ -4584,7 +4584,7 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
             Config::load(&path)
         };
         for (network, anchored) in [
-            ("op", false),
+            ("op", true),
             ("base", true),
             ("base-sepolia", false),
             ("arbitrum-one", true),
@@ -4623,7 +4623,7 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
         assert_eq!(history("robinhood"), ["json_rpc"]);
         // Op-stack history comes through the live lane.
         assert!(history("base").is_empty());
-        let error = load("op", true).expect_err("nothing reads the checkpoint");
+        let error = load("base-sepolia", true).expect_err("nothing reads the checkpoint");
         assert!(error.to_string().contains("no L1 anchor"), "{error}");
         let error = load("ethereum-hoodi", false).expect_err("no checkpoint");
         assert!(error.to_string().contains("verified checkpoint"), "{error}");

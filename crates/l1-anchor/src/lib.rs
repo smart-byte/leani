@@ -2,8 +2,8 @@
 //! events in L1 blocks; once those blocks are finalized, the events say
 //! which L2 block the chain's own rules treat as final: a confirmed Nitro
 //! assertion names its block hash, and an op-stack anchor state registry
-//! moves to a dispute game whose root claim is checked against a block the
-//! sequencer signed.
+//! moves to a dispute game whose claim, an output root or a super root
+//! holding one, is checked against a block the sequencer signed.
 
 use std::{
     collections::BTreeMap,
@@ -13,7 +13,7 @@ use std::{
 
 use alloy_primitives::{Address, B256, b256, keccak256};
 use futures::StreamExt;
-use leani_chain::L1Anchor;
+use leani_chain::{GameClaims, L1Anchor};
 use leani_primitives::{
     BlockFrame, BlockHash, BlockNumber, BlockRange, Capability, CapabilitySet, ChainId, Material,
     SourceId, SourceKind, TrustModel,
@@ -38,17 +38,27 @@ const ASSERTION_CONFIRMED: B256 =
     b256!("0xfc42829b29c259a7370ab56c8f69fce23b5f351a9ce151da453281993ec0090c");
 /// `create(uint32,bytes32,bytes)` and
 /// `createWithInitData(uint32,bytes32,bytes,bytes)`: the extra data, at the
-/// same place in both, starts with the claimed L2 block number.
+/// same place in both, starts with the claimed L2 block number, or is the
+/// preimage of the claimed super root.
 const CREATE_SELECTORS: [[u8; 4]; 2] = [[0x82, 0xec, 0xf2, 0xf6], [0x10, 0x11, 0xf3, 0x77]];
+
+/// The L2 block a dispute game claims an output root for.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ClaimedBlock {
+    Number(u64),
+    /// The block made at this Unix time, as a super root names its chains'
+    /// blocks.
+    Time(u64),
+}
 
 /// What a finalized L1 block says about the rollup.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Observation {
-    /// A game of the anchor's type claims `root` as the output root of L2
-    /// block `l2_block`.
+    /// A game of the anchor's type claims `root` as the output root of
+    /// `l2_block`.
     GameCreated {
         game: Address,
-        l2_block: u64,
+        l2_block: ClaimedBlock,
         root: B256,
     },
     /// The registry's anchor moved to `game`.
@@ -78,11 +88,11 @@ pub const fn calldata_recipient(anchor: &L1Anchor) -> Option<Address> {
     }
 }
 
-/// The anchor's observations in one L1 block, in log order. A game created
-/// through another contract has no readable creation call and is skipped:
-/// a later game moves finality on.
+/// The anchor's observations in one L1 block of rollup `chain_id`, in log
+/// order. A game created through another contract has no readable creation
+/// call and is skipped: a later game moves finality on.
 #[must_use]
-pub fn observe(anchor: &L1Anchor, frame: &BlockFrame) -> Vec<Observation> {
+pub fn observe(anchor: &L1Anchor, chain_id: u64, frame: &BlockFrame) -> Vec<Observation> {
     let logs = match &frame.logs {
         Material::Complete(logs) | Material::Filtered { value: logs, .. } => logs.as_slice(),
         Material::Missing(_) => return Vec::new(),
@@ -107,18 +117,21 @@ pub fn observe(anchor: &L1Anchor, frame: &BlockFrame) -> Vec<Observation> {
                 factory,
                 registry,
                 game_type,
+                claims,
             } => {
                 if address == factory && topic(0) == Some(DISPUTE_GAME_CREATED) {
-                    let (Some(game), Some(kind), Some(root)) = (topic(1), topic(2), topic(3))
+                    let (Some(game), Some(kind), Some(claim)) = (topic(1), topic(2), topic(3))
                     else {
                         continue;
                     };
                     if kind != B256::from(alloy_primitives::U256::from(game_type)) {
                         continue;
                     }
-                    let Some(l2_block) = calldata(log.transaction_index).and_then(claimed_block)
+                    let Some((l2_block, root)) = calldata(log.transaction_index)
+                        .and_then(extra_data)
+                        .and_then(|extra| claimed(extra, claims, claim, chain_id))
                     else {
-                        debug!(game = %Address::from_word(game), "no readable creation call for a dispute game");
+                        debug!(game = %Address::from_word(game), "no readable claim in a dispute game's creation call");
                         continue;
                     };
                     Observation::GameCreated {
@@ -150,20 +163,54 @@ pub fn observe(anchor: &L1Anchor, frame: &BlockFrame) -> Vec<Observation> {
     observations
 }
 
-/// The L2 block a game creation call claims: the first word of its extra
-/// data, the third argument of both creation functions.
-fn claimed_block(input: &[u8]) -> Option<u64> {
+/// The extra data of a game creation call: the third argument of both
+/// creation functions.
+fn extra_data(input: &[u8]) -> Option<&[u8]> {
     let (selector, arguments) = input.split_first_chunk::<4>()?;
     if !CREATE_SELECTORS.contains(selector) {
         return None;
     }
     let word = |offset: usize| arguments.get(offset..offset.checked_add(32)?);
-    let extra = usize::try_from(alloy_primitives::U256::from_be_slice(word(64)?)).ok()?;
-    let length = alloy_primitives::U256::from_be_slice(word(extra)?);
-    if length < alloy_primitives::U256::from(32) {
-        return None;
+    let start = usize::try_from(alloy_primitives::U256::from_be_slice(word(64)?)).ok()?;
+    let length = usize::try_from(alloy_primitives::U256::from_be_slice(word(start)?)).ok()?;
+    let from = start.checked_add(32)?;
+    arguments.get(from..from.checked_add(length)?)
+}
+
+/// The block a game's `extra` data names and the output root `claim` holds
+/// for it: the claim itself, or the rollup's entry in the super root it is.
+fn claimed(
+    extra: &[u8],
+    claims: GameClaims,
+    claim: B256,
+    chain_id: u64,
+) -> Option<(ClaimedBlock, B256)> {
+    match claims {
+        GameClaims::OutputRoots => {
+            let number = alloy_primitives::U256::from_be_slice(extra.get(..32)?);
+            Some((ClaimedBlock::Number(u64::try_from(number).ok()?), claim))
+        }
+        GameClaims::SuperRoots => {
+            // Version 1: the time, then each chain's id and output root.
+            if keccak256(extra) != claim {
+                return None;
+            }
+            let (&version, rest) = extra.split_first()?;
+            let (time, outputs) = rest.split_first_chunk::<8>()?;
+            let (outputs, partial) = outputs.as_chunks::<64>();
+            if version != 1 || !partial.is_empty() {
+                return None;
+            }
+            let output = outputs.iter().find(|output| {
+                alloy_primitives::U256::from_be_slice(&output[..32])
+                    == alloy_primitives::U256::from(chain_id)
+            })?;
+            Some((
+                ClaimedBlock::Time(u64::from_be_bytes(*time)),
+                B256::from_slice(&output[32..]),
+            ))
+        }
     }
-    u64::try_from(alloy_primitives::U256::from_be_slice(word(extra + 32)?)).ok()
 }
 
 /// An op-stack output root (version 0), as dispute games claim it.
@@ -185,7 +232,8 @@ pub fn output_root(state_root: B256, withdrawals_root: B256, block_hash: B256) -
 #[derive(Debug)]
 pub struct GameLedger {
     capacity: usize,
-    signed: BTreeMap<u64, (B256, B256)>,
+    /// Each signed block's hash, output root, and time.
+    signed: BTreeMap<u64, (B256, B256, u64)>,
     games: BTreeMap<Address, (u64, B256)>,
     path: Option<PathBuf>,
 }
@@ -219,9 +267,10 @@ impl GameLedger {
         })
     }
 
-    /// Remember a signed block and its output root.
-    pub fn record_block(&mut self, number: u64, hash: B256, output_root: B256) {
-        self.signed.insert(number, (hash, output_root));
+    /// Remember a signed block, its output root, and the Unix time it was
+    /// made.
+    pub fn record_block(&mut self, number: u64, hash: B256, output_root: B256, time: u64) {
+        self.signed.insert(number, (hash, output_root, time));
         while self.signed.len() > self.capacity {
             self.signed.pop_first();
         }
@@ -239,17 +288,23 @@ impl GameLedger {
                 l2_block,
                 root,
             } => {
-                match self.signed.get(&l2_block) {
-                    Some((hash, signed_root)) if *signed_root == root => {
-                        info!(%game, l2_block, "a dispute game claims the signed block's output root");
-                        self.games.insert(game, (l2_block, *hash));
+                let signed = match l2_block {
+                    ClaimedBlock::Number(number) => self.signed.get_key_value(&number),
+                    ClaimedBlock::Time(time) => {
+                        self.signed.iter().find(|(_, (_, _, made))| *made == time)
+                    }
+                };
+                match signed {
+                    Some((&number, &(hash, signed_root, _))) if signed_root == root => {
+                        info!(%game, l2_block = number, "a dispute game claims the signed block's output root");
+                        self.games.insert(game, (number, hash));
                         self.save()?;
                     }
-                    Some(_) => {
-                        warn!(%game, l2_block, "a dispute game claims another output root than the signed block's");
+                    Some((&number, _)) => {
+                        warn!(%game, l2_block = number, "a dispute game claims another output root than the signed block's");
                     }
                     None => {
-                        debug!(%game, l2_block, "a dispute game claims a block this node did not see signed");
+                        debug!(%game, ?l2_block, "a dispute game claims a block this node did not see signed");
                     }
                 }
                 Ok(None)
@@ -327,6 +382,8 @@ pub struct AnchorLane<B> {
     pub blocks: B,
     pub cursor_path: PathBuf,
     pub lookback: u64,
+    /// The rollup's chain id, by which a super root names its output root.
+    pub chain_id: u64,
 }
 
 impl<B: FinalizedBlocks> AnchorLane<B> {
@@ -390,7 +447,7 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             }
             let mut found = 0_usize;
             for frame in &frames {
-                for observation in observe(&self.anchor, frame) {
+                for observation in observe(&self.anchor, self.chain_id, frame) {
                     found += 1;
                     if observations.send(observation).await.is_err() {
                         return Ok(());
