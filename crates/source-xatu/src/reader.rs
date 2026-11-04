@@ -19,18 +19,22 @@ use parquet::{
     errors::{ParquetError, Result},
     file::metadata::{ParquetMetaData, ParquetMetaDataReader},
 };
+use tokio::sync::Semaphore;
 
 /// Ranges this close together are fetched as one request, as `object_store`
 /// coalesces them, while the input budget covers the bytes between them.
 const RANGE_COALESCE_BYTES: u64 = 1_024 * 1_024;
+/// Longest range one request reads: a longer one goes out as parts in
+/// parallel.
+pub(crate) const PART_BYTES: u64 = 8 * 1_024 * 1_024;
 /// Largest range read while loading a Parquet footer. The footer's own
 /// length field names the metadata range, and Xatu footers are a few
 /// megabytes at most.
 const MAX_METADATA_BYTES: u64 = 64 * 1_024 * 1_024;
 
-/// Bytes one source open may request from the object store. A reader starts
-/// from what the open's earlier objects used, and charges each request before
-/// it is sent: footers, column chunks, and the gaps merged between them.
+/// Bytes one source open may request from the object store, shared by its
+/// readers. Each charges a request before it is sent: footers, column chunks,
+/// and the gaps merged between them.
 #[derive(Debug)]
 pub(crate) struct InputBudget {
     limit: u64,
@@ -40,11 +44,11 @@ pub(crate) struct InputBudget {
 }
 
 impl InputBudget {
-    /// A budget of `limit` bytes, `used` of them by earlier objects.
-    pub(crate) fn new(limit: u64, used: u64) -> Arc<Self> {
+    /// A budget of `limit` bytes.
+    pub(crate) fn new(limit: u64) -> Arc<Self> {
         Arc::new(Self {
             limit,
-            used: AtomicU64::new(used),
+            used: AtomicU64::new(0),
             refused: AtomicU64::new(0),
         })
     }
@@ -89,8 +93,8 @@ pub(crate) struct ObjectStoreReader {
     /// an object rewritten mid-read fails the read instead of mixing two
     /// versions.
     e_tag: Option<String>,
-    /// Most range requests in flight at once.
-    concurrency: usize,
+    /// Range requests in flight, shared by the objects one open reads.
+    requests: Arc<Semaphore>,
     budget: Arc<InputBudget>,
     metrics: Arc<ReaderMetrics>,
 }
@@ -109,12 +113,13 @@ pub(crate) struct ReaderMetricsSnapshot {
 }
 
 impl ObjectStoreReader {
-    /// Read the object `head` describes, pinned to its `ETag`, with at most
-    /// `concurrency` range requests in flight, charging each to `budget`.
+    /// Read the object `head` describes, pinned to its `ETag`, holding one of
+    /// `requests` for each range request in flight and charging each to
+    /// `budget`.
     pub(crate) fn new(
         store: Arc<dyn ObjectStore>,
         head: &ObjectMeta,
-        concurrency: usize,
+        requests: Arc<Semaphore>,
         budget: Arc<InputBudget>,
     ) -> (Self, ReaderMetricsHandle) {
         let metrics = Arc::new(ReaderMetrics::default());
@@ -124,7 +129,7 @@ impl ObjectStoreReader {
                 path: head.location.clone(),
                 file_size: head.size,
                 e_tag: head.e_tag.clone(),
-                concurrency: concurrency.max(1),
+                requests,
                 budget,
                 metrics: Arc::clone(&metrics),
             },
@@ -145,6 +150,11 @@ impl ObjectStoreReader {
         let options = GetOptions::new()
             .with_range(Some(range.clone()))
             .with_if_match(self.e_tag.clone());
+        let _request = self
+            .requests
+            .acquire()
+            .await
+            .map_err(|error| ParquetError::General(error.to_string()))?;
         let mut body = self
             .store
             .get_opts(&self.path, options)
@@ -225,6 +235,18 @@ fn merge_ranges(ranges: &[Range<u64>], mut gap_allowance: u64) -> Vec<Range<u64>
     merged
 }
 
+/// The parts of one range, in order, as one.
+fn join(mut parts: impl Iterator<Item = Bytes>) -> Bytes {
+    let first = parts.next().unwrap_or_default();
+    let Some(second) = parts.next() else {
+        return first;
+    };
+    let mut joined = BytesMut::from(first);
+    joined.extend_from_slice(&second);
+    parts.for_each(|part| joined.extend_from_slice(&part));
+    joined.freeze()
+}
+
 fn span_bytes(ranges: &[Range<u64>]) -> u64 {
     ranges.iter().fold(0, |total, range| {
         total.saturating_add(range.end - range.start)
@@ -260,11 +282,26 @@ impl AsyncFileReader for ObjectStoreReader {
             let merged = merge_ranges(&ranges, self.budget.remaining().saturating_sub(needed));
             self.budget.charge(span_bytes(&merged))?;
             let reader = &*self;
-            let fetched = stream::iter(merged.iter().cloned())
-                .map(|range| reader.read_pinned(range))
-                .buffered(reader.concurrency)
+            let parts = merged
+                .iter()
+                .map(|range| {
+                    (range.start..range.end)
+                        .step_by(usize::try_from(PART_BYTES).unwrap_or(usize::MAX))
+                        .map(|start| start..start.saturating_add(PART_BYTES).min(range.end))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            let count = parts.iter().map(Vec::len).sum::<usize>();
+            let mut fetched = stream::iter(parts.iter().flatten().cloned())
+                .map(|part| reader.read_pinned(part))
+                .buffered(count.max(1))
                 .try_collect::<Vec<_>>()
-                .await?;
+                .await?
+                .into_iter();
+            let fetched = parts
+                .iter()
+                .map(|split| join(fetched.by_ref().take(split.len())))
+                .collect::<Vec<_>>();
             let pages = ranges
                 .iter()
                 .map(|range| {
@@ -382,8 +419,8 @@ mod tests {
             let (mut reader, _) = ObjectStoreReader::new(
                 Arc::clone(&store),
                 &head,
-                MAX_HTTP_RANGE_CONCURRENCY,
-                InputBudget::new(u64::MAX, 0),
+                Arc::new(Semaphore::new(MAX_HTTP_RANGE_CONCURRENCY)),
+                InputBudget::new(u64::MAX),
             );
             let metadata = tokio::time::timeout(deadline, reader.get_metadata(None))
                 .await
@@ -458,8 +495,12 @@ mod tests {
         let path = Path::from("footer.parquet");
         store.put(&path, vec![0_u8; 64].into()).await.expect("put");
         let head = store.head(&path).await.expect("head");
-        let (mut reader, metrics) =
-            ObjectStoreReader::new(store, &head, 4, InputBudget::new(u64::MAX, 0));
+        let (mut reader, metrics) = ObjectStoreReader::new(
+            store,
+            &head,
+            Arc::new(Semaphore::new(4)),
+            InputBudget::new(u64::MAX),
+        );
         // A footer's length field is untrusted, and names the metadata range.
         assert!(
             MetadataReads(&mut reader)
@@ -487,8 +528,12 @@ mod tests {
             .collect();
         store.put(&path, payload.clone().into()).await.expect("put");
         let head = store.head(&path).await.expect("head");
-        let (mut reader, metrics) =
-            ObjectStoreReader::new(store, &head, 4, InputBudget::new(u64::MAX, 0));
+        let (mut reader, metrics) = ObjectStoreReader::new(
+            store,
+            &head,
+            Arc::new(Semaphore::new(4)),
+            InputBudget::new(u64::MAX),
+        );
         assert_eq!(
             reader.get_bytes(13..800_009).await.expect("large read"),
             payload[13..800_009]

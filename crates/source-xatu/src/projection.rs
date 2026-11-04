@@ -27,6 +27,7 @@ use parquet::{
     file::metadata::ParquetMetaData,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -494,35 +495,29 @@ impl XatuBlobsProjector {
             ));
         }
         let started = Instant::now();
-        let mut projected_bytes = 0_u64;
-        let mut metrics = Vec::new();
-        let mut execution_blocks = BTreeMap::new();
-        let mut beacon_blocks = BTreeMap::new();
-        let mut execution_transactions = BTreeMap::new();
-        let mut beacon_transactions = Vec::new();
-        let mut transaction_sizes = BTreeMap::new();
-        let mut withdrawals = BTreeMap::new();
-
-        for object in self
-            .catalog
-            .execution_objects(XatuTable::CanonicalExecutionBlock, range)?
-        {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    EXECUTION_BLOCK_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_execution_blocks(batch, range, &mut execution_blocks),
-                )
-                .await?,
-            );
-        }
-        let (start_date, end_date) =
-            if let Some(dates) = dates {
+        let open = OpenBudget::new(budget);
+        let store = self.catalog.store();
+        let beacon = async {
+            let mut metrics = Vec::new();
+            let mut execution_blocks = BTreeMap::new();
+            for object in self
+                .catalog
+                .execution_objects(XatuTable::CanonicalExecutionBlock, range)?
+            {
+                metrics.push(
+                    read_projected(
+                        Arc::clone(&store),
+                        &object,
+                        EXECUTION_BLOCK_COLUMNS,
+                        &open,
+                        batch_rows,
+                        &cancellation,
+                        |batch| parse_execution_blocks(batch, range, &mut execution_blocks),
+                    )
+                    .await?,
+                );
+            }
+            let (start_date, end_date) = if let Some(dates) = dates {
                 dates
             } else {
                 let first = execution_blocks.values().next().ok_or_else(|| {
@@ -536,92 +531,136 @@ impl XatuBlobsProjector {
                     XatuDate::from_unix_seconds(last.timestamp)?,
                 )
             };
-        for object in
-            self.catalog
-                .daily_objects(XatuTable::CanonicalBeaconBlock, start_date, end_date)?
-        {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    BEACON_BLOCK_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_beacon_blocks(batch, range, &mut beacon_blocks),
-                )
-                .await?,
-            );
-        }
-        let slots = beacon_blocks
-            .values()
-            .map(|block| block.slot)
-            .collect::<BTreeSet<_>>();
-        for object in self.catalog.daily_objects(
-            XatuTable::CanonicalBeaconBlockExecutionTransaction,
-            start_date,
-            end_date,
-        )? {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    BEACON_TRANSACTION_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| {
-                        parse_beacon_transactions(
-                            batch,
-                            &slots,
-                            &mut beacon_transactions,
-                            &mut transaction_sizes,
+            let mut beacon_blocks = BTreeMap::new();
+            for object in
+                self.catalog
+                    .daily_objects(XatuTable::CanonicalBeaconBlock, start_date, end_date)?
+            {
+                metrics.push(
+                    read_projected(
+                        Arc::clone(&store),
+                        &object,
+                        BEACON_BLOCK_COLUMNS,
+                        &open,
+                        batch_rows,
+                        &cancellation,
+                        |batch| parse_beacon_blocks(batch, range, &mut beacon_blocks),
+                    )
+                    .await?,
+                );
+            }
+            let slots = beacon_blocks
+                .values()
+                .map(|block| block.slot)
+                .collect::<BTreeSet<_>>();
+            let transactions = async {
+                let mut metrics = Vec::new();
+                let mut beacon_transactions = Vec::new();
+                let mut transaction_sizes = BTreeMap::new();
+                for object in self.catalog.daily_objects(
+                    XatuTable::CanonicalBeaconBlockExecutionTransaction,
+                    start_date,
+                    end_date,
+                )? {
+                    metrics.push(
+                        read_projected(
+                            Arc::clone(&store),
+                            &object,
+                            BEACON_TRANSACTION_COLUMNS,
+                            &open,
+                            batch_rows,
+                            &cancellation,
+                            |batch| {
+                                parse_beacon_transactions(
+                                    batch,
+                                    &slots,
+                                    &mut beacon_transactions,
+                                    &mut transaction_sizes,
+                                )
+                            },
                         )
-                    },
-                )
-                .await?,
-            );
-        }
-        for object in self.catalog.daily_objects(
-            XatuTable::CanonicalBeaconBlockWithdrawal,
-            start_date,
-            end_date,
-        )? {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    WITHDRAWAL_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_withdrawals(batch, &slots, &mut withdrawals),
-                )
-                .await?,
-            );
-        }
-        for object in self
-            .catalog
-            .execution_objects(XatuTable::CanonicalExecutionTransaction, range)?
-        {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    EXECUTION_TRANSACTION_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_execution_transactions(batch, range, &mut execution_transactions),
-                )
-                .await?,
-            );
-        }
-
+                        .await?,
+                    );
+                }
+                Ok::<_, XatuError>((metrics, beacon_transactions, transaction_sizes))
+            };
+            let withdrawals = async {
+                let mut metrics = Vec::new();
+                let mut withdrawals = BTreeMap::new();
+                for object in self.catalog.daily_objects(
+                    XatuTable::CanonicalBeaconBlockWithdrawal,
+                    start_date,
+                    end_date,
+                )? {
+                    metrics.push(
+                        read_projected(
+                            Arc::clone(&store),
+                            &object,
+                            WITHDRAWAL_COLUMNS,
+                            &open,
+                            batch_rows,
+                            &cancellation,
+                            |batch| parse_withdrawals(batch, &slots, &mut withdrawals),
+                        )
+                        .await?,
+                    );
+                }
+                Ok::<_, XatuError>((metrics, withdrawals))
+            };
+            let (
+                (transaction_metrics, beacon_transactions, transaction_sizes),
+                (withdrawal_metrics, withdrawals),
+            ) = futures::try_join!(transactions, withdrawals)?;
+            metrics.extend(transaction_metrics);
+            metrics.extend(withdrawal_metrics);
+            Ok::<_, XatuError>((
+                metrics,
+                execution_blocks,
+                beacon_blocks,
+                beacon_transactions,
+                transaction_sizes,
+                withdrawals,
+            ))
+        };
+        let execution = async {
+            let mut metrics = Vec::new();
+            let mut execution_transactions = BTreeMap::new();
+            for object in self
+                .catalog
+                .execution_objects(XatuTable::CanonicalExecutionTransaction, range)?
+            {
+                metrics.push(
+                    read_projected(
+                        Arc::clone(&store),
+                        &object,
+                        EXECUTION_TRANSACTION_COLUMNS,
+                        &open,
+                        batch_rows,
+                        &cancellation,
+                        |batch| {
+                            parse_execution_transactions(batch, range, &mut execution_transactions)
+                        },
+                    )
+                    .await?,
+                );
+            }
+            Ok::<_, XatuError>((metrics, execution_transactions))
+        };
+        // The execution blocks name the days of the beacon tables, and the
+        // beacon blocks the slots the other two keep; the execution
+        // transactions need neither.
+        let (
+            (
+                mut metrics,
+                execution_blocks,
+                beacon_blocks,
+                beacon_transactions,
+                transaction_sizes,
+                withdrawals,
+            ),
+            (execution_metrics, execution_transactions),
+        ) = futures::try_join!(beacon, execution)?;
+        metrics.extend(execution_metrics);
         let provenance = metrics
             .iter()
             .map(|metric| metric.provenance(range))
@@ -717,128 +756,138 @@ impl XatuBlobsProjector {
             ));
         }
         let started = Instant::now();
-        let mut projected_bytes = 0_u64;
-        let mut metrics = Vec::new();
-        let mut execution_blocks = BTreeMap::new();
-        for object in self
-            .catalog
-            .execution_objects(XatuTable::CanonicalExecutionBlock, range)?
-        {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    GENERIC_EXECUTION_BLOCK_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_generic_execution_blocks(batch, range, &mut execution_blocks),
-                )
-                .await?,
-            );
-        }
-        let first = execution_blocks
-            .values()
-            .next()
-            .ok_or_else(|| XatuError::Data("execution range returned no blocks".to_owned()))?;
-        let last = execution_blocks
-            .values()
-            .next_back()
-            .ok_or_else(|| XatuError::Data("execution range returned no blocks".to_owned()))?;
-        let start_date = XatuDate::from_unix_seconds(first.timestamp)?;
-        let end_date = XatuDate::from_unix_seconds(last.timestamp)?;
+        let open = OpenBudget::new(budget);
+        let store = self.catalog.store();
+        let headers = async {
+            let mut metrics = Vec::new();
+            let mut execution_blocks = BTreeMap::new();
+            for object in self
+                .catalog
+                .execution_objects(XatuTable::CanonicalExecutionBlock, range)?
+            {
+                metrics.push(
+                    read_projected(
+                        Arc::clone(&store),
+                        &object,
+                        GENERIC_EXECUTION_BLOCK_COLUMNS,
+                        &open,
+                        batch_rows,
+                        &cancellation,
+                        |batch| parse_generic_execution_blocks(batch, range, &mut execution_blocks),
+                    )
+                    .await?,
+                );
+            }
+            let first = execution_blocks
+                .values()
+                .next()
+                .ok_or_else(|| XatuError::Data("execution range returned no blocks".to_owned()))?;
+            let last = execution_blocks
+                .values()
+                .next_back()
+                .ok_or_else(|| XatuError::Data("execution range returned no blocks".to_owned()))?;
+            let start_date = XatuDate::from_unix_seconds(first.timestamp)?;
+            let end_date = XatuDate::from_unix_seconds(last.timestamp)?;
 
-        let mut beacon_blocks = BTreeMap::new();
-        for object in
-            self.catalog
-                .daily_objects(XatuTable::CanonicalBeaconBlock, start_date, end_date)?
-        {
-            metrics.push(
-                read_projected(
-                    self.catalog.store(),
-                    &object,
-                    GENERIC_BEACON_BLOCK_COLUMNS,
-                    budget,
-                    batch_rows,
-                    &mut projected_bytes,
-                    &cancellation,
-                    |batch| parse_generic_beacon_blocks(batch, range, &mut beacon_blocks),
-                )
-                .await?,
-            );
-        }
+            let mut beacon_blocks = BTreeMap::new();
+            for object in
+                self.catalog
+                    .daily_objects(XatuTable::CanonicalBeaconBlock, start_date, end_date)?
+            {
+                metrics.push(
+                    read_projected(
+                        Arc::clone(&store),
+                        &object,
+                        GENERIC_BEACON_BLOCK_COLUMNS,
+                        &open,
+                        batch_rows,
+                        &cancellation,
+                        |batch| parse_generic_beacon_blocks(batch, range, &mut beacon_blocks),
+                    )
+                    .await?,
+                );
+            }
+            Ok::<_, XatuError>((metrics, execution_blocks, beacon_blocks))
+        };
 
-        let mut row_indices = BTreeMap::<u64, Vec<u32>>::new();
-        let mut transactions = BTreeMap::<u64, Vec<TransactionEnvelope>>::new();
-        let mut receipts = BTreeMap::<u64, Vec<ReceiptEnvelope>>::new();
-        let mut logs = BTreeMap::<u64, Vec<Log>>::new();
         let columns = TransactionColumns::for_groups(groups, filters);
-        match kind {
-            GenericProjectionKind::Headers => {}
-            GenericProjectionKind::Transactions => {
-                let names = columns.names();
-                for object in self
-                    .catalog
-                    .execution_objects(XatuTable::CanonicalExecutionTransaction, range)?
-                {
-                    metrics.push(
-                        read_projected(
-                            self.catalog.store(),
-                            &object,
-                            &names,
-                            budget,
-                            batch_rows,
-                            &mut projected_bytes,
-                            &cancellation,
-                            |batch| {
-                                parse_generic_transactions(
-                                    batch,
-                                    range,
-                                    filters,
-                                    columns,
-                                    &mut row_indices,
-                                    &mut transactions,
-                                    &mut receipts,
-                                )
-                            },
-                        )
-                        .await?,
-                    );
+        let body = async {
+            let mut metrics = Vec::new();
+            let mut row_indices = BTreeMap::<u64, Vec<u32>>::new();
+            let mut transactions = BTreeMap::<u64, Vec<TransactionEnvelope>>::new();
+            let mut receipts = BTreeMap::<u64, Vec<ReceiptEnvelope>>::new();
+            let mut logs = BTreeMap::<u64, Vec<Log>>::new();
+            match kind {
+                GenericProjectionKind::Headers => {}
+                GenericProjectionKind::Transactions => {
+                    let names = columns.names();
+                    for object in self
+                        .catalog
+                        .execution_objects(XatuTable::CanonicalExecutionTransaction, range)?
+                    {
+                        metrics.push(
+                            read_projected(
+                                Arc::clone(&store),
+                                &object,
+                                &names,
+                                &open,
+                                batch_rows,
+                                &cancellation,
+                                |batch| {
+                                    parse_generic_transactions(
+                                        batch,
+                                        range,
+                                        filters,
+                                        columns,
+                                        &mut row_indices,
+                                        &mut transactions,
+                                        &mut receipts,
+                                    )
+                                },
+                            )
+                            .await?,
+                        );
+                    }
+                }
+                GenericProjectionKind::Logs => {
+                    let columns = generic_log_columns(log_fields, filters);
+                    for object in self
+                        .catalog
+                        .execution_objects(XatuTable::CanonicalExecutionLogs, range)?
+                    {
+                        metrics.push(
+                            read_projected(
+                                Arc::clone(&store),
+                                &object,
+                                &columns,
+                                &open,
+                                batch_rows,
+                                &cancellation,
+                                |batch| {
+                                    parse_generic_logs(
+                                        batch,
+                                        range,
+                                        filters,
+                                        log_fields,
+                                        &mut row_indices,
+                                        &mut logs,
+                                    )
+                                },
+                            )
+                            .await?,
+                        );
+                    }
                 }
             }
-            GenericProjectionKind::Logs => {
-                let columns = generic_log_columns(log_fields, filters);
-                for object in self
-                    .catalog
-                    .execution_objects(XatuTable::CanonicalExecutionLogs, range)?
-                {
-                    metrics.push(
-                        read_projected(
-                            self.catalog.store(),
-                            &object,
-                            &columns,
-                            budget,
-                            batch_rows,
-                            &mut projected_bytes,
-                            &cancellation,
-                            |batch| {
-                                parse_generic_logs(
-                                    batch,
-                                    range,
-                                    filters,
-                                    log_fields,
-                                    &mut row_indices,
-                                    &mut logs,
-                                )
-                            },
-                        )
-                        .await?,
-                    );
-                }
-            }
-        }
-
+            Ok::<_, XatuError>((metrics, row_indices, transactions, receipts, logs))
+        };
+        // The execution blocks name the days of the beacon blocks; the
+        // transaction or log table needs neither.
+        let (
+            (mut metrics, execution_blocks, beacon_blocks),
+            (body_metrics, row_indices, transactions, receipts, logs),
+        ) = futures::try_join!(headers, body)?;
+        metrics.extend(body_metrics);
         let provenance = metrics
             .iter()
             .map(|metric| metric.provenance(range))
@@ -904,21 +953,49 @@ impl ProjectionObjectMetrics {
     }
 }
 
+/// The budget one source open shares among the objects it reads at once:
+/// the bytes it may request, its requests in flight, and the row group bytes
+/// its readers hold.
+struct OpenBudget {
+    budget: SourceBudget,
+    input: Arc<InputBudget>,
+    requests: Arc<Semaphore>,
+    /// Held row group bytes, in KiB rounded up.
+    resident: Semaphore,
+    resident_kib: u32,
+}
+
+impl OpenBudget {
+    fn new(budget: SourceBudget) -> Self {
+        let resident_kib = kib(budget.max_resident_bytes);
+        Self {
+            budget,
+            input: InputBudget::new(budget.max_input_bytes),
+            requests: Arc::new(Semaphore::new(budget.max_in_flight_requests.max(1))),
+            resident: Semaphore::new(resident_kib as usize),
+            resident_kib,
+        }
+    }
+}
+
+fn kib(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(1_024)).unwrap_or(u32::MAX)
+}
+
 /// Stream `columns` of `object` into `consume`. Every byte requested from
 /// the store, footer and merged gaps included, is charged before it is
-/// requested to the open's input budget, of which earlier objects used
-/// `input_bytes_used`.
-#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+/// requested to the open's input budget.
+#[allow(clippy::too_many_lines)]
 async fn read_projected(
     store: Arc<dyn ObjectStore>,
     object: &CatalogObject,
     columns: &[&str],
-    budget: SourceBudget,
+    open: &OpenBudget,
     batch_rows: usize,
-    input_bytes_used: &mut u64,
     cancellation: &CancellationToken,
     mut consume: impl FnMut(&RecordBatch) -> Result<u64, XatuError>,
 ) -> Result<ProjectionObjectMetrics, XatuError> {
+    let budget = open.budget;
     if cancellation.is_cancelled() {
         return Err(XatuError::Cancelled);
     }
@@ -941,7 +1018,7 @@ async fn read_projected(
             detail,
         });
     }
-    let input = InputBudget::new(budget.max_input_bytes, *input_bytes_used);
+    let input = &open.input;
     let parquet_error = |error: ParquetError| match input.refused() {
         Some(actual) => XatuError::Budget {
             resource: "input_bytes",
@@ -955,8 +1032,8 @@ async fn read_projected(
     let (reader, reader_metrics) = ObjectStoreReader::new(
         Arc::clone(&store),
         &head,
-        budget.max_in_flight_requests,
-        Arc::clone(&input),
+        Arc::clone(&open.requests),
+        Arc::clone(input),
     );
     let builder = ParquetRecordBatchStreamBuilder::new(reader)
         .await
@@ -977,7 +1054,7 @@ async fn read_projected(
         });
     }
     // The reader fetches, and holds, one row group's selected columns at a
-    // time.
+    // time, beside those the open's other readers hold.
     if largest_row_group > budget.max_resident_bytes {
         return Err(XatuError::Budget {
             resource: "resident_bytes",
@@ -985,6 +1062,13 @@ async fn read_projected(
             limit: budget.max_resident_bytes,
         });
     }
+    let _held = tokio::select! {
+        () = cancellation.cancelled() => return Err(XatuError::Cancelled),
+        permits = open
+            .resident
+            .acquire_many(kib(largest_row_group).min(open.resident_kib)) => permits
+            .map_err(|error| XatuError::Data(error.to_string()))?,
+    };
     let projection = ProjectionMask::roots(schema, root_indices);
     let mut stream = builder
         .with_batch_size(batch_rows)
@@ -1013,7 +1097,6 @@ async fn read_projected(
     }
 
     let reader_metrics = reader_metrics.snapshot();
-    *input_bytes_used = input.used();
     Ok(ProjectionObjectMetrics {
         table: object.table,
         partition: object.partition.clone(),
@@ -2821,6 +2904,13 @@ mod tests {
         weak_e_tags: bool,
         /// Bytes of every ranged read requested.
         requested_bytes: AtomicUsize,
+        /// The longest ranged read requested.
+        longest_range: AtomicUsize,
+        /// Hold every ranged read of the first object until a request for
+        /// the second one has arrived.
+        rendezvous: Option<(ObjectPath, ObjectPath)>,
+        requested: std::sync::Mutex<BTreeSet<ObjectPath>>,
+        request_arrived: tokio::sync::Notify,
     }
 
     impl std::fmt::Display for RecordingStore {
@@ -2853,6 +2943,30 @@ mod tests {
             location: &ObjectPath,
             options: GetOptions,
         ) -> object_store::Result<GetResult> {
+            self.requested
+                .lock()
+                .expect("requested lock")
+                .insert(location.clone());
+            self.request_arrived.notify_waiters();
+            if let Some((waiter, awaited)) = &self.rendezvous
+                && waiter == location
+                && matches!(options.range, Some(GetRange::Bounded(_)))
+            {
+                loop {
+                    let arrived = self.request_arrived.notified();
+                    tokio::pin!(arrived);
+                    arrived.as_mut().enable();
+                    if self
+                        .requested
+                        .lock()
+                        .expect("requested lock")
+                        .contains(awaited)
+                    {
+                        break;
+                    }
+                    arrived.await;
+                }
+            }
             let Some(GetRange::Bounded(range)) = options.range.clone() else {
                 let mut result = self.inner.get_opts(location, options).await?;
                 if self.weak_e_tags {
@@ -2860,10 +2974,9 @@ mod tests {
                 }
                 return Ok(result);
             };
-            self.requested_bytes.fetch_add(
-                usize::try_from(range.end - range.start).expect("range length"),
-                Ordering::SeqCst,
-            );
+            let length = usize::try_from(range.end - range.start).expect("range length");
+            self.requested_bytes.fetch_add(length, Ordering::SeqCst);
+            self.longest_range.fetch_max(length, Ordering::SeqCst);
             if range.end < self.inner.head(location).await?.size {
                 let replacement = self.replacement.lock().expect("replacement lock").take();
                 if let Some((path, bytes)) = replacement {
@@ -2992,14 +3105,12 @@ mod tests {
             ]),
         )
         .await;
-        let mut projected = 0;
         let metrics = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number", "gas_used", "base_fee_per_gas"],
-            test_budget(1),
+            &OpenBudget::new(test_budget(1)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             rows,
         )
@@ -3015,6 +3126,125 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_chunk_reads_its_block_and_log_tables_at_once() {
+        let blocks = ObjectPath::from(EXECUTION_BLOCK_OBJECT);
+        let logs = ObjectPath::from("canonical_execution_logs/1000/0.parquet");
+        let store = Arc::new(RecordingStore {
+            rendezvous: Some((blocks.clone(), logs.clone())),
+            ..RecordingStore::default()
+        });
+        // Neither object has the projected columns, so the projection fails
+        // once both footers are read.
+        let object = parquet_object(vec![(
+            "unrelated",
+            Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+        )]);
+        for location in [&blocks, &logs] {
+            store
+                .put(location, object.clone().into())
+                .await
+                .expect("put");
+        }
+        let projector = XatuBlobsProjector::new(XatuCatalog::with_store(
+            crate::XatuCatalogConfig::default(),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        ));
+        let projection = tokio::time::timeout(
+            Duration::from_secs(10),
+            projector.project_generic(
+                BlockRange::new(BlockNumber(0), BlockNumber(999)).expect("range"),
+                GenericProjectionKind::Logs,
+                &FilterSet::default(),
+                LogFieldSet::ALL,
+                CapabilitySet::of(Capability::Header).with(Capability::Logs),
+                test_budget(4),
+                8_192,
+                CancellationToken::new(),
+            ),
+        )
+        .await;
+        assert!(
+            projection.is_ok(),
+            "the block table was read to its end before the log table was requested"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_tables_of_a_chunk_share_its_requests_in_flight() {
+        let store = Arc::new(RecordingStore::default());
+        let object = parquet_object(vec![(
+            "unrelated",
+            Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+        )]);
+        for location in [
+            EXECUTION_BLOCK_OBJECT,
+            "canonical_execution_logs/1000/0.parquet",
+        ] {
+            store
+                .put(&ObjectPath::from(location), object.clone().into())
+                .await
+                .expect("put");
+        }
+        let projector = XatuBlobsProjector::new(XatuCatalog::with_store(
+            crate::XatuCatalogConfig::default(),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        ));
+        projector
+            .project_generic(
+                BlockRange::new(BlockNumber(0), BlockNumber(999)).expect("range"),
+                GenericProjectionKind::Logs,
+                &FilterSet::default(),
+                LogFieldSet::ALL,
+                CapabilitySet::of(Capability::Header).with(Capability::Logs),
+                test_budget(1),
+                8_192,
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("neither object has the projected columns");
+        assert_eq!(
+            store.peak_in_flight.load(Ordering::SeqCst),
+            1,
+            "the source budget allows one request in flight"
+        );
+    }
+
+    #[tokio::test]
+    async fn long_column_reads_go_out_as_parallel_parts_within_the_request_limit() {
+        let store = Arc::new(RecordingStore::default());
+        let part = usize::try_from(crate::reader::PART_BYTES).expect("part bytes");
+        let object = stored_object(
+            &store,
+            parquet_object(vec![
+                (
+                    "block_number",
+                    Arc::new(UInt64Array::from(vec![7])) as ArrayRef,
+                ),
+                (
+                    "extra_data",
+                    Arc::new(BinaryArray::from(vec![vec![0x5a; 2 * part + 1].as_slice()]))
+                        as ArrayRef,
+                ),
+            ]),
+        )
+        .await;
+        let metrics = read_projected(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            &object,
+            &["block_number", "extra_data"],
+            &OpenBudget::new(test_budget(2)),
+            8_192,
+            &CancellationToken::new(),
+            rows,
+        )
+        .await
+        .expect("projection");
+        assert_eq!(metrics.rows_selected, 1);
+        assert!(store.longest_range.load(Ordering::SeqCst) <= part);
+        assert_eq!(store.peak_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
     async fn range_reads_are_pinned_to_the_object_version_seen_at_head() {
         let store = Arc::new(RecordingStore::default());
         let version = |first: u64| {
@@ -3027,15 +3257,13 @@ mod tests {
         // The publisher rewrites the object after its footer was read.
         *store.replacement.lock().expect("replacement lock") =
             Some((ObjectPath::from(EXECUTION_BLOCK_OBJECT), version(1_000_000)));
-        let mut projected = 0;
         let mut first_seen = None;
         let result = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number"],
-            test_budget(4),
+            &OpenBudget::new(test_budget(4)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             |batch| {
                 first_seen = first_seen.or_else(|| {
@@ -3080,7 +3308,6 @@ mod tests {
             ]),
         )
         .await;
-        let mut projected = 0;
         let mut blocks = BTreeMap::new();
         // Block 7 is outside the range, so no row reaches a decoder.
         let range = BlockRange::single(BlockNumber(42));
@@ -3088,9 +3315,8 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number", "extra_data"],
-            test_budget(4),
+            &OpenBudget::new(test_budget(4)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             |batch| parse_execution_blocks(batch, range, &mut blocks),
         )
@@ -4720,14 +4946,12 @@ mod tests {
             )]),
         )
         .await;
-        let mut projected = 0;
         let error = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number"],
-            test_budget(4),
+            &OpenBudget::new(test_budget(4)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             rows,
         )
@@ -4742,14 +4966,12 @@ mod tests {
     #[tokio::test]
     async fn an_unpublished_object_is_reported_as_not_published() {
         let store = Arc::new(RecordingStore::default());
-        let mut projected = 0;
         let error = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &execution_block_object(),
             &["block_number"],
-            test_budget(4),
+            &OpenBudget::new(test_budget(4)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             rows,
         )
@@ -4779,14 +5001,12 @@ mod tests {
         .await;
         *store.removal.lock().expect("removal lock") =
             Some(ObjectPath::from(EXECUTION_BLOCK_OBJECT));
-        let mut projected = 0;
         let error = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number"],
-            test_budget(4),
+            &OpenBudget::new(test_budget(4)),
             8_192,
-            &mut projected,
             &CancellationToken::new(),
             rows,
         )
@@ -5195,14 +5415,13 @@ mod tests {
         .await;
         let mut budget = test_budget(4);
         budget.max_input_bytes = 1_024;
-        let mut used = 0;
+        let open = OpenBudget::new(budget);
         let metrics = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number", "gas_used"],
-            budget,
+            &open,
             8_192,
-            &mut used,
             &CancellationToken::new(),
             rows,
         )
@@ -5218,7 +5437,7 @@ mod tests {
             "{requested} bytes requested under a 1,024-byte budget"
         );
         assert_eq!(metrics.fetched_bytes, requested);
-        assert_eq!(used, requested);
+        assert_eq!(open.input.used(), requested);
         assert!(metrics.projected_compressed_bytes < requested);
     }
 
@@ -5243,9 +5462,8 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number", "gas_used"],
-            budget,
+            &OpenBudget::new(budget),
             8_192,
-            &mut 0,
             &CancellationToken::new(),
             rows,
         )
@@ -5292,9 +5510,8 @@ mod tests {
                     store,
                     &object,
                     &["block_number", "gas_used"],
-                    budget,
+                    &OpenBudget::new(budget),
                     8_192,
-                    &mut 0,
                     &CancellationToken::new(),
                     rows,
                 )
@@ -5326,14 +5543,12 @@ mod tests {
         .await;
         let mut budget = test_budget(4);
         budget.max_input_bytes = 64;
-        let mut used = 0;
         let error = read_projected(
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number"],
-            budget,
+            &OpenBudget::new(budget),
             8_192,
-            &mut used,
             &CancellationToken::new(),
             rows,
         )
@@ -5375,9 +5590,8 @@ mod tests {
             Arc::clone(&store) as Arc<dyn ObjectStore>,
             &object,
             &["block_number"],
-            acquisition,
+            &OpenBudget::new(acquisition),
             8_192,
-            &mut 0,
             &CancellationToken::new(),
             rows,
         )
