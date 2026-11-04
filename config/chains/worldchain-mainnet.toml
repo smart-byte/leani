@@ -14,6 +14,10 @@ bootnodes = [
   "enode://77b6b1e72984d5d50e00ae934ffea982902226fe92fa50da42334c2750d8e405b55a5baabeb988c88125368142a64eda5096d0d4522d3b6eef75d166c7d303a9@3.148.100.173:30303",
 ]
 
+# No keyless endpoint serves World Chain's whole blocks' receipts at a
+# following pace (drpc and Alchemy's public one refuse eth_getBlockReceipts,
+# thirdweb rate-limits it), so its node follows over execution P2P alone.
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0x2270d6ec8e760daa317dd978cfb98c8f144b1f3a"
@@ -29,3 +33,12 @@ consensus_bootnodes = [
   "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
   "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
 ]
+
+# World Chain's permissioned games (type 1), as the OptimismPortal's
+# respectedGameType() and anchorStateRegistry() name them. A new respected
+# type stops the anchor until this entry follows it.
+[l1_anchor]
+kind = "dispute_games"
+factory = "0x069c4c579671f8c120b1327a73217D01Ea2EC5ea"
+registry = "0x90bb48fe3310499db36437dcae642f721e32d094"
+game_type = 1

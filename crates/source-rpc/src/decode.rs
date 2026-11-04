@@ -4,7 +4,7 @@
 use alloy_consensus::{Header, ReceiptWithBloom};
 use alloy_consensus_any::{AnyHeader, AnyReceiptEnvelope};
 use alloy_eips::eip2718::Encodable2718;
-use alloy_primitives::{Address, B256, Bytes, U256};
+use alloy_primitives::{Address, B256, Bytes, TxKind, U256};
 use alloy_rlp::Encodable;
 use alloy_rpc_types_eth::{Log as RpcLog, TransactionReceipt};
 use leani_primitives::{
@@ -53,8 +53,9 @@ pub struct DecodedBlock {
     pub check: BlockCheck,
     /// `None` when only transaction hashes were fetched.
     transactions: Option<Vec<(Value, Option<Vec<u8>>)>>,
-    /// `None` when receipts were not fetched.
-    receipts: Option<Vec<(AnyReceiptEnvelope, Value)>>,
+    /// `None` when receipts were not fetched. Each receipt comes with the
+    /// bytes its block's receipts root hashed.
+    receipts: Option<Vec<(AnyReceiptEnvelope, Value, Vec<u8>)>>,
 }
 
 impl DecodedBlock {
@@ -113,9 +114,9 @@ fn typed_rlp(ty: u8, fields: &[&dyn Encodable]) -> Vec<u8> {
     out
 }
 
-/// The EIP-2718 bytes of an Arbitrum system transaction, which no Ethereum
+/// The EIP-2718 bytes of a rollup's system transaction, which no Ethereum
 /// type covers. `None` for a type this release does not re-encode.
-fn arbitrum_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
+fn rollup_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
     Ok(match ty {
         // ArbitrumInternalTx: rlp([chain id, data]).
         0x6a => {
@@ -131,6 +132,36 @@ fn arbitrum_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError>
             let to: Address = parsed(tx, "to")?;
             let value = quantity(tx, "value")?;
             Some(typed_rlp(ty, &[&chain_id, &request_id, &from, &to, &value]))
+        }
+        // Op-stack deposit: rlp([source hash, from, to, mint, value, gas,
+        // is system tx, data]), `to` empty for a creation. Endpoints leave
+        // `isSystemTx` out while it is false, as it is since Regolith.
+        0x7e => {
+            let source_hash: B256 = parsed(tx, "sourceHash")?;
+            let from: Address = parsed(tx, "from")?;
+            let to = if tx["to"].is_null() {
+                TxKind::Create
+            } else {
+                TxKind::Call(parsed(tx, "to")?)
+            };
+            let mint = optional_quantity(tx, "mint")?.unwrap_or_default();
+            let value = quantity(tx, "value")?;
+            let gas = quantity(tx, "gas")?;
+            let system = tx["isSystemTx"].as_bool().unwrap_or_default();
+            let input: Bytes = parsed(tx, "input")?;
+            Some(typed_rlp(
+                ty,
+                &[
+                    &source_hash,
+                    &from,
+                    &to,
+                    &mint,
+                    &value,
+                    &gas,
+                    &system,
+                    &input,
+                ],
+            ))
         }
         _ => None,
     })
@@ -162,7 +193,7 @@ pub fn decode_block(block: &Value, receipts: &Value) -> Result<DecodedBlock, Rpc
         let mut unchecked = None;
         for tx in served {
             let ty = transaction_type(tx)?;
-            let encoded = match arbitrum_transaction(ty, tx)? {
+            let encoded = match rollup_transaction(ty, tx)? {
                 Some(bytes) => Some(bytes),
                 None => serde_json::from_value::<alloy_rpc_types_eth::Transaction>(tx.clone())
                     .ok()
@@ -242,10 +273,32 @@ pub fn decode_block(block: &Value, receipts: &Value) -> Result<DecodedBlock, Rpc
     let blooms_hold = receipts
         .iter()
         .all(|(receipt, _)| receipt.inner.logs_bloom == receipt.inner.receipt.bloom_slow());
-    let receipts_root =
-        alloy_trie::root::ordered_trie_root_with_encoder(&receipts, |(receipt, _), out| {
-            receipt.encode_2718(out);
-        });
+    let encode = |with_nonces: bool| {
+        receipts
+            .iter()
+            .map(|(receipt, json)| receipt_bytes(receipt, json, with_nonces))
+            .collect::<Result<Vec<_>, RpcError>>()
+    };
+    let root = |encoded: &[Vec<u8>]| {
+        alloy_trie::root::ordered_trie_root_with_encoder(encoded, |bytes, out| {
+            out.extend_from_slice(bytes);
+        })
+    };
+    let mut encoded = encode(true)?;
+    let mut receipts_root = root(&encoded);
+    // Between Regolith and Canyon an op-stack receipts root left deposit
+    // nonces out.
+    if receipts_root != header.receipts_root
+        && receipts
+            .iter()
+            .any(|(receipt, json)| receipt.r#type == 0x7e && !json["depositNonce"].is_null())
+    {
+        let stripped = encode(false)?;
+        if root(&stripped) == header.receipts_root {
+            receipts_root = header.receipts_root;
+            encoded = stripped;
+        }
+    }
     let counts_match = receipts.len() == served_transactions;
     Ok(DecodedBlock {
         check: BlockCheck {
@@ -261,8 +314,38 @@ pub fn decode_block(block: &Value, receipts: &Value) -> Result<DecodedBlock, Rpc
         header,
         hash,
         transactions,
-        receipts: Some(receipts),
+        receipts: Some(
+            receipts
+                .into_iter()
+                .zip(encoded)
+                .map(|((receipt, json), bytes)| (receipt, json, bytes))
+                .collect(),
+        ),
     })
+}
+
+/// A receipt's EIP-2718 bytes. An op-stack deposit receipt's also hold its
+/// nonce, unless `with_nonce` leaves it out, and its version.
+fn receipt_bytes(
+    receipt: &AnyReceiptEnvelope,
+    json: &Value,
+    with_nonce: bool,
+) -> Result<Vec<u8>, RpcError> {
+    if receipt.r#type != 0x7e {
+        return Ok(receipt.encoded_2718());
+    }
+    let nonce = optional_quantity(json, "depositNonce")?.filter(|_| with_nonce);
+    let version = optional_quantity(json, "depositReceiptVersion")?;
+    let inner = &receipt.inner;
+    let mut fields: Vec<&dyn Encodable> = vec![
+        &inner.receipt.status,
+        &inner.receipt.cumulative_gas_used,
+        &inner.logs_bloom,
+        &inner.receipt.logs,
+    ];
+    fields.extend(nonce.as_ref().map(|nonce| nonce as &dyn Encodable));
+    fields.extend(version.as_ref().map(|version| version as &dyn Encodable));
+    Ok(typed_rlp(0x7e, &fields))
 }
 
 fn block_hash(value: B256) -> BlockHash {
@@ -362,7 +445,7 @@ pub fn frame(
     let mut logs = Vec::new();
     let mut previous_gas = 0_u64;
     let mut block_log_index = 0_u32;
-    for (index, (receipt, receipt_json)) in decoded.receipts.iter().flatten().enumerate() {
+    for (index, (receipt, receipt_json, encoded)) in decoded.receipts.iter().flatten().enumerate() {
         let index = u32::try_from(index)
             .map_err(|_| RpcError::Malformed("receipt index overflows u32".to_owned()))?;
         let hash: B256 = parsed(receipt_json, "transactionHash")?;
@@ -387,7 +470,7 @@ pub fn frame(
             transaction_hash: hash,
             transaction_type: receipt.r#type,
             transaction_index: index,
-            encoded: Some(receipt.encoded_2718()),
+            encoded: Some(encoded.clone()),
             success: Some(receipt.inner.receipt.status.coerce_status()),
             gas_used: Some(cumulative.saturating_sub(previous_gas)),
             effective_gas_price: optional_quantity(receipt_json, "effectiveGasPrice")?.map(amount),
@@ -514,6 +597,31 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn served_op_stack_blocks_check_against_their_roots() {
+        let sample: Value =
+            serde_json::from_str(include_str!("fixtures/unichain-block.json")).unwrap();
+        let decoded = decode_block(&sample["block"], &sample["receipts"]).unwrap();
+        assert!(decoded.check.verified(), "{:?}", decoded.check);
+
+        let mut minted = sample.clone();
+        minted["block"]["transactions"][0]["mint"] = Value::from("0x1");
+        let decoded = decode_block(&minted["block"], &minted["receipts"]).unwrap();
+        assert_eq!(decoded.check.transactions_root, Check::Mismatch);
+        let mut renumbered = sample;
+        renumbered["receipts"][0]["depositNonce"] = Value::from("0x1");
+        let decoded = decode_block(&renumbered["block"], &renumbered["receipts"]).unwrap();
+        assert_eq!(decoded.check.receipts_root, Check::Mismatch);
+    }
+
+    #[test]
+    fn regolith_receipts_roots_leave_deposit_nonces_out() {
+        let sample: Value =
+            serde_json::from_str(include_str!("fixtures/op-mainnet-regolith-block.json")).unwrap();
+        let decoded = decode_block(&sample["block"], &sample["receipts"]).unwrap();
+        assert!(decoded.check.verified(), "{:?}", decoded.check);
     }
 
     #[test]

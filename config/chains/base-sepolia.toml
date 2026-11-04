@@ -15,6 +15,16 @@ bootnodes = [
   "enode://6f10052847a966a725c9f4adf6716f9141155b99a0fb487fea3f51498f4c2a2cb8d534e680ee678f9447db85b93ff7c74562762c3714783a7233ac448603b25f@107.21.251.55:9200",
 ]
 
+# Public keyless endpoints, paced to the limits their operators announce.
+# They serve while no execution peer does, and each block they serve must
+# have the hash the sequencer signed or link to one.
+[defaults]
+rpc_endpoints = [
+  "https://sepolia.base.org",
+  "https://base-sepolia-rpc.publicnode.com",
+  "https://base-sepolia.drpc.org",
+]
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum Sepolia.
 sequencer_signer = "0xb830b99c95ea32300039624cb567d324d4b1d83c"

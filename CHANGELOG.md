@@ -91,12 +91,24 @@ record, and documented RPC contracts.
 - `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
   contracts, read in finalized Ethereum blocks over verified Ethereum
   finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,
-  Arbitrum Nova, and Robinhood Chain, and, on Base and OP Mainnet, the
-  dispute game the anchor state registry moves to, once its claim matched
-  the output root of the block the sequencer signed. OP Mainnet's games
-  claim super roots: their creation call carries the super root's preimage,
-  which holds OP Mainnet's output root at a time. Chain entries name the
-  contracts and, with `claims = "super_roots"`, that format.
+  Arbitrum Nova, and Robinhood Chain, and, on Base, OP Mainnet, Unichain,
+  Ink, Soneium, Mode, Zora, and World Chain, the dispute game the anchor
+  state registry moves to, once its claim matched the output root of the
+  block the sequencer signed. OP Mainnet's, Unichain's, Ink's, and
+  Soneium's games claim super roots: their creation call carries the super
+  root's preimage, which holds the chain's output root at a time. Chain
+  entries name the contracts and, with `claims = "super_roots"`, that
+  format.
+- An op-stack node follows over JSON-RPC while no execution peer serves it:
+  `sources.live.kind` takes an ordered list, `["p2p", "json_rpc"]`, which
+  op-stack compact configurations and `leani init` use with public endpoints
+  the chain entries bundle. A block from the endpoints must have the hash the
+  sequencer signed on gossip, or link to one, and its transactions and
+  receipts roots must hold; the node returns to execution P2P once peers
+  serve it again.
+- Op-stack blocks served over JSON-RPC check against their transactions and
+  receipts roots: deposit transactions and receipts are re-encoded, and
+  Regolith's receipts roots, which leave deposit nonces out, are recognized.
 - `finality.kind = "op_gossip"` follows an op-stack chain's sequencer-signed
   block gossip: each signed block is the attested head the P2P live lane
   follows. Recent frames are pruned `finality.settle_blocks` below the tip,

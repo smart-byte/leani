@@ -357,7 +357,11 @@ pub(super) async fn run_standalone(
     let cancellation = CancellationToken::new();
     let mut signals = ShutdownSignals::new()?;
     let telemetry = leani_source_api::NetworkTelemetry::default();
-    let bridge = if matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p)
+    let bridge = if config
+        .sources
+        .live
+        .kind
+        .uses(crate::config::LiveSourceKind::P2p)
         && !configured.require_retained_input
     {
         // Like a running node, retain locally verified finality so repeated

@@ -14,6 +14,16 @@ bootnodes = [
   "enode://77b6b1e72984d5d50e00ae934ffea982902226fe92fa50da42334c2750d8e405b55a5baabeb988c88125368142a64eda5096d0d4522d3b6eef75d166c7d303a9@3.148.100.173:30303",
 ]
 
+# Public keyless endpoints, paced to the limits their operators announce.
+# They serve while no execution peer does, and each block they serve must
+# have the hash the sequencer signed or link to one.
+[defaults]
+rpc_endpoints = [
+  "https://rpc.soneium.org",
+  "https://soneium-rpc.publicnode.com",
+  "https://soneium.drpc.org",
+]
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0x7c2bd59ee2a2c7391c9a240132f26071e9546262"
@@ -29,3 +39,13 @@ consensus_bootnodes = [
   "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
   "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
 ]
+
+# Soneium's permissioned super-root games (type 5), as the
+# OptimismPortal's respectedGameType() and anchorStateRegistry() name
+# them. A new respected type stops the anchor until this entry follows it.
+[l1_anchor]
+kind = "dispute_games"
+factory = "0x512A3d2c7a43BD9261d2B8E8C9c70D4bd4D503C0"
+registry = "0x4890928941e62e273da359374b105f803329f473"
+game_type = 5
+claims = "super_roots"

@@ -22,6 +22,15 @@ bootnodes = [
   "enode://cdadbe835308ad3557f9a1de8db411da1a260a98f8421d62da90e71da66e55e98aaa8e90aa7ce01b408a54e4bd2253d701218081ded3dbe5efbbc7b41d7cef79@54.198.153.150:9200",
 ]
 
+# Public keyless endpoints, paced to the limits their operators announce.
+# They serve while no execution peer does, and each block they serve must
+# have the hash the sequencer signed or link to one.
+[defaults]
+rpc_endpoints = [
+  "https://mainnet.base.org",
+  "https://base-rpc.publicnode.com",
+]
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0xaf6e19be0f9ce7f8afd49a1824851023a8249e8a"

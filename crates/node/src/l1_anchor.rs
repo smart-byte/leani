@@ -2,7 +2,7 @@
 //! execution P2P read the chain entry's settlement contracts.
 
 use std::{
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -24,7 +24,7 @@ use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, FinalitySourceKind, L1AnchorConfig};
+use crate::config::{Config, FinalitySourceKind, L1AnchorConfig, LiveSourceKind};
 
 /// Most bytes one finalized L1 block may cost: its receipts and, for
 /// dispute games, its body.
@@ -189,6 +189,12 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
 pub(crate) struct OpHeads {
     pub(crate) heads: watch::Receiver<Option<leani_finality_op_gossip::SignedBlock>>,
     pub(crate) finalized: Option<watch::Receiver<FinalizedBlock>>,
+    /// The signed blocks' hashes, which check the blocks JSON-RPC endpoints
+    /// serve when the live lane falls back to them.
+    pub(crate) signed: Option<leani_source_rpc::feed::SignedHashes>,
+    /// Set by a P2P run that no execution peer served: the next run follows
+    /// over JSON-RPC.
+    pub(crate) over_rpc: Arc<AtomicBool>,
 }
 
 /// Join the chain's sequencer gossip, publishing each signed block as the
@@ -228,6 +234,12 @@ pub(crate) async fn start_op_heads(
         cancellation.child_token(),
     )
     .await?;
+    let hashes = config
+        .sources
+        .live
+        .kind
+        .uses(LiveSourceKind::JsonRpc)
+        .then(|| keep_signed_hashes(heads.clone(), cancellation.child_token()));
     let finalized = match (anchor, signed) {
         (Some((_, observations)), Some(signed)) => Some(follow_dispute_games(
             config,
@@ -238,7 +250,34 @@ pub(crate) async fn start_op_heads(
         )?),
         _ => None,
     };
-    Ok(OpHeads { heads, finalized })
+    Ok(OpHeads {
+        heads,
+        finalized,
+        signed: hashes,
+        over_rpc: Arc::default(),
+    })
+}
+
+/// Record every signed head's hash. A head the watch coalesced away is
+/// still attested through the next one it links to.
+fn keep_signed_hashes(
+    mut heads: watch::Receiver<Option<leani_finality_op_gossip::SignedBlock>>,
+    cancellation: CancellationToken,
+) -> leani_source_rpc::feed::SignedHashes {
+    let hashes = leani_source_rpc::feed::SignedHashes::default();
+    let kept = hashes.clone();
+    tokio::spawn(async move {
+        loop {
+            if let Some(block) = *heads.borrow_and_update() {
+                kept.insert(block.number, block.hash);
+            }
+            tokio::select! {
+                () = cancellation.cancelled() => return,
+                changed = heads.changed() => if changed.is_err() { return },
+            }
+        }
+    });
+    hashes
 }
 
 /// The L1's verified finality. `headers` numbers the blocks Gloas headers
