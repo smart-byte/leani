@@ -11,7 +11,7 @@ merge_block = 15537394
 
 [budgets]
 memory_bytes = 536870912
-temporary_disk_bytes = 2147483648
+temporary_disk_bytes = 4294967296
 pending_delta_bytes = 268435456
 recent_raw_soft_bytes = 268435456
 recent_raw_hard_bytes = 536870912

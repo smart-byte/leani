@@ -131,8 +131,12 @@ record, and documented RPC contracts.
   (SonarX's). Each block's receipts are rebuilt from the receipt and log rows
   and checked against its receipts root and logs bloom, and Base and Arbitrum
   block hashes are recomputed from their header rows. It serves headers,
-  receipts, and logs, one UTC day per chunk. `leani source probe aws` checks
-  a range.
+  receipts, and logs in parallel ranged reads: a whole UTC day per chunk on
+  Ethereum, and on Base and Arbitrum One only the pages that hold a chunk's
+  blocks, in chunks of 2,000 blocks on Base and 100,000 on Arbitrum One. The
+  chunks of a day download each footer, page index, and dictionary page once,
+  kept in a temporary file in `data_dir` of at most
+  `budgets.temporary_disk_bytes`. `leani source probe aws` checks a range.
 - A node can follow a chain over JSON-RPC: `kind = "json_rpc"` for the live
   source, finality, and history, with endpoints and a quorum under
   `[sources.json_rpc]` (defaulting to the chain entry's). A block counts as
@@ -253,6 +257,9 @@ record, and documented RPC contracts.
   it did.
 - The live lane keeps every block's header, which the P2P source fetches
   anyway, so header-only processors run ad hoc on any node.
+- `budgets.temporary_disk_bytes` defaults to 4 GiB instead of 2 GiB, which
+  holds the byte ranges the chunks of a Base day share: with 2 GiB, a Base
+  day downloaded 5 GB instead of 4.3 GB and ran 13% slower.
 - The live subscriptions of one P2P source share their downloads: a block's
   bodies or receipts that two of them need are downloaded once.
 - Xatu reads a chunk's tables at once, and a long range as parallel parts,
@@ -266,6 +273,13 @@ record, and documented RPC contracts.
   peers of a testnet, whose records are rare in the discovery network all
   chains share. It handshakes with Status v2, which some peers require, and
   still answers v1.
+
+### Fixed
+
+- `leani benchmark real-source` measures the configured chain instead of
+  refusing every chain but Ethereum mainnet, and its consumer renews its
+  lease while it waits, as the SDK does: a source slower than the lease to
+  deliver its first batch no longer ends the run.
 
 ## [0.1.1] - 2026-10-29
 

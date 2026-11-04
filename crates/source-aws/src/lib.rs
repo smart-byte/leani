@@ -1,11 +1,13 @@
 //! History from public, daily-partitioned Parquet exports on AWS Open Data.
 //!
-//! Rows are unsorted within a day, so a chunk is one UTC day: every table
-//! of that day is read once with only the needed columns. Each block's
-//! receipts are rebuilt from its receipt and log rows and checked against
-//! its receipts root; where the export carries every header field, the
-//! block hash is recomputed too.
+//! Rows are unsorted within a day, so a chunk reads every table of its UTC
+//! day with only the needed columns: where the files index their pages,
+//! only the pages whose block numbers can hold the chunk's blocks. Each
+//! block's receipts are rebuilt from its receipt and log rows and checked
+//! against its receipts root; where the export carries every header field,
+//! the block hash is recomputed too.
 
+mod cache;
 mod catalog;
 mod history;
 mod layout;

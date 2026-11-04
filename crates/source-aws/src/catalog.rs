@@ -9,7 +9,7 @@ use std::{
 use async_trait::async_trait;
 use leani_chain::DatasetLayout;
 use object_store::{ObjectStore, path::Path};
-use parquet::{arrow::async_reader::ParquetRecordBatchStreamBuilder, file::statistics::Statistics};
+use parquet::arrow::async_reader::ParquetRecordBatchStreamBuilder;
 use url::Url;
 
 use crate::{
@@ -295,7 +295,13 @@ impl Catalog {
             .unwrap_or_default();
         let mut span: Option<(u64, u64)> = None;
         for (key, size) in self.objects(Table::Blocks, date).await? {
-            let reader = crate::read::StoreReader::new(Arc::clone(&self.store), &key, size);
+            let reader = crate::read::StoreReader::new(
+                Arc::clone(&self.store),
+                &key,
+                size,
+                Arc::new(crate::read::RangeRequests::new(1, u64::MAX)),
+                None,
+            );
             let builder = ParquetRecordBatchStreamBuilder::new(reader)
                 .await
                 .map_err(|error| AwsError::Parquet(format!("{key}: {error}")))?;
@@ -314,7 +320,7 @@ impl Catalog {
                 let (min, max) = row_group
                     .column(column)
                     .statistics()
-                    .and_then(block_bounds)
+                    .and_then(crate::read::block_bounds)
                     .ok_or_else(|| AwsError::Malformed {
                         table: Table::Blocks.label(),
                         detail: format!("{key} has no block-number statistics"),
@@ -377,27 +383,6 @@ impl Catalog {
             )
             .map_err(|error| AwsError::Store(error.to_string()))?,
         ))
-    }
-}
-
-/// Block-number bounds of a column chunk: `INT64` statistics, or the
-/// big-endian `DECIMAL(38, 0)` `SonarX` stores numbers as.
-fn block_bounds(statistics: &Statistics) -> Option<(u64, u64)> {
-    match statistics {
-        Statistics::Int64(values) => Some((
-            u64::try_from(*values.min_opt()?).ok()?,
-            u64::try_from(*values.max_opt()?).ok()?,
-        )),
-        Statistics::FixedLenByteArray(values) => {
-            let decode = |bytes: &[u8]| {
-                u64::try_from(i128::from_be_bytes(<[u8; 16]>::try_from(bytes).ok()?)).ok()
-            };
-            Some((
-                decode(values.min_bytes_opt()?)?,
-                decode(values.max_bytes_opt()?)?,
-            ))
-        }
-        _ => None,
     }
 }
 

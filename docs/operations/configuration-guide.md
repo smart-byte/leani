@@ -85,7 +85,7 @@ Compact Ethereum Mainnet configurations expand to:
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
 | processor | selected built-in feed, unattested publication, checkpointed state, 256-block undo safety |
-| resources | 512 MiB memory, 2 GiB temporary disk, four source and mapper tasks |
+| resources | 512 MiB memory, 4 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
 
@@ -329,14 +329,28 @@ validation.
 Ethereum mainnet from AWS's own export, about a day behind, and Base and
 Arbitrum One from SonarX's, about a week behind. It serves headers, receipts,
 and logs. Transaction bodies are left to other sources, because the exports
-store values as floating-point numbers. Rows are unsorted within a day, so each
-chunk downloads its whole UTC day: in October 2026 about 2 GB for Ethereum,
-1.5 GB for Arbitrum One, and 9 GB for Base. That download counts against
-`budgets.temporary_disk_bytes`, and a chunk whose rows would decode to more
-than `budgets.memory_bytes` is refused before it downloads: an unfiltered
-Ethereum day took about 8.7 GB of memory. `chunk_blocks` caps the blocks one
-chunk holds, and each chunk reads its day again. With a log filter, only
-blocks whose logs bloom admits it are decoded.
+store values as floating-point numbers. Rows are unsorted within a day: in
+October 2026 a day held about 2 GB for Ethereum, 1.5 GB for Arbitrum One, and
+9 GB for Base. AWS's Ethereum export has no page index, so each chunk
+downloads its whole UTC day, and `chunk_blocks` splits a day only by reading
+it again for each chunk. SonarX's files index their pages, so a chunk
+downloads only the pages that hold its blocks: Base reads chunks of 2,000
+blocks and Arbitrum One chunks of 100,000 unless `chunk_blocks` sets another
+size. The chunks of a day share the footers, page indexes, and dictionary
+pages of its files. The node keeps the byte ranges it reads in one temporary
+file in `data_dir`, at most `budgets.temporary_disk_bytes` for each bucket,
+which the system frees when the node exits, and downloads a range that
+several chunks need at once only once: for a log-filtered processor a Base
+day took about 4.3 GB, and an Arbitrum One day about 0.9 GB. A Base day's
+ranges fill most of the default 4 GiB: with 2 GiB, chunks downloaded some
+again, and the day took 5 GB and ran 13% slower. What a chunk
+downloads counts against `budgets.temporary_disk_bytes`, and a chunk whose
+rows would decode to more than `budgets.memory_bytes` is refused before it
+downloads: an unfiltered Ethereum day took about 8.7 GB of memory. Each
+active chunk holds its own rows, so a Base backfill with the default eight
+active chunks peaked at about 7 GB of memory. Reads go
+out as parallel ranged requests, up to four per `budgets.source_concurrency`.
+With a log filter, only blocks whose logs bloom admits it are decoded.
 
 ### History source order
 
@@ -359,7 +373,7 @@ The shipped profiles list eraE at priority 10 and Xatu at priority 20:
 |---|---|---|---|
 | `era_e` | Whole blocks and receipts up to its mirror's last catalog update | Transactions and receipts roots against the header | The public mirror's catalog ended at block 24,518,655 (2026-02-26) when this was written |
 | `xatu` | Columnar projections, about one day behind the chain, until the day Glamsterdam activates | Transaction rows against the beacon payload count; log rows without a gap | Cannot prove a block's last logs complete; Ethereum mainnet only |
-| `aws_public` (opt-in) | Headers, receipts, and logs, one UTC day per chunk | Receipts root and logs bloom against the header; the block hash, where the export has every header field (Base, Arbitrum One) | The export names the canonical chain; no transaction bodies |
+| `aws_public` (opt-in) | Headers, receipts, and logs: a whole UTC day per chunk on Ethereum, the pages of a chunk's blocks on Base and Arbitrum One | Receipts root and logs bloom against the header; the block hash, where the export has every header field (Base, Arbitrum One) | The export names the canonical chain; no transaction bodies |
 | P2P (live source) | Recent and live blocks from peers | Commitments of every header, body, and receipt | Slowest for old history; peers may no longer serve very old blocks |
 
 So for blocks the eraE mirror covers, a backfill reads verified complete

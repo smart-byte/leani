@@ -232,7 +232,7 @@ which `leani init` fills with the ordinary PublicNode
 (`https://ethereum-beacon-api.publicnode.com/`) and Lodestar
 (`https://lodestar-mainnet.chainsafe.io/`) Beacon API endpoints and the
 responding checkpoint providers that serve the Beacon light-client API, Xatu
-history fallback, bounded 512 MiB memory and 2 GiB temporary-disk budgets,
+history fallback, bounded 512 MiB memory and 4 GiB temporary-disk budgets,
 on-demand Uniswap history, unattested publication, undo records kept
 until 256 blocks past finality, 64 MiB/24 hour delivery retention, ephemeral
 P2P listener ports, RPC on `18545`/`18546`, and the native API on `18080`.

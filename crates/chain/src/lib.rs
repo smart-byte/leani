@@ -208,6 +208,10 @@ pub struct PublicDataset {
     /// receipts).
     #[serde(default)]
     pub first_block: u64,
+    /// Most blocks one chunk reads when the source configures none; `None`
+    /// reads a whole day per chunk.
+    #[serde(default)]
+    pub chunk_blocks: Option<u64>,
 }
 
 /// The Ethereum contracts that settle a rollup's chain, which the opt-in
