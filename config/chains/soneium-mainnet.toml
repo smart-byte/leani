@@ -29,3 +29,13 @@ consensus_bootnodes = [
   "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
   "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
 ]
+
+# Soneium's permissioned super-root games (type 5), as the
+# OptimismPortal's respectedGameType() and anchorStateRegistry() name
+# them. A new respected type stops the anchor until this entry follows it.
+[l1_anchor]
+kind = "dispute_games"
+factory = "0x512A3d2c7a43BD9261d2B8E8C9c70D4bd4D503C0"
+registry = "0x4890928941e62e273da359374b105f803329f473"
+game_type = 5
+claims = "super_roots"

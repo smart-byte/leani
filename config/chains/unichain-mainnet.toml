@@ -16,7 +16,7 @@ bootnodes = [
 
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
-sequencer_signer = "0x833c6f278474a78658af91ae8edc926fe33a230e"
+sequencer_signer = "0xfaaca0a10e4a23c5e01485de07767547d4d8056d"
 # Consensus bootnodes op-stack clients ship (kona); discovery is shared
 # across the superchain, peers are filtered by their `opstack` entry.
 consensus_bootnodes = [
@@ -29,3 +29,13 @@ consensus_bootnodes = [
   "enr:-J24QHmGyBwUZXIcsGYMaUqGGSl4CFdx9Tozu-vQCn5bHIQbR7On7dZbU61vYvfrJr30t0iahSqhc64J46MnUO2JvQaGAYiOoCKKgmlkgnY0gmlwhAPnCzSHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQINc4fSijfbNIiGhcgvwjsjxVFJHUstK9L1T8OTKUjgloN0Y3CCJAaDdWRwgiQG",
   "enr:-J24QG3ypT4xSu0gjb5PABCmVxZqBjVw9ca7pvsI8jl4KATYAnxBmfkaIuEqy9sKvDHKuNCsy57WwK9wTt2aQgcaDDyGAYiOoGAXgmlkgnY0gmlwhDbGmZaHb3BzdGFja4OFQgCJc2VjcDI1NmsxoQIeAK_--tcLEiu7HvoUlbV52MspE0uCocsx1f_rYvRenIN0Y3CCJAaDdWRwgiQG",
 ]
+
+# Unichain's super-root games (type 9), as the OptimismPortal's
+# respectedGameType() and anchorStateRegistry() name them. A new respected
+# type stops the anchor until this entry follows it.
+[l1_anchor]
+kind = "dispute_games"
+factory = "0x2F12d621a16e2d3285929C9996f478508951dFe4"
+registry = "0x27cf508e4e3aa8d30b3226ac3b5ea0e8bcacaff9"
+game_type = 9
+claims = "super_roots"

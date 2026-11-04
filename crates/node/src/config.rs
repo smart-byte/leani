@@ -4586,6 +4586,12 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
         for (network, anchored) in [
             ("op", true),
             ("base", true),
+            ("unichain", true),
+            ("ink", true),
+            ("soneium", true),
+            ("mode", true),
+            ("zora", true),
+            ("worldchain", true),
             ("base-sepolia", false),
             ("arbitrum-one", true),
             ("nova", true),

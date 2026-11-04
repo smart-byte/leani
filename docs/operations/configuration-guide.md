@@ -616,18 +616,21 @@ an RPC endpoint.
   holds it. Confirmation takes about 6.4 days. The endpoints' `finalized`
   tag no longer finalizes anything, and recent frames are pruned
   `finality.settle_blocks` (default 3,600) below the tip.
-- Op-stack chains (Base, OP Mainnet): a game of the respected type is
-  checked when it is created against the output root of the block the
-  sequencer signed, and that block is `finalized` once the anchor state
-  registry moves to the game, about five days later on Base and seven on OP
-  Mainnet. OP Mainnet's games claim super roots (`claims = "super_roots"`):
-  the creation call carries the super root's preimage, which holds OP
-  Mainnet's output root at a time, and the anchor checks the preimage
-  against the claim and that root against the block signed at that time.
+- Op-stack chains: a game of the respected type is checked when it is
+  created against the output root of the block the sequencer signed, and
+  that block is `finalized` once the anchor state registry moves to the
+  game, about 3.5 days later on Soneium, five on Base, and seven on the
+  others. OP Mainnet's, Unichain's, Ink's, and Soneium's games claim super
+  roots (`claims = "super_roots"`): the creation call carries the super
+  root's preimage, which holds the chain's output root at a time, and the
+  anchor checks the preimage against the claim and that root against the
+  block signed at that time. Soneium, Mode, Zora, and World Chain run
+  permissioned games: only the chain's proposer creates them, and only its
+  challenger can dispute them.
 
 The lane reads the receipts of the finalized L1 blocks whose logs bloom may
 hold the contracts' logs, at most about 1 GB a day. Op-stack game creations
-also need their call data, so on Base and OP Mainnet it reads every block's
+also need their call data, so on op-stack chains it reads every block's
 receipts and body, about 2 GB a day. Where
 it stopped survives restarts (`l1-anchor-cursor.json`); a cold start reads
 `lookback_blocks` (600 by default) below the first finalized block. Its

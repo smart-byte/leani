@@ -355,6 +355,23 @@ fn rollups_name_their_l1_anchor() {
             claims: GameClaims::SuperRoots,
         })
     );
+    for (name, respected, format) in [
+        ("unichain", 9, GameClaims::SuperRoots),
+        ("ink", 9, GameClaims::SuperRoots),
+        ("soneium", 5, GameClaims::SuperRoots),
+        ("mode", 1, GameClaims::OutputRoots),
+        ("zora", 1, GameClaims::OutputRoots),
+        ("worldchain", 1, GameClaims::OutputRoots),
+    ] {
+        assert!(
+            matches!(
+                registry.get(name).unwrap().l1_anchor,
+                Some(L1Anchor::DisputeGames { game_type, claims, .. })
+                    if game_type == respected && claims == format
+            ),
+            "{name}"
+        );
+    }
     assert!(matches!(
         registry.get("robinhood").unwrap().l1_anchor,
         Some(L1Anchor::NitroRollup { .. })
