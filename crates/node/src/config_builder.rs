@@ -639,7 +639,7 @@ fn follow(
     let terminal = requirements.keep == Keep::Result;
     match requirements.follow {
         Follow::None => {
-            config.sources.live.kind = LiveSourceKind::Disabled;
+            config.sources.live.kind = LiveSourceKind::Disabled.into();
             config.sources.live.minimum_peers = 0;
             config.finality.kind = FinalitySourceKind::Disabled;
             config.finality.checkpoint = String::new();
@@ -731,6 +731,13 @@ fn follow_rollup(
             "the sequencer feed signs every block the endpoints serve",
         );
     } else {
+        if config.sources.live.kind.fallback().is_some() {
+            decisions.add(
+                "sources.live.kind",
+                "[\"p2p\", \"json_rpc\"]",
+                "execution P2P first, the chain entry's endpoints while no execution peer serves",
+            );
+        }
         decisions.add(
             "finality.kind",
             "op_gossip",
@@ -1286,10 +1293,10 @@ mod tests {
         .expect("build");
         let config: Config = toml::from_str(&build.toml).expect("configuration");
         assert!(build.errors.is_empty(), "{:?}", build.errors);
-        assert!(matches!(
-            config.sources.live.kind,
+        assert_eq!(
+            config.sources.live.kind.primary(),
             crate::config::LiveSourceKind::Disabled
-        ));
+        );
         assert!(matches!(
             config.finality.kind,
             crate::config::FinalitySourceKind::Disabled
@@ -1465,10 +1472,10 @@ mod tests {
             (None, Some(7 * 86_400))
         );
         let arbitrum = parsed(&build_for("arbitrum-one", "finalized").expect("arbitrum"));
-        assert!(matches!(
-            arbitrum.sources.live.kind,
+        assert_eq!(
+            arbitrum.sources.live.kind.primary(),
             LiveSourceKind::JsonRpc
-        ));
+        );
         assert!(matches!(
             arbitrum.finality.kind,
             FinalitySourceKind::SequencerFeed

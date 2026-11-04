@@ -99,6 +99,13 @@ record, and documented RPC contracts.
   root's preimage, which holds the chain's output root at a time. Chain
   entries name the contracts and, with `claims = "super_roots"`, that
   format.
+- An op-stack node follows over JSON-RPC while no execution peer serves it:
+  `sources.live.kind` takes an ordered list, `["p2p", "json_rpc"]`, which
+  op-stack compact configurations and `leani init` use with public endpoints
+  the chain entries bundle. A block from the endpoints must have the hash the
+  sequencer signed on gossip, or link to one, and its transactions and
+  receipts roots must hold; the node returns to execution P2P once peers
+  serve it again.
 - Op-stack blocks served over JSON-RPC check against their transactions and
   receipts roots: deposit transactions and receipts are re-encoded, and
   Regolith's receipts roots, which leave deposit nonces out, are recognized.

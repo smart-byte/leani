@@ -316,12 +316,19 @@
         "allow_insecure_http": { "type": "boolean" }
       }
     },
+    "liveSourceKind": { "enum": ["p2p", "json_rpc", "disabled"] },
     "liveSource": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "minimum_peers"],
       "properties": {
-        "kind": { "enum": ["p2p", "json_rpc", "disabled"] },
+        "kind": {
+          "description": "One kind, or [\"p2p\", \"json_rpc\"] on an op-stack chain with op_gossip finality: execution P2P first, JSON-RPC while no execution peer serves.",
+          "oneOf": [
+            { "$ref": "#/$defs/liveSourceKind" },
+            { "type": "array", "items": { "$ref": "#/$defs/liveSourceKind" }, "minItems": 1, "uniqueItems": true }
+          ]
+        },
         "minimum_peers": { "$ref": "#/$defs/nonNegativeInteger" },
         "body_serving_peer_target": { "$ref": "#/$defs/nonNegativeInteger" },
         "preferred_peers": { "$ref": "#/$defs/nonNegativeInteger" },

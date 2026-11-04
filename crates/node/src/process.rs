@@ -82,7 +82,12 @@ pub(crate) fn select_processor_config<'a>(
 }
 
 fn historical_map_task_capacity(config: &Config) -> usize {
-    if matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p) {
+    if config
+        .sources
+        .live
+        .kind
+        .uses(crate::config::LiveSourceKind::P2p)
+    {
         config.budgets.mapper_concurrency.saturating_sub(1).max(1)
     } else {
         config.budgets.mapper_concurrency
@@ -4058,7 +4063,7 @@ async fn mainnet_e2e(
     let mut config = Config::load(config_path)
         .with_context(|| format!("load configuration {}", config_path.display()))?;
     if config.chain.chain_id != 1
-        || !matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p)
+        || config.sources.live.kind.primary() != crate::config::LiveSourceKind::P2p
         || matches!(
             config.finality.kind,
             crate::config::FinalitySourceKind::Disabled
@@ -5881,14 +5886,16 @@ struct JsonRpcPlan {
 impl JsonRpcPlan {
     /// The plan of a node with JSON-RPC sources.
     fn of(config: &Config) -> Option<Self> {
-        let json_rpc = matches!(
-            config.sources.live.kind,
-            crate::config::LiveSourceKind::JsonRpc
-        ) || config
+        let json_rpc = config
             .sources
-            .history
-            .iter()
-            .any(|source| matches!(source.kind, crate::config::HistorySourceKind::JsonRpc));
+            .live
+            .kind
+            .uses(crate::config::LiveSourceKind::JsonRpc)
+            || config
+                .sources
+                .history
+                .iter()
+                .any(|source| matches!(source.kind, crate::config::HistorySourceKind::JsonRpc));
         json_rpc.then(|| Self {
             own_endpoints: config.sources.json_rpc.endpoints.len(),
             public_endpoints: config.public_endpoints(),
@@ -6018,10 +6025,7 @@ fn attested_gating_warnings<'a>(
 
 /// The live lane's warnings for a configuration whose processors build.
 fn live_lane_warnings(config: &Config, registry: &ProcessorRegistry) -> Vec<String> {
-    if matches!(
-        config.sources.live.kind,
-        crate::config::LiveSourceKind::Disabled
-    ) {
+    if config.sources.live.kind.primary() == crate::config::LiveSourceKind::Disabled {
         return Vec::new();
     }
     let processors = config
@@ -6165,7 +6169,7 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
             .iter()
             .map(|source| source.id.as_str())
             .collect(),
-        live_source: format!("{:?}", config.sources.live.kind),
+        live_source: config.sources.live.kind.to_string(),
         finality_source: format!("{:?}", config.finality.kind),
         processors: config
             .processors
@@ -6268,14 +6272,10 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     for processor in &processors {
         bootstrap_processor(&store, processor.as_ref()).await?;
     }
-    let live_required = matches!(
-        config.get().sources.live.kind,
-        crate::config::LiveSourceKind::P2p | crate::config::LiveSourceKind::JsonRpc
-    );
-    let rpc_lanes = matches!(
-        config.get().sources.live.kind,
-        crate::config::LiveSourceKind::JsonRpc
-    );
+    let live_required =
+        config.get().sources.live.kind.primary() != crate::config::LiveSourceKind::Disabled;
+    let rpc_lanes =
+        config.get().sources.live.kind.primary() == crate::config::LiveSourceKind::JsonRpc;
     let finality_required = !matches!(
         config.get().finality.kind,
         crate::config::FinalitySourceKind::Disabled
@@ -7626,8 +7626,9 @@ fn follow_sequencer_feed(
     Ok(Some(hashes))
 }
 
-/// A block the sequencer feed signed and the endpoints serve with that hash:
-/// where feed-checked lanes start. `None` once cancelled.
+/// A block the sequencer signed, on its feed or gossip, and the endpoints
+/// serve with that hash: where signature-checked lanes start. `None` once
+/// cancelled.
 async fn signed_anchor(
     quorum: &leani_source_rpc::RpcQuorum,
     signed: &leani_source_rpc::feed::SignedHashes,
@@ -7650,9 +7651,7 @@ async fn signed_anchor(
                 Err(_) => {}
             }
         } else if expired {
-            bail!(
-                "no signed block came from the sequencer feed within {FIRST_SIGNED_HEAD_TIMEOUT:?}"
-            );
+            bail!("no signed block came from the sequencer within {FIRST_SIGNED_HEAD_TIMEOUT:?}");
         }
         tokio::select! {
             () = cancellation.cancelled() => return Ok(None),
@@ -7689,6 +7688,37 @@ async fn supervise_rpc_lane_runs<T, F, Fut>(
             () = tokio::time::sleep(Duration::from_secs(5)) => {}
         }
     }
+}
+
+/// The configured endpoints, then `listed`, that serve the chain and whole
+/// blocks' receipts.
+async fn qualified_json_rpc_pool(
+    config: &Config,
+    listed: Vec<url::Url>,
+) -> Result<leani_source_rpc::RpcQuorum> {
+    let quorum = config
+        .json_rpc_pool(listed)
+        .map_err(anyhow::Error::msg)?
+        .qualified(config.chain.chain_id, true)
+        .await
+        .context("qualify the JSON-RPC endpoints")?;
+    let hosts = |tier| {
+        quorum
+            .hosts()
+            .into_iter()
+            .filter(|(of, _)| *of == tier)
+            .map(|(_, host)| host)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    info!(
+        own = %hosts(leani_source_rpc::Tier::Own),
+        bundled = %hosts(leani_source_rpc::Tier::Bundled),
+        listed = %hosts(leani_source_rpc::Tier::Listed),
+        quorum = quorum.quorum(),
+        "json-rpc endpoints qualified"
+    );
+    Ok(quorum)
 }
 
 /// What the JSON-RPC lanes report to and share with the rest of the node.
@@ -7737,28 +7767,7 @@ async fn run_rpc_lanes(
     } else {
         Vec::new()
     };
-    let quorum = config
-        .json_rpc_pool(listed)
-        .map_err(anyhow::Error::msg)?
-        .qualified(config.chain.chain_id, true)
-        .await
-        .context("qualify the JSON-RPC endpoints")?;
-    let hosts = |tier| {
-        quorum
-            .hosts()
-            .into_iter()
-            .filter(|(of, _)| *of == tier)
-            .map(|(_, host)| host)
-            .collect::<Vec<_>>()
-            .join(",")
-    };
-    info!(
-        own = %hosts(leani_source_rpc::Tier::Own),
-        bundled = %hosts(leani_source_rpc::Tier::Bundled),
-        listed = %hosts(leani_source_rpc::Tier::Listed),
-        quorum = quorum.quorum(),
-        "json-rpc endpoints qualified"
-    );
+    let quorum = qualified_json_rpc_pool(config, listed).await?;
     let rpc = &config.sources.json_rpc;
     // With the L1 anchor, confirmed assertions finalize blocks, not the
     // endpoints' `finalized` tag; with the sequencer feed, nothing else does.
@@ -8166,6 +8175,10 @@ const FIRST_SIGNED_HEAD_TIMEOUT: Duration = Duration::from_secs(180);
 /// catch-up batch.
 const RPC_CATCH_UP_GRID: u64 = 256;
 
+/// How often an op-stack node following over JSON-RPC asks whether execution
+/// peers serve it again.
+const P2P_RETURN_PROBE: Duration = Duration::from_mins(5);
+
 /// The block a fresh store catches up from, below the signed `head`: the
 /// lowest start of the processors whose history the node fills, at most
 /// `history_fallback_blocks` back and above the chain's first block.
@@ -8190,6 +8203,11 @@ fn catch_up_start(config: &Config, first_block: u64, head: u64) -> Option<u64> {
 /// becomes the attested head the execution P2P live lane follows. Nothing is
 /// finalized without an L1 anchor, so recent frames are pruned a settle depth
 /// below the tip instead.
+///
+/// A run that no execution peer served hands the next one to the JSON-RPC
+/// endpoints, when the live kinds fall back to them: their blocks must have
+/// the signed hashes or link to them. That run ends once execution peers
+/// connect again, so P2P serves whenever it can.
 #[allow(clippy::too_many_lines)]
 async fn run_op_lanes(
     config: &Config,
@@ -8231,7 +8249,28 @@ async fn run_op_lanes(
         timestamp: first.timestamp,
     };
     info!(block = first.number, "first sequencer-signed head");
-    live_source.update_advertised_head(anchor).await;
+    let rpc = match &op_heads.signed {
+        Some(signed)
+            if op_heads
+                .over_rpc
+                .swap(false, std::sync::atomic::Ordering::Relaxed) =>
+        {
+            let quorum = qualified_json_rpc_pool(config, Vec::new()).await?;
+            let Some(anchor) = signed_anchor(&quorum, signed, cancellation).await? else {
+                return Ok(());
+            };
+            info!(
+                block = anchor.number.0,
+                "following over JSON-RPC, checked against the signed blocks"
+            );
+            Some((quorum, signed.clone(), anchor))
+        }
+        _ => None,
+    };
+    let anchor = rpc.as_ref().map_or(anchor, |(_, _, anchor)| *anchor);
+    if rpc.is_none() {
+        live_source.update_advertised_head(anchor).await;
+    }
     // Windows counted in blocks keep their time at Base's 200 ms Denim cadence;
     // the lanes restart when a signed head changes the cadence.
     let block_ms = cadence.slot_ms(first.number).max(1);
@@ -8240,17 +8279,19 @@ async fn run_op_lanes(
         heads.clone(),
         op_heads.finalized.clone(),
     )?);
-    let live_runtime = SharedLiveRuntime::new(
+    let live_config = SharedLiveRuntimeConfig {
+        max_reorg_depth: usize::try_from(128_000 / block_ms).unwrap_or(usize::MAX),
+        pending_delta_bytes: config.budgets.pending_delta_bytes,
+        committed_events: Some(handles.committed_events),
+        recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+        ..SharedLiveRuntimeConfig::default()
+    };
+    // Startup reconciliation reads only the store, whichever source follows.
+    let mut live_runtime = SharedLiveRuntime::new(
         store.clone(),
         live_source.clone(),
         processors.clone(),
-        SharedLiveRuntimeConfig {
-            max_reorg_depth: usize::try_from(128_000 / block_ms).unwrap_or(usize::MAX),
-            pending_delta_bytes: config.budgets.pending_delta_bytes,
-            committed_events: Some(handles.committed_events),
-            recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
-            ..SharedLiveRuntimeConfig::default()
-        },
+        live_config.clone(),
     )?;
     live_runtime
         .reconcile_startup()
@@ -8263,7 +8304,7 @@ async fn run_op_lanes(
     let finality_runtime = SharedFinalityRuntime::new(
         store.clone(),
         finality,
-        processors,
+        processors.clone(),
         SharedFinalityRuntimeConfig {
             minimum_recent_blocks: config.rpc.minimum_recent_blocks,
             recent_soft_bytes: config.budgets.recent_raw_soft_bytes,
@@ -8275,6 +8316,7 @@ async fn run_op_lanes(
     // A store resumes from its own tip: peers serve the blocks in between. A
     // fresh one catches up from the processors' start, proven down from the
     // signed head.
+    let mut proven = None;
     let start = match store.recent_canonical_bounds(chain_id).await? {
         Some(bounds) if bounds.end() < anchor.number => store
             .recent_frame(chain_id, bounds.end())
@@ -8287,12 +8329,26 @@ async fn run_op_lanes(
                 info!(
                     from,
                     head = anchor.number.0,
-                    "catching up from the processors' start block over P2P"
+                    over = if rpc.is_some() { "JSON-RPC" } else { "P2P" },
+                    "catching up from the processors' start block"
                 );
-                let hash = live_source
-                    .ancestor_hash(anchor, before, cancellation)
-                    .await
-                    .context("prove the catch-up start against the signed head")?;
+                let hash = match &rpc {
+                    Some((quorum, ..)) => {
+                        let hashes = prove_down_from(quorum, anchor, before.0).await?;
+                        let hash = hashes.get(&before.0).copied().with_context(|| {
+                            format!(
+                                "the proof down from the signed block skipped block {}",
+                                before.0
+                            )
+                        })?;
+                        proven = Some(hashes);
+                        BlockHash::new(hash.0)
+                    }
+                    None => live_source
+                        .ancestor_hash(anchor, before, cancellation)
+                        .await
+                        .context("prove the catch-up start against the signed head")?,
+                };
                 Some(BlockRef {
                     number: before,
                     hash,
@@ -8303,6 +8359,33 @@ async fn run_op_lanes(
             None => None,
         },
     };
+    let follows_rpc = rpc.is_some();
+    if let Some((quorum, signed, _)) = rpc {
+        // The endpoints' blocks up from a stored tip are proven down from the
+        // signed block before any is delivered.
+        if let (Some(start), None) = (start, &proven) {
+            let hashes = prove_down_from(&quorum, anchor, start.number.0).await?;
+            if hashes.get(&start.number.0).map(|hash| hash.0) != Some(start.hash.0) {
+                bail!(
+                    "block {} is not on the chain down from the signed block",
+                    start.number.0
+                );
+            }
+            proven = Some(hashes);
+        }
+        let mut live = leani_source_rpc::RpcLiveSource::new(
+            "json-rpc-live",
+            chain_id,
+            quorum,
+            Duration::from_millis(config.sources.json_rpc.poll_interval_ms),
+        )?
+        .with_signed_hashes(signed);
+        if let Some(proven) = proven {
+            live = live.with_proven_hashes(proven);
+        }
+        live_runtime =
+            SharedLiveRuntime::new(store.clone(), Arc::new(live), processors, live_config)?;
+    }
     let live_start = leani_source_api::LiveStart::Block(start.unwrap_or(anchor));
     let checkpoint = leani_source_api::ConsensusCheckpoint {
         beacon_slot: anchor.number.0,
@@ -8327,11 +8410,23 @@ async fn run_op_lanes(
         cancellation.clone(),
         finality_ready,
     );
+    let p2p_returns = p2p_returns(
+        &live_source,
+        op_heads.heads.clone(),
+        config.sources.live.minimum_peers,
+        follows_rpc,
+        cancellation,
+    );
     tokio::pin!(live);
     tokio::pin!(finality);
+    tokio::pin!(p2p_returns);
     loop {
         tokio::select! {
             () = cancellation.cancelled() => return Ok(()),
+            connected = &mut p2p_returns => {
+                info!(connected, "execution peers serve the chain again; following over P2P");
+                return Err(LiveSwitch.into());
+            }
             changed = heads.changed() => {
                 if changed.is_err() {
                     bail!("the gossip lane ended");
@@ -8363,6 +8458,17 @@ async fn run_op_lanes(
                 info!(ready, "op-stack finality readiness changed");
             }
             result = &mut live => {
+                if let Err(error) = &result
+                    && let Some(reason) = peerless(error)
+                    && !follows_rpc
+                    && op_heads.signed.is_some()
+                {
+                    warn!(%reason, "no execution peer serves the chain; following over JSON-RPC");
+                    op_heads
+                        .over_rpc
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    return Err(LiveSwitch.into());
+                }
                 let report = result?;
                 bail!("op-stack live lane ended: {report:?}");
             }
@@ -8370,6 +8476,67 @@ async fn run_op_lanes(
                 let report = result?;
                 bail!("op-stack finality lane ended: {report:?}");
             }
+        }
+    }
+}
+
+/// Why a live lane failed for want of execution peers; `None` when it failed
+/// otherwise.
+fn peerless(error: &leani_runtime::RuntimeError) -> Option<&str> {
+    match error {
+        leani_runtime::RuntimeError::Source(leani_source_api::SourceError::Unavailable(reason)) => {
+            Some(reason)
+        }
+        _ => None,
+    }
+}
+
+/// The hashes a proof down from the signed `head` finds, every
+/// [`RPC_CATCH_UP_GRID`] blocks and at `from`.
+async fn prove_down_from(
+    quorum: &leani_source_rpc::RpcQuorum,
+    head: leani_primitives::BlockRef,
+    from: u64,
+) -> Result<std::collections::BTreeMap<u64, alloy_primitives::B256>> {
+    quorum
+        .prove_down(
+            head.number.0,
+            alloy_primitives::B256::from(head.hash.0),
+            from,
+            RPC_CATCH_UP_GRID,
+        )
+        .await
+        .context("prove the catch-up chain down from the signed block")
+}
+
+/// Resolves to the connected peer count once execution P2P holds at least
+/// `minimum` peers, asked every [`P2P_RETURN_PROBE`] while `following_rpc`;
+/// never otherwise.
+async fn p2p_returns(
+    source: &leani_source_p2p::RethP2pSource,
+    mut heads: tokio::sync::watch::Receiver<Option<leani_finality_op_gossip::SignedBlock>>,
+    minimum: usize,
+    following_rpc: bool,
+    cancellation: &CancellationToken,
+) -> usize {
+    if !following_rpc {
+        return std::future::pending().await;
+    }
+    loop {
+        tokio::time::sleep(P2P_RETURN_PROBE).await;
+        let Some(head) = *heads.borrow_and_update() else {
+            continue;
+        };
+        let advertised = leani_primitives::BlockRef {
+            number: leani_primitives::BlockNumber(head.number),
+            hash: leani_primitives::BlockHash::new(head.hash.0),
+            parent_hash: leani_primitives::BlockHash::new(head.parent_hash.0),
+            timestamp: head.timestamp,
+        };
+        match source.warm_up(advertised, cancellation).await {
+            Ok(connected) if connected >= minimum => return connected,
+            Ok(connected) => debug!(connected, "too few execution peers to follow over P2P yet"),
+            Err(error) => debug!(%error, "execution peers still do not serve the chain"),
         }
     }
 }
@@ -8545,6 +8712,12 @@ impl Drop for LaneReadinessGuard<'_> {
 #[error("the processor set changed")]
 struct Reconfigured;
 
+/// The op-stack lanes end their run to follow the chain with the other live
+/// source kind.
+#[derive(Debug, thiserror::Error)]
+#[error("the live source kind changed")]
+struct LiveSwitch;
+
 /// Run the lanes `run` builds for the current processor set, under a child
 /// of `cancellation`, until they end or the set changes; a change cancels
 /// them, awaits their shutdown, and ends in [`Reconfigured`], so the
@@ -8611,6 +8784,10 @@ where
             .is_err_and(anyhow::Error::is::<Reconfigured>)
         {
             info!("the processors changed; the network lanes restart with them");
+            retry = INITIAL_LANE_BACKOFF;
+            continue;
+        }
+        if result.as_ref().is_err_and(anyhow::Error::is::<LiveSwitch>) {
             retry = INITIAL_LANE_BACKOFF;
             continue;
         }
@@ -8944,7 +9121,7 @@ async fn run_network_lanes(
         checkpoint_origin,
         attested_heads,
     } = handles;
-    if !matches!(config.sources.live.kind, crate::config::LiveSourceKind::P2p) {
+    if config.sources.live.kind.primary() != crate::config::LiveSourceKind::P2p {
         bail!("network supervisor requires p2p live ingestion");
     }
     let startup_started = Instant::now();
@@ -10708,6 +10885,21 @@ mod tests {
             detail: "the finalized hash is 0xf2…, the canonical hash 0x02…".to_owned(),
         })
         .context("finality network lane")
+    }
+
+    #[test]
+    fn a_live_lane_without_execution_peers_hands_over_to_json_rpc() {
+        let peerless_run = leani_runtime::RuntimeError::from(leani_source_api::SourceError::from(
+            leani_source_p2p::P2pError::PeerTimeout {
+                minimum: 1,
+                connected: 0,
+            },
+        ));
+        assert!(peerless(&peerless_run).is_some_and(|reason| reason.contains("0 peers")));
+        let refused = leani_runtime::RuntimeError::from(leani_source_api::SourceError::from(
+            leani_source_p2p::P2pError::InvalidResponse("receipt root mismatch".to_owned()),
+        ));
+        assert_eq!(peerless(&refused), None);
     }
 
     #[test]
@@ -15188,7 +15380,7 @@ markets = ["ETH/USDT"]
             &manifest,
             &[("transaction-stats", "transfers")],
         );
-        config.sources.live.kind = crate::config::LiveSourceKind::Disabled;
+        config.sources.live.kind = crate::config::LiveSourceKind::Disabled.into();
         config.finality.kind = crate::config::FinalitySourceKind::Disabled;
         let configured = &mut config.processors[0];
         "1.0.0".clone_into(&mut configured.version);
@@ -15240,7 +15432,7 @@ markets = ["ETH/USDT"]
             &manifest,
             &[("transaction-stats", "transfers")],
         );
-        config.sources.live.kind = crate::config::LiveSourceKind::Disabled;
+        config.sources.live.kind = crate::config::LiveSourceKind::Disabled.into();
         config.finality.kind = crate::config::FinalitySourceKind::Disabled;
         let configured = &mut config.processors[0];
         "1.0.0".clone_into(&mut configured.version);

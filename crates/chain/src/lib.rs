@@ -178,7 +178,8 @@ pub struct ChainDefaults {
     /// History source kinds the compact config enables, in priority order.
     #[serde(default)]
     pub history_sources: Vec<String>,
-    /// JSON-RPC endpoints for chains without public execution P2P.
+    /// JSON-RPC endpoints: a Nitro chain's blocks, and an op-stack chain's
+    /// while no execution peer serves them.
     #[serde(default)]
     pub rpc_endpoints: Vec<Url>,
 }

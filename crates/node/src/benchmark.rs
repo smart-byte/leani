@@ -7046,7 +7046,7 @@ mod tests {
         let directory = tempfile::tempdir().expect("temporary directory");
         let _node = crate::local_state::lock_runtime_directory(directory.path())
             .expect("a node holds the data directory");
-        let error = run_real_source(
+        let error = Box::pin(run_real_source(
             &directory.path().join("leani.toml"),
             RealSourceBenchmarkOptions {
                 processor: "blobs-money".to_owned(),
@@ -7065,7 +7065,7 @@ mod tests {
                 report: directory.path().join("report.json"),
             },
             &ProcessorRegistry::standard(),
-        )
+        ))
         .await
         .expect_err("the node holds the data directory");
         assert!(

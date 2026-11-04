@@ -677,7 +677,9 @@ pub enum HistoryTrust {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct LiveSourceConfig {
-    pub kind: LiveSourceKind,
+    /// One kind, or `["p2p", "json_rpc"]` on an op-stack chain: execution
+    /// P2P first, JSON-RPC while no execution peer serves.
+    pub kind: LiveKinds,
     /// Hard connected-peer floor required before execution requests may start.
     /// Capability qualification ranks peers but does not gate this floor.
     pub minimum_peers: usize,
@@ -784,12 +786,111 @@ pub struct LiveSourceConfig {
     pub handoff_overlap_blocks: u64,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSourceKind {
     P2p,
     JsonRpc,
     Disabled,
+}
+
+/// The live source kinds in order, configured as one kind or a list: the
+/// first serves while it can, the next while it cannot. Never empty.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LiveKinds(Vec<LiveSourceKind>);
+
+impl LiveKinds {
+    /// The kind a node follows its chain with first.
+    #[must_use]
+    pub fn primary(&self) -> LiveSourceKind {
+        self.0[0]
+    }
+
+    /// The kind that serves while the first cannot; `None` when the first
+    /// serves alone.
+    #[must_use]
+    pub fn fallback(&self) -> Option<LiveSourceKind> {
+        self.0.get(1).copied()
+    }
+
+    /// Whether `kind` is one of the listed kinds.
+    #[must_use]
+    pub fn uses(&self, kind: LiveSourceKind) -> bool {
+        self.0.contains(&kind)
+    }
+
+    fn kinds(&self) -> &[LiveSourceKind] {
+        &self.0
+    }
+}
+
+/// The kinds in order: `P2p then JsonRpc`.
+impl std::fmt::Display for LiveKinds {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (index, kind) in self.0.iter().enumerate() {
+            if index > 0 {
+                formatter.write_str(" then ")?;
+            }
+            write!(formatter, "{kind:?}")?;
+        }
+        Ok(())
+    }
+}
+
+impl From<LiveSourceKind> for LiveKinds {
+    fn from(kind: LiveSourceKind) -> Self {
+        Self(vec![kind])
+    }
+}
+
+impl Serialize for LiveKinds {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self.0.as_slice() {
+            [kind] if serializer.is_human_readable() => kind.serialize(serializer),
+            kinds => kinds.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for LiveKinds {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Kinds;
+        impl<'de> serde::de::Visitor<'de> for Kinds {
+            type Value = LiveKinds;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a live source kind or a list of them")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<LiveKinds, E> {
+                LiveSourceKind::deserialize(serde::de::value::StrDeserializer::new(value))
+                    .map(LiveKinds::from)
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut list: A,
+            ) -> Result<LiveKinds, A::Error> {
+                let mut kinds = Vec::new();
+                while let Some(kind) = list.next_element()? {
+                    kinds.push(kind);
+                }
+                if kinds.is_empty() {
+                    return Err(serde::de::Error::invalid_length(0, &self));
+                }
+                Ok(LiveKinds(kinds))
+            }
+        }
+        // Compact formats carry the list alone.
+        if !deserializer.is_human_readable() {
+            let kinds = Vec::<LiveSourceKind>::deserialize(deserializer)?;
+            if kinds.is_empty() {
+                return Err(serde::de::Error::invalid_length(0, &Kinds));
+            }
+            return Ok(Self(kinds));
+        }
+        deserializer.deserialize_any(Kinds)
+    }
 }
 
 impl LiveSourceConfig {
@@ -1667,9 +1768,17 @@ impl Config {
                     discovery_port: OP_GOSSIP_PORT,
                     ..without_checkpoint(config.finality, FinalitySourceKind::OpGossip)
                 };
+                // Few execution peers take a node they cannot dial back:
+                // after a minute without one, the entry's endpoints serve
+                // until one does.
+                if !chain.defaults.rpc_endpoints.is_empty() {
+                    config.sources.live.kind =
+                        LiveKinds(vec![LiveSourceKind::P2p, LiveSourceKind::JsonRpc]);
+                    config.sources.live.peer_recovery_timeout_seconds = 60;
+                }
             }
             leani_chain::Family::Arbitrum => {
-                config.sources.live.kind = LiveSourceKind::JsonRpc;
+                config.sources.live.kind = LiveSourceKind::JsonRpc.into();
                 config.finality =
                     without_checkpoint(config.finality, FinalitySourceKind::SequencerFeed);
             }
@@ -1754,9 +1863,13 @@ impl Config {
                 self.chain.name
             ));
         }
-        // The sequencer feed checks each block: one endpoint is enough.
+        // The sequencer feed or gossip checks each block: one endpoint is
+        // enough.
         let quorum = self.sources.json_rpc.quorum.unwrap_or_else(|| {
-            if matches!(self.finality.kind, FinalitySourceKind::SequencerFeed) {
+            if matches!(
+                self.finality.kind,
+                FinalitySourceKind::SequencerFeed | FinalitySourceKind::OpGossip
+            ) {
                 1
             } else {
                 count.min(2)
@@ -1976,8 +2089,7 @@ impl Config {
                 "must not exceed recent_raw_hard_bytes",
             ));
         }
-        if self.sources.history.is_empty() && !matches!(self.sources.live.kind, LiveSourceKind::P2p)
-        {
+        if self.sources.history.is_empty() && !self.sources.live.kind.uses(LiveSourceKind::P2p) {
             errors.push(ValidationError::new(
                 "sources.history",
                 "at least one historical source is required without the p2p live source",
@@ -2005,15 +2117,14 @@ impl Config {
             public_dataset,
             &mut errors,
         );
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
-            && self.sources.live.minimum_peers == 0
+        if self.sources.live.kind.uses(LiveSourceKind::P2p) && self.sources.live.minimum_peers == 0
         {
             errors.push(ValidationError::new(
                 "sources.live.minimum_peers",
                 "must be greater than zero for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.max_outbound_peers < self.sources.live.minimum_peers
                 || self.sources.live.max_outbound_peers > 400)
         {
@@ -2022,7 +2133,7 @@ impl Config {
                 "must be between minimum_peers and 400 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.preferred_peers < self.sources.live.minimum_peers
                 || self.sources.live.preferred_peers > self.sources.live.max_outbound_peers)
         {
@@ -2031,7 +2142,7 @@ impl Config {
                 "must be between minimum_peers and max_outbound_peers for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.body_serving_peer_target == 0
                 || self.sources.live.body_serving_peer_target > self.sources.live.preferred_peers)
         {
@@ -2040,7 +2151,7 @@ impl Config {
                 "must be in 1..=preferred_peers for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.max_concurrent_dials == 0
                 || self.sources.live.max_concurrent_dials > self.sources.live.max_outbound_peers)
         {
@@ -2049,7 +2160,7 @@ impl Config {
                 "must be in 1..=max_outbound_peers for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && self.sources.live.enable_discv5
             && self.sources.live.discovery_port != 0
             && self.sources.live.discovery_port == self.sources.live.discv5_port
@@ -2059,7 +2170,7 @@ impl Config {
                 "must differ from the fixed Discv4 discovery_port",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.peer_refill_interval_ms == 0
                 || self.sources.live.peer_recovery_timeout_seconds == 0)
         {
@@ -2070,7 +2181,7 @@ impl Config {
         }
         // Longer than the five-minute startup peer wait, which fails a run
         // that finds no peers, and short enough to add to the clock.
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(360..=2_592_000).contains(&self.sources.live.stall_timeout_seconds)
         {
             errors.push(ValidationError::new(
@@ -2078,7 +2189,7 @@ impl Config {
                 "must be in 360..=2592000 (six minutes to 30 days) for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=64).contains(&self.sources.live.material_request_concurrency)
         {
             errors.push(ValidationError::new(
@@ -2086,7 +2197,7 @@ impl Config {
                 "must be in 1..=64 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=16).contains(&self.sources.live.material_request_blocks)
         {
             errors.push(ValidationError::new(
@@ -2094,7 +2205,7 @@ impl Config {
                 "must be in 1..=16 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(2..=120).contains(&self.sources.live.request_timeout_seconds)
         {
             errors.push(ValidationError::new(
@@ -2102,7 +2213,7 @@ impl Config {
                 "must be in 2..=120 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=10).contains(&self.sources.live.request_retries)
         {
             errors.push(ValidationError::new(
@@ -2110,7 +2221,7 @@ impl Config {
                 "must be in 1..=10 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=10_000).contains(&self.sources.live.request_retry_backoff_ms)
         {
             errors.push(ValidationError::new(
@@ -2118,7 +2229,7 @@ impl Config {
                 "must be in 1..=10000 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && (self.sources.live.retry_backoff_max_seconds == 0
                 || self.sources.live.peer_store_flush_seconds == 0
                 || self.sources.live.archive_reconciliation_interval_seconds == 0)
@@ -2128,7 +2239,7 @@ impl Config {
                 "must be greater than zero for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=65_536).contains(&self.sources.live.peer_store_max_entries)
         {
             errors.push(ValidationError::new(
@@ -2136,7 +2247,7 @@ impl Config {
                 "must be in 1..=65536 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && leani_source_p2p::parse_nat_resolver(&self.sources.live.nat).is_err()
         {
             errors.push(ValidationError::new(
@@ -2144,7 +2255,7 @@ impl Config {
                 "must be a supported Reth NAT resolver or none",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p) {
+        if self.sources.live.kind.uses(LiveSourceKind::P2p) {
             for (index, peer) in self.sources.live.trusted_peers.iter().enumerate() {
                 if leani_source_p2p::parse_trusted_peer(peer).is_err() {
                     errors.push(ValidationError::new(
@@ -2162,7 +2273,7 @@ impl Config {
                 ));
             }
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=4_096).contains(&self.sources.live.archive_reconciliation_blocks)
         {
             errors.push(ValidationError::new(
@@ -2170,7 +2281,7 @@ impl Config {
                 "must be in 1..=4096 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && self
                 .sources
                 .live
@@ -2182,7 +2293,7 @@ impl Config {
                 "must be in 1..=100000000 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=64).contains(&self.sources.live.history_header_request_concurrency)
         {
             errors.push(ValidationError::new(
@@ -2190,7 +2301,7 @@ impl Config {
                 "must be in 1..=64 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=1_024).contains(&self.sources.live.history_header_request_blocks)
         {
             errors.push(ValidationError::new(
@@ -2198,7 +2309,7 @@ impl Config {
                 "must be in 1..=1024 for p2p",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !(1..=64).contains(&self.sources.live.handoff_overlap_blocks)
         {
             errors.push(ValidationError::new(
@@ -2207,7 +2318,7 @@ impl Config {
             ));
         }
         validate_finality(&self.finality, &mut errors);
-        let rpc_live = matches!(self.sources.live.kind, LiveSourceKind::JsonRpc);
+        let rpc_live = self.sources.live.kind.primary() == LiveSourceKind::JsonRpc;
         let rpc_finality = matches!(
             self.finality.kind,
             FinalitySourceKind::JsonRpc | FinalitySourceKind::SequencerFeed
@@ -2218,12 +2329,25 @@ impl Config {
                 "json_rpc live runs with json_rpc or sequencer_feed finality, and they only with it",
             ));
         }
+        if self.sources.live.kind.kinds().len() > 1 {
+            if self.sources.live.kind.kinds() != [LiveSourceKind::P2p, LiveSourceKind::JsonRpc] {
+                errors.push(ValidationError::new(
+                    "sources.live.kind",
+                    "a list of live kinds is [\"p2p\", \"json_rpc\"]: execution P2P first, JSON-RPC while no execution peer serves",
+                ));
+            } else if !matches!(self.finality.kind, FinalitySourceKind::OpGossip) {
+                errors.push(ValidationError::new(
+                    "sources.live.kind",
+                    "falling back to json_rpc needs op_gossip finality, whose signed blocks check what the endpoints serve",
+                ));
+            }
+        }
         let rpc_history = self
             .sources
             .history
             .iter()
             .any(|source| matches!(source.kind, HistorySourceKind::JsonRpc));
-        if (rpc_live || rpc_history)
+        if (self.sources.live.kind.uses(LiveSourceKind::JsonRpc) || rpc_history)
             && let Err(error) = self.json_rpc_quorum()
         {
             errors.push(ValidationError::new("sources.json_rpc", error));
@@ -2236,7 +2360,7 @@ impl Config {
                 "anyone can list an endpoint on chainlist.org, so its endpoints only carry blocks the sequencer feed checks; use `bundled` or `none` with this finality",
             ));
         }
-        if matches!(self.sources.live.kind, LiveSourceKind::P2p)
+        if self.sources.live.kind.uses(LiveSourceKind::P2p)
             && !matches!(
                 self.finality.kind,
                 FinalitySourceKind::BeaconApi
@@ -4367,7 +4491,7 @@ max_blocks = 64"#,
             "{refusal:?}"
         );
         // Disabling live following as well is a finalized-dataset backfill.
-        config.sources.live.kind = LiveSourceKind::Disabled;
+        config.sources.live.kind = LiveSourceKind::Disabled.into();
         assert!(
             finality_errors(config)
                 .iter()
@@ -4576,6 +4700,66 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
     }
 
     #[test]
+    fn live_kinds_take_one_kind_or_an_ordered_list() {
+        #[derive(Deserialize, Serialize)]
+        struct Live {
+            kind: LiveKinds,
+        }
+        let one: Live = toml::from_str("kind = \"p2p\"").expect("one kind");
+        assert_eq!(
+            (one.kind.primary(), one.kind.fallback()),
+            (LiveSourceKind::P2p, None)
+        );
+        let listed: Live = toml::from_str("kind = [\"p2p\", \"json_rpc\"]").expect("a list");
+        assert_eq!(
+            (listed.kind.primary(), listed.kind.fallback()),
+            (LiveSourceKind::P2p, Some(LiveSourceKind::JsonRpc))
+        );
+        assert_eq!(toml::to_string(&one).expect("one"), "kind = \"p2p\"\n");
+        assert_eq!(
+            toml::to_string(&listed).expect("list"),
+            "kind = [\"p2p\", \"json_rpc\"]\n"
+        );
+        assert!(toml::from_str::<Live>("kind = []").is_err());
+        assert!(toml::from_str::<Live>("kind = [\"p2p\", \"rpc\"]").is_err());
+    }
+
+    #[test]
+    fn only_op_stack_nodes_fall_back_from_p2p_to_json_rpc() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let path = temp.path().join("unichain.toml");
+        fs::write(&path, compact_rollup_config("unichain", true)).expect("write config");
+        let mut config = Config::load(&path).expect("load");
+        assert!(
+            config.validation_errors().is_empty(),
+            "{:?}",
+            config.validation_errors()
+        );
+        let refused = |config: &Config, field: &str| {
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == field)
+        };
+        config.sources.live.kind = LiveKinds(vec![LiveSourceKind::JsonRpc, LiveSourceKind::P2p]);
+        assert!(refused(&config, "sources.live.kind"), "JSON-RPC first");
+        config.sources.live.kind = LiveKinds(vec![LiveSourceKind::P2p, LiveSourceKind::P2p]);
+        assert!(refused(&config, "sources.live.kind"), "a kind twice");
+        config.sources.live.kind = LiveKinds(vec![LiveSourceKind::P2p, LiveSourceKind::JsonRpc]);
+        config.sources.json_rpc.public_endpoints = Some(PublicEndpoints::None);
+        assert!(
+            refused(&config, "sources.json_rpc"),
+            "a fallback without endpoints"
+        );
+        config.sources.json_rpc.public_endpoints = None;
+        config.finality.kind = FinalitySourceKind::BeaconApi;
+        assert!(
+            refused(&config, "sources.live.kind"),
+            "no signed blocks check the endpoints"
+        );
+    }
+
+    #[test]
     fn compact_rollup_configurations_follow_their_family() {
         let temp = tempfile::tempdir().expect("temporary directory");
         let load = |network: &str, checkpoint: bool| {
@@ -4607,7 +4791,7 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
                 config.chain_entry().expect("entry").family == leani_chain::Family::Arbitrum;
             assert_eq!(
                 (
-                    matches!(config.sources.live.kind, LiveSourceKind::JsonRpc),
+                    config.sources.live.kind.primary() == LiveSourceKind::JsonRpc,
                     matches!(config.finality.kind, FinalitySourceKind::SequencerFeed),
                     matches!(config.finality.kind, FinalitySourceKind::OpGossip),
                     config.l1_anchor.is_some(),
@@ -4615,6 +4799,20 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
                 (nitro, nitro, !nitro, anchored),
                 "{network}"
             );
+            // Op-stack chains fall back to their entry's endpoints, one of
+            // which suffices since signed blocks check what it serves; World
+            // Chain's entry names none.
+            if !nitro && network != "worldchain" {
+                assert_eq!(
+                    (
+                        config.sources.live.kind.fallback(),
+                        config.sources.live.peer_recovery_timeout_seconds,
+                        config.json_rpc_quorum().expect("entry endpoints").quorum(),
+                    ),
+                    (Some(LiveSourceKind::JsonRpc), 60, 1),
+                    "{network}"
+                );
+            }
         }
         let history = |network| {
             load(network, true)
@@ -4681,7 +4879,7 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
         config.sources.history.truncate(1);
         config.sources.history[0].kind = HistorySourceKind::JsonRpc;
         config.sources.history[0].chunk_blocks = None;
-        config.sources.live.kind = LiveSourceKind::JsonRpc;
+        config.sources.live.kind = LiveSourceKind::JsonRpc.into();
         let errors = config.validation_errors();
         assert!(
             errors

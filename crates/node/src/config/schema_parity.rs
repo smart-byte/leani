@@ -436,7 +436,17 @@ fn compare(
                 }
             }
         }
-        Shape::Array(item) => match node.get("items") {
+        // A field that takes one value or a list declares the list as a
+        // `oneOf` candidate.
+        Shape::Array(item) => match node.get("items").or_else(|| {
+            node.get("oneOf")
+                .and_then(Value::as_array)
+                .and_then(|candidates| {
+                    candidates
+                        .iter()
+                        .find_map(|candidate| schema.resolve(candidate).get("items"))
+                })
+        }) {
             Some(items) => compare(schema, items, item, &format!("{path}[]"), differences),
             None => differences.push(format!("{path}: the schema declares no array items")),
         },

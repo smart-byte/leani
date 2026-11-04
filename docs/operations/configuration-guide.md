@@ -98,7 +98,8 @@ Use the advanced schema below when any expanded field needs an override.
 `leani init blocks --network base` writes one. The chain's family picks the
 lanes. An Ethereum testnet follows its own beacon chain from the checkpoint in
 `[finality]`. An op-stack chain follows the sequencer's signed block gossip
-over execution P2P, on gossip port 9222 so that peers can dial in, and its
+over execution P2P, on gossip port 9222 so that peers can dial in, and over
+the entry's public JSON-RPC endpoints while no execution peer serves it; its
 history comes through the live lane. A Nitro chain follows its sequencer feed
 over the entry's public JSON-RPC endpoints, with history from the sources the
 entry names: SonarX and then the endpoints for Arbitrum One, the endpoints
@@ -488,7 +489,8 @@ of blocks when omitted, or sooner when that hour outgrows
 keep their level. Gossip peers find the node through
 its discovery record: fixed, reachable `finality.listen_port` (TCP) and
 `finality.discovery_port` (UDP) let them dial in, which Base needs because
-its busy consensus nodes refuse new connections. Since only a few
+its busy consensus nodes refuse new connections, and Unichain because its
+gossip peers are rarely found otherwise. Since only a few
 of them carry blocks to a new node, the node keeps the ones that did in
 `op-gossip-peers.txt` in its data directory and dials them first after a
 restart and again whenever signed blocks stop for 10 seconds. Peers whose
@@ -504,6 +506,22 @@ chain, so caught-up blocks are `attested` like the ones that follow. A restart
 resumes from the store's tip. A processor's status shows the catch-up's
 progress in `processedThrough`. Blocks are not `finalized` until the L1
 anchor finalizes them.
+
+Few execution peers take a node they cannot dial back, so a fresh op-stack
+node behind NAT may find none. `sources.live.kind` then takes an ordered
+list, `["p2p", "json_rpc"]`, as compact configurations and `leani init` set
+it for op-stack chains: when no execution peer connects within
+`sources.live.peer_recovery_timeout_seconds` (60 there), the next lane run
+follows over the `[sources.json_rpc]` endpoints, the chain entry's public
+ones unless `public_endpoints = "none"`. Each block they serve must have the
+hash the sequencer signed or link to a block that does, and its
+transactions and receipts roots must hold, so one endpoint suffices
+(`quorum` defaults to 1). The catch-up is proven by parent links down from
+the signed head, as over P2P. Every five minutes the node asks whether
+execution peers serve it again, and the next run returns to P2P once they
+do. `kind = "p2p"` keeps the node on execution P2P, which World Chain's
+compact configuration does: no keyless endpoint serves its blocks' receipts
+at a following pace, so the fallback there needs endpoints of your own.
 
 Nitro chains (Arbitrum One and Nova, Robinhood Chain) run no public execution
 P2P, so `sources.live.kind = "json_rpc"` serves their blocks. With

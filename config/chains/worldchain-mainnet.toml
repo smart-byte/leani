@@ -14,6 +14,10 @@ bootnodes = [
   "enode://77b6b1e72984d5d50e00ae934ffea982902226fe92fa50da42334c2750d8e405b55a5baabeb988c88125368142a64eda5096d0d4522d3b6eef75d166c7d303a9@3.148.100.173:30303",
 ]
 
+# No keyless endpoint serves World Chain's whole blocks' receipts at a
+# following pace (drpc and Alchemy's public one refuse eth_getBlockReceipts,
+# thirdweb rate-limits it), so its node follows over execution P2P alone.
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0x2270d6ec8e760daa317dd978cfb98c8f144b1f3a"

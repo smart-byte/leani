@@ -14,6 +14,15 @@ bootnodes = [
   "enode://77b6b1e72984d5d50e00ae934ffea982902226fe92fa50da42334c2750d8e405b55a5baabeb988c88125368142a64eda5096d0d4522d3b6eef75d166c7d303a9@3.148.100.173:30303",
 ]
 
+# Public keyless endpoints, paced to the limits their operators announce.
+# They serve while no execution peer does, and each block they serve must
+# have the hash the sequencer signed or link to one.
+[defaults]
+rpc_endpoints = [
+  "https://rpc.zora.energy",
+  "https://zora.drpc.org",
+]
+
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0x3dc8dfd0709c835cad15a6a27e089ff4cf4c9228"
