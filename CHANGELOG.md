@@ -54,8 +54,12 @@ record, and documented RPC contracts.
   or a limit and its reset) and to a 429's `Retry-After`, halves its pace
   once per burst of rate limits and recovers per call served; its calls take
   their slots in turn, so calls queued during a rate limit speed up once it
-  lifts. All lanes of a node share each endpoint's budget.
-  The live lane fetches 256 blocks at a time while catching up. With
+  lifts. All lanes of a node share each endpoint's budget. Once enough
+  endpoints answered a head or a block, the others get 250 ms, so a slow or
+  rate-limited endpoint does not hold up what the rest agree on.
+  The live lane fetches 256 blocks at a time while catching up, hands each
+  round's blocks over as soon as they are fetched, and asks for the head
+  again at once while it moves. With
   `sequencer_feed`, the quorum defaults to 1 and no
   endpoint can claim a head the sequencer has not signed. Nitro entries list
   public keyless endpoints of several operators. Requests name `leani` in
