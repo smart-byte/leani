@@ -207,6 +207,7 @@ pub(crate) struct OpHeads {
     /// Set by a P2P run that no execution peer served: the next run follows
     /// over JSON-RPC.
     pub(crate) over_rpc: Arc<AtomicBool>,
+    pub(crate) returns: Arc<std::sync::Mutex<crate::process::P2pReturns>>,
 }
 
 /// Join the chain's sequencer gossip, publishing each signed block as the
@@ -279,6 +280,7 @@ pub(crate) async fn start_op_heads(
         finalized,
         signed: hashes,
         over_rpc: Arc::default(),
+        returns: Arc::default(),
     })
 }
 
