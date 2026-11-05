@@ -41,8 +41,8 @@ new instance.
 
 ## Try a template
 
-The binary embeds four templates: `block-gas`, the gas and base fee of every
-block, from headers alone; `erc20-transfers`, transfers of chosen tokens at or
+The binary embeds four templates: `block-gas`, the gas, base fee, and burned
+base fee of every block, from headers alone; `erc20-transfers`, transfers of chosen tokens at or
 above a minimum value; `token-volume`, a running transfer count and volume per
 token, in ordered state; and `event-decoder`, any contract's events, decoded
 from Solidity signatures given as parameters. Run one over twelve Mainnet
@@ -167,7 +167,8 @@ export_processor!(BusyBlocks);
 ```
 
 The SDK's `solidity` module parses Solidity signatures and decodes event and
-call arguments, and `U256` holds 256-bit amounts. The templates' sources in
+call arguments, and `U256` holds 256-bit amounts with checked addition,
+subtraction, and multiplication. The templates' sources in
 `examples/wasm-processors` show log filters, ERC-20 decoding, and ordered
 state.
 

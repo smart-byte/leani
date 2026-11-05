@@ -1,4 +1,5 @@
-//! Gas used, gas limit, utilization, and base fee of every block.
+//! Gas used, gas limit, utilization, base fee, and burned base fee of every
+//! block.
 //!
 //! Block-local, keyed by block number, and needs only block headers, which
 //! a node following blocks fetches.
@@ -64,6 +65,9 @@ impl Processor for BlockGas {
         let Some(gas) = gas else {
             return Ok(());
         };
+        let burned_wei = gas
+            .base_fee_per_gas
+            .and_then(|fee| fee.checked_mul(U256::from_u128(gas.gas_used.into())));
         store.upsert(
             "blocks",
             "block.gas",
@@ -72,17 +76,22 @@ impl Processor for BlockGas {
                 number: block.number,
                 timestamp: block.timestamp,
                 gas,
+                burned_wei,
             },
         )
     }
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Entity {
     number: u64,
     timestamp: u64,
     #[serde(flatten)]
     gas: Gas,
+    /// The base fee times the gas used; `None` without a base fee, or when
+    /// the product does not fit 256 bits.
+    burned_wei: Option<U256>,
 }
 
 export_processor!(BlockGas);

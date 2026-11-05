@@ -933,8 +933,28 @@ async fn block_gas_carries_a_256_bit_fee_through_its_delta() {
             "gasLimit": 30_000_000,
             "utilizationBasisPoints": 7,
             "baseFeePerGas": "452312848583266388373324160190187140051835877600158453279131187530910662656",
+            // 21,000 gas at this fee needs more than 256 bits.
+            "burnedWei": null,
         }))
     );
+}
+
+#[tokio::test]
+async fn block_gas_burns_the_base_fee_for_the_gas_used() {
+    let processor =
+        processor_with(BLOCK_GAS, &json!({}), WasmLimits::default()).expect("processor");
+    let mut block = frame(11, BlockHash::ZERO, Vec::new());
+    if let Material::Complete(header) = &mut block.header {
+        header.base_fee_per_gas = Some(leani_primitives::Quantity::new(word(7_000_000_000)));
+    }
+    let directory = tempfile::tempdir().expect("directory");
+    let store = open_store(&directory).await;
+    apply(&store, &processor, &block).await.expect("apply");
+    let gas = entity(&store, &processor, "blocks", &11_u64.to_be_bytes())
+        .await
+        .expect("entity");
+    assert_eq!(gas["gasUsed"], 21_000);
+    assert_eq!(gas["burnedWei"], "147000000000000");
 }
 
 #[tokio::test]
@@ -1235,15 +1255,23 @@ async fn typescript_examples_match_their_rust_twins() {
         header.base_fee_per_gas = Some(leani_primitives::Quantity::new(word(7_000_000_000)));
     }
     let plain = frame(12, fee.block.hash, Vec::new());
+    let mut overflowing = frame(13, plain.block.hash, Vec::new());
+    if let Material::Complete(header) = &mut overflowing.header {
+        let mut huge = [0; 32];
+        huge[0] = 1;
+        header.base_fee_per_gas = Some(leani_primitives::Quantity::new(huge));
+    }
     let (published, _) = twins(
         BLOCK_GAS,
         &typescript_example("block-gas"),
         &json!({}),
-        &[fee.clone(), plain],
+        &[fee.clone(), plain, overflowing],
     )
     .await;
-    assert_eq!(published.len(), 2, "{published:?}");
+    assert_eq!(published.len(), 3, "{published:?}");
     assert_eq!(published[0].2["baseFeePerGas"], "7000000000");
+    assert_eq!(published[0].2["burnedWei"], "147000000000000");
+    assert_eq!(published[2].2["burnedWei"], Value::Null);
     let (skipped, _) = twins(
         BLOCK_GAS,
         &typescript_example("block-gas"),

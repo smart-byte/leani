@@ -1,9 +1,10 @@
-// Gas used, gas limit, utilization, and base fee of every block.
+// Gas used, gas limit, utilization, base fee, and burned base fee of every
+// block.
 //
 // Block-local, keyed by block number, and needs only block headers, which
 // a node following blocks fetches.
 
-import { Block, BlockRef, Capability, Json, Manifest, Processor, Reader, Store, Writer, bigEndian64, register } from "./leani";
+import { Block, BlockRef, Capability, Json, Manifest, Processor, Reader, Store, U256, Writer, bigEndian64, register } from "./leani";
 export * from "./leani/exports";
 
 class BlockGas extends Processor {
@@ -35,13 +36,19 @@ class BlockGas extends Processor {
 
   reduce(params: Json, block: BlockRef, delta: Reader, store: Store): void {
     if (delta.done) return;
+    const gasUsed = delta.uint();
     const entity = Json.object()
       .set("number", block.number)
       .set("timestamp", block.timestamp)
-      .set("gasUsed", delta.uint())
+      .set("gasUsed", gasUsed)
       .set("gasLimit", delta.uint())
-      .set("utilizationBasisPoints", delta.uint())
-      .set("baseFeePerGas", delta.flag() ? delta.u256() : null);
+      .set("utilizationBasisPoints", delta.uint());
+    const fee = delta.flag() ? delta.u256() : null;
+    // The base fee times the gas used; null without a base fee, or when the
+    // product does not fit 256 bits.
+    let burned: U256 | null = null;
+    if (fee != null) burned = fee.checkedMul(U256.fromU64(gasUsed));
+    entity.set("baseFeePerGas", fee).set("burnedWei", burned);
     store.upsert("blocks", "block.gas", bigEndian64(block.number), entity);
   }
 }

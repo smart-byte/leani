@@ -120,6 +120,27 @@ export class U256 extends Jsonable {
     return new U256(difference);
   }
 
+  /** The product, or `null` on overflow. */
+  checkedMul(other: U256): U256 | null {
+    // Byte products by significance, least significant first. A sum holds
+    // at most 32 products of 255 * 255, far below 2^32.
+    const sums = new StaticArray<u32>(64);
+    for (let i = 0; i < 32; i++) {
+      for (let j = 0; j < 32; j++) {
+        sums[i + j] += <u32>this.bytes[31 - i] * <u32>other.bytes[31 - j];
+      }
+    }
+    const product = new Uint8Array(32);
+    let carry: u32 = 0;
+    for (let index = 0; index < 64; index++) {
+      const total = sums[index] + carry;
+      if (index < 32) product[31 - index] = <u8>total;
+      else if (<u8>total != 0) return null;
+      carry = total >> 8;
+    }
+    return new U256(product);
+  }
+
   /** Multiply by a small factor and add a digit; `null` on overflow. */
   private mulAdd(factor: u8, addend: u8): U256 | null {
     const product = new Uint8Array(32);
