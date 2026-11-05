@@ -492,8 +492,10 @@ which the finality source verifies each slot, so validation refuses
 
 On an op-stack chain, such as Base, `finality.kind = "op_gossip"` follows the
 sequencer's signed block gossip and needs no checkpoint. Every block the
-chain entry's sequencer key signed becomes the attested head the P2P live lane
-follows, so blocks reach `attested` about as fast as `unattested`. Nothing
+sequencer's key signed becomes the attested head the P2P live lane follows:
+the chain entry's key, a newer one the L1 anchor read, or
+`finality.sequencer_signer` when that is set, so blocks reach `attested`
+about as fast as `unattested`. Nothing
 finalizes a block without an L1 anchor, so recent frames are pruned
 `finality.settle_blocks` below the newest signed head instead, about one hour
 of blocks when omitted, or sooner when that hour outgrows
@@ -666,6 +668,21 @@ it stopped survives restarts (`l1-anchor-cursor.json`); a cold start reads
 `lookback_blocks` (600 by default) below the first finalized block. Its
 execution P2P uses its own ports, `listener_port`, `discovery_port`, and
 `discv5_port`, and its own peer store.
+
+On an op-stack chain the lane also follows the rollup's own changes in the
+same finalized blocks. When the chain's SystemConfig names a new unsafe
+block signer, gossip blocks are checked against that key from then on, and
+when the anchor state registry comes to respect another game type, the
+anchor reads that type's games. What the lane learned stays in
+`l1-anchor-cursor.json` across restarts. A rotation from before the node
+first ran reaches it only through the chain entry or the configuration.
+The claim format stays the entry's: after a move between output-root and
+super-root games, the anchor finalizes nothing until `l1_anchor.claims`
+names the new one. `finality.sequencer_signer` fixes the signer, and
+`l1_anchor.factory`, `registry`, `game_type`, and `claims` replace the
+entry's contracts; a configured `game_type` stays when the registry
+respects another. On a chain whose entry names no dispute games, such as
+Base Sepolia, `factory`, `registry`, and `game_type` together name them.
 
 ## Processor identity and publication
 

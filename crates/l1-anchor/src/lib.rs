@@ -3,7 +3,9 @@
 //! which L2 block the chain's own rules treat as final: a confirmed Nitro
 //! assertion names its block hash, and an op-stack anchor state registry
 //! moves to a dispute game whose claim, an output root or a super root
-//! holding one, is checked against a block the sequencer signed.
+//! holding one, is checked against a block the sequencer signed. The same
+//! blocks carry an op-stack chain's new sequencer signer and respected game
+//! type.
 
 use std::{
     collections::BTreeMap,
@@ -36,6 +38,15 @@ const ANCHOR_UPDATED: B256 =
 /// `AssertionConfirmed(bytes32 indexed, bytes32, bytes32)`.
 const ASSERTION_CONFIRMED: B256 =
     b256!("0xfc42829b29c259a7370ab56c8f69fce23b5f351a9ce151da453281993ec0090c");
+/// `ConfigUpdate(uint256 indexed, uint8 indexed, bytes)`, as a `SystemConfig`
+/// emits it.
+const CONFIG_UPDATE: B256 =
+    b256!("0x1d2b0bda21d56b8bd12d4f94ebacffdfb35f5e226f84b461103bb8beab6353be");
+/// `SystemConfig`'s `UpdateType.UNSAFE_BLOCK_SIGNER`.
+const UNSAFE_BLOCK_SIGNER: u64 = 3;
+/// `RespectedGameTypeSet(uint32)`, as an anchor state registry emits it.
+const RESPECTED_GAME_TYPE_SET: B256 =
+    b256!("0xcee0703b5e4bad4efededab85c9fd1aec17dee7c5f6c584330e0509b677745a2");
 /// `create(uint32,bytes32,bytes)` and
 /// `createWithInitData(uint32,bytes32,bytes,bytes)`: the extra data, at the
 /// same place in both, starts with the claimed L2 block number, or is the
@@ -65,15 +76,23 @@ pub enum Observation {
     AnchorUpdated { game: Address },
     /// The rollup confirmed the assertion ending at `block_hash`.
     AssertionConfirmed { block_hash: B256 },
+    /// The `SystemConfig` names a new key to sign the sequencer's blocks.
+    SignerChanged { signer: Address },
+    /// The registry respects games of `game_type` from this block on.
+    GameTypeChanged { game_type: u32 },
 }
 
-/// The contracts whose logs the anchor reads.
+/// The contracts whose logs the anchor reads, `system_config` among them for
+/// an op-stack chain's signer updates.
 #[must_use]
-pub fn log_addresses(anchor: &L1Anchor) -> Vec<Address> {
+pub fn log_addresses(anchor: &L1Anchor, system_config: Option<Address>) -> Vec<Address> {
     match *anchor {
         L1Anchor::DisputeGames {
             factory, registry, ..
-        } => vec![factory, registry],
+        } => [factory, registry]
+            .into_iter()
+            .chain(system_config)
+            .collect(),
         L1Anchor::NitroRollup { rollup } => vec![rollup],
     }
 }
@@ -89,10 +108,16 @@ pub const fn calldata_recipient(anchor: &L1Anchor) -> Option<Address> {
 }
 
 /// The anchor's observations in one L1 block of rollup `chain_id`, in log
-/// order. A game created through another contract has no readable creation
-/// call and is skipped: a later game moves finality on.
+/// order, with the signer updates of the rollup's `system_config`. A game
+/// created through another contract has no readable creation call and is
+/// skipped: a later game moves finality on.
 #[must_use]
-pub fn observe(anchor: &L1Anchor, chain_id: u64, frame: &BlockFrame) -> Vec<Observation> {
+pub fn observe(
+    anchor: &L1Anchor,
+    chain_id: u64,
+    system_config: Option<Address>,
+    frame: &BlockFrame,
+) -> Vec<Observation> {
     let logs = match &frame.logs {
         Material::Complete(logs) | Material::Filtered { value: logs, .. } => logs.as_slice(),
         Material::Missing(_) => return Vec::new(),
@@ -143,6 +168,30 @@ pub fn observe(anchor: &L1Anchor, chain_id: u64, frame: &BlockFrame) -> Vec<Obse
                     let Some(game) = topic(1) else { continue };
                     Observation::AnchorUpdated {
                         game: Address::from_word(game),
+                    }
+                } else if address == registry && topic(0) == Some(RESPECTED_GAME_TYPE_SET) {
+                    let Some(game_type) = log
+                        .data
+                        .get(..32)
+                        .map(alloy_primitives::U256::from_be_slice)
+                        .and_then(|game_type| u32::try_from(game_type).ok())
+                    else {
+                        continue;
+                    };
+                    Observation::GameTypeChanged { game_type }
+                } else if Some(address) == system_config
+                    && topic(0) == Some(CONFIG_UPDATE)
+                    && topic(2)
+                        == Some(B256::from(alloy_primitives::U256::from(
+                            UNSAFE_BLOCK_SIGNER,
+                        )))
+                {
+                    // `abi.encode(bytes)` of one address: offset, length, word.
+                    let Some(signer) = log.data.get(64..96) else {
+                        continue;
+                    };
+                    Observation::SignerChanged {
+                        signer: Address::from_word(B256::from_slice(signer)),
                     }
                 } else {
                     continue;
@@ -319,7 +368,9 @@ impl GameLedger {
                 self.save()?;
                 Ok(Some(final_block))
             }
-            Observation::AssertionConfirmed { .. } => Ok(None),
+            Observation::AssertionConfirmed { .. }
+            | Observation::SignerChanged { .. }
+            | Observation::GameTypeChanged { .. } => Ok(None),
         }
     }
 
@@ -369,6 +420,29 @@ pub trait FinalizedBlocks: Send + Sync {
 struct Cursor {
     number: u64,
     hash: B256,
+    #[serde(default, flatten)]
+    learned: Learned,
+}
+
+/// What the lane learned from the rollup's contracts up to where it stopped.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct Learned {
+    /// The newest signer the `SystemConfig` named; `None` before any update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signer: Option<Address>,
+    /// The newest game type the registry respects; `None` before any change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_type: Option<u32>,
+}
+
+/// What the lane whose cursor is at `cursor_path` learned, read before it
+/// runs; nothing for a lane that never ran.
+///
+/// # Errors
+///
+/// Returns an error for a cursor that cannot be read.
+pub fn learned(cursor_path: &Path) -> Result<Learned, SourceError> {
+    Ok(read_cursor(cursor_path)?.map_or_else(Learned::default, |cursor| cursor.learned))
 }
 
 /// Follows verified L1 finality and reads each newly finalized range for
@@ -384,6 +458,11 @@ pub struct AnchorLane<B> {
     pub lookback: u64,
     /// The rollup's chain id, by which a super root names its output root.
     pub chain_id: u64,
+    /// The rollup's `SystemConfig`, whose signer updates the lane reports.
+    pub system_config: Option<Address>,
+    /// Whether a game type the registry comes to respect replaces the
+    /// anchor's; `false` keeps a configured one.
+    pub follow_game_type: bool,
 }
 
 impl<B: FinalizedBlocks> AnchorLane<B> {
@@ -394,11 +473,17 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
     /// Returns an error when L1 finality ends or fails, a range cannot be
     /// read, or finalized L1 blocks fail to link to the last range read.
     pub async fn run(
-        self,
+        mut self,
         observations: mpsc::Sender<Observation>,
         cancellation: CancellationToken,
     ) -> Result<(), SourceError> {
         let mut cursor = read_cursor(&self.cursor_path)?;
+        let mut learned = cursor
+            .as_ref()
+            .map_or_else(Learned::default, |cursor| cursor.learned);
+        if let Some(game_type) = learned.game_type {
+            self.respect(game_type);
+        }
         let mut events = self
             .finality
             .subscribe(self.checkpoint.clone(), cancellation.clone())
@@ -447,8 +532,16 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             }
             let mut found = 0_usize;
             for frame in &frames {
-                for observation in observe(&self.anchor, self.chain_id, frame) {
+                for observation in observe(&self.anchor, self.chain_id, self.system_config, frame) {
                     found += 1;
+                    match observation {
+                        Observation::SignerChanged { signer } => learned.signer = Some(signer),
+                        Observation::GameTypeChanged { game_type } => {
+                            learned.game_type = Some(game_type);
+                            self.respect(game_type);
+                        }
+                        _ => {}
+                    }
                     if observations.send(observation).await.is_err() {
                         return Ok(());
                     }
@@ -463,6 +556,7 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             let next = Cursor {
                 number: block_number.0,
                 hash: B256::from(block_hash.0),
+                learned,
             };
             write_atomically(
                 &self.cursor_path,
@@ -471,6 +565,27 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             )
             .map_err(|error| SourceError::Unavailable(error.to_string()))?;
             cursor = Some(next);
+        }
+    }
+}
+
+impl<B> AnchorLane<B> {
+    /// Read games of `game_type` from here on, unless the anchor's is fixed.
+    fn respect(&mut self, game_type: u32) {
+        if let (
+            true,
+            L1Anchor::DisputeGames {
+                game_type: kept, ..
+            },
+        ) = (self.follow_game_type, &mut self.anchor)
+            && *kept != game_type
+        {
+            info!(
+                from = *kept,
+                to = game_type,
+                "the anchor state registry respects another game type"
+            );
+            *kept = game_type;
         }
     }
 }

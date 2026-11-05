@@ -29,6 +29,9 @@ pub struct OpStackNetwork {
     pub block_forks: Vec<(&'static str, u64)>,
     /// The key that signs unsafe-block gossip: the `attested` anchor.
     pub sequencer_signer: Address,
+    /// The rollup's `SystemConfig` on Ethereum, which names a new signer when
+    /// the key rotates.
+    pub system_config: Address,
     /// Discv5 records of consensus peers that carry block gossip.
     pub consensus_bootnodes: Vec<String>,
 }
@@ -48,6 +51,13 @@ struct RegistryChain {
     block_time: u64,
     hardforks: BTreeMap<String, toml::Value>,
     genesis: RegistryGenesis,
+    addresses: RegistryAddresses,
+}
+
+#[derive(Deserialize)]
+struct RegistryAddresses {
+    #[serde(rename = "SystemConfigProxy")]
+    system_config: Address,
 }
 
 #[derive(Deserialize)]
@@ -121,6 +131,7 @@ impl OpStackNetwork {
             forks,
             block_forks,
             sequencer_signer: entry.sequencer_signer,
+            system_config: registry.addresses.system_config,
             consensus_bootnodes: entry.consensus_bootnodes,
         })
     }

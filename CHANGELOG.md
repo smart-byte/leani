@@ -94,6 +94,14 @@ record, and documented RPC contracts.
   waiting minutes for a replacement. While signed blocks arrive, its Discv5
   lookups run once a minute instead of every 5 seconds: every lookup asks
   fresh peers over UDP, and a home router keeps state for each of them.
+- The L1 anchor follows an op-stack chain's own changes in finalized
+  Ethereum blocks: a new unsafe block signer its SystemConfig names checks
+  gossip blocks from then on, and a game type the anchor state registry comes
+  to respect replaces the chain entry's. Both survive restarts.
+  `finality.sequencer_signer` and `l1_anchor.factory`, `registry`,
+  `game_type`, and `claims` override the entry, and `factory`, `registry`,
+  and `game_type` together name the dispute games of a chain whose entry
+  names none.
 - `[l1_anchor]` finalizes a rollup's blocks from its Ethereum settlement
   contracts, read in finalized Ethereum blocks over verified Ethereum
   finality and execution P2P: a confirmed BoLD assertion on Arbitrum One,

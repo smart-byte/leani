@@ -66,6 +66,21 @@ pub struct L1AnchorConfig {
     /// start, so the newest confirmation in them counts at once.
     #[serde(default = "default_l1_anchor_lookback")]
     pub lookback_blocks: u64,
+    /// An op-stack chain's dispute game factory in place of the chain
+    /// entry's; with `registry` and `game_type`, the contracts of a chain
+    /// whose entry names none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub factory: Option<String>,
+    /// The anchor state registry in place of the chain entry's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    /// The game type the anchor reads, kept even when the registry comes to
+    /// respect another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_type: Option<u32>,
+    /// What the games claim, in place of the chain entry's format.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims: Option<leani_chain::GameClaims>,
 }
 
 const fn default_l1_anchor_lookback() -> u64 {
@@ -932,11 +947,29 @@ pub struct FinalityConfig {
     /// then only be dialed, never dial in.
     #[serde(default)]
     pub listen_port: u16,
+    /// For `op_gossip`: the key the sequencer signs blocks with, in place of
+    /// the chain entry's and any new one the L1 anchor reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sequencer_signer: Option<String>,
     /// For `op_gossip`, and `json_rpc` with the L1 anchor: how far below the
     /// tip recent frames are pruned while `finalized` waits for the anchor.
     /// Omitted, about one hour of op-stack blocks, or 3,600 Nitro blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_blocks: Option<u64>,
+}
+
+impl FinalityConfig {
+    /// The configured `sequencer_signer`; `None` when the chain's is used.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a value that is not an address.
+    pub(crate) fn sequencer_signer(&self) -> Result<Option<alloy_primitives::Address>, String> {
+        parsed_address(
+            "finality.sequencer_signer",
+            self.sequencer_signer.as_deref(),
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -1796,7 +1829,67 @@ impl Config {
             discv5_port: 0,
             nat: default_execution_nat(),
             lookback_blocks: default_l1_anchor_lookback(),
+            factory: None,
+            registry: None,
+            game_type: None,
+            claims: None,
         });
+    }
+
+    /// The settlement contracts the L1 anchor reads: the chain entry's, with
+    /// any configured dispute game settings in their place. `None` when
+    /// neither names any.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for dispute game settings on a chain that is not an
+    /// op-stack one, or for only some of them where the entry names none.
+    pub(crate) fn l1_anchor_contracts(&self) -> Result<Option<leani_chain::L1Anchor>, String> {
+        let chain = self.chain_entry().map_err(|error| error.to_string())?;
+        let Some(anchor) = self.l1_anchor.as_ref().filter(|anchor| {
+            anchor.factory.is_some()
+                || anchor.registry.is_some()
+                || anchor.game_type.is_some()
+                || anchor.claims.is_some()
+        }) else {
+            return Ok(chain.l1_anchor);
+        };
+        let configured_factory = parsed_address("l1_anchor.factory", anchor.factory.as_deref())?;
+        let configured_registry = parsed_address("l1_anchor.registry", anchor.registry.as_deref())?;
+        match (chain.l1_anchor, chain.op_stack.is_some()) {
+            (
+                Some(leani_chain::L1Anchor::DisputeGames {
+                    factory,
+                    registry,
+                    game_type,
+                    claims,
+                }),
+                _,
+            ) => Ok(Some(leani_chain::L1Anchor::DisputeGames {
+                factory: configured_factory.unwrap_or(factory),
+                registry: configured_registry.unwrap_or(registry),
+                game_type: anchor.game_type.unwrap_or(game_type),
+                claims: anchor.claims.unwrap_or(claims),
+            })),
+            (None, true) => match (configured_factory, configured_registry, anchor.game_type) {
+                (Some(factory), Some(registry), Some(game_type)) => {
+                    Ok(Some(leani_chain::L1Anchor::DisputeGames {
+                        factory,
+                        registry,
+                        game_type,
+                        claims: anchor.claims.unwrap_or_default(),
+                    }))
+                }
+                _ => Err(format!(
+                    "{}'s entry names no dispute games: set factory, registry, and game_type together",
+                    chain.name
+                )),
+            },
+            _ => Err(
+                "factory, registry, game_type, and claims name an op-stack chain's dispute games"
+                    .to_owned(),
+            ),
+        }
     }
 
     /// The built-in chain entry `[chain] name` names, checked against the
@@ -3099,6 +3192,7 @@ fn validate_artifact_storage(
 
 fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
     validate_settle_blocks(finality, errors);
+    validate_sequencer_signer(finality, errors);
     if matches!(finality.kind, FinalitySourceKind::OpGossip) {
         validate_enr_bootnodes(&finality.bootnodes, errors);
         return;
@@ -3216,14 +3310,13 @@ fn validate_settle_blocks(finality: &FinalityConfig, errors: &mut Vec<Validation
 }
 
 fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec<ValidationError>) {
-    if config
-        .chain_entry()
-        .is_ok_and(|chain| chain.l1_anchor.is_none())
-    {
-        errors.push(ValidationError::new(
+    match config.l1_anchor_contracts() {
+        Ok(Some(_)) => {}
+        Ok(None) => errors.push(ValidationError::new(
             "l1_anchor",
             "this chain's entry names no settlement contracts to anchor to",
-        ));
+        )),
+        Err(message) => errors.push(ValidationError::new("l1_anchor", message)),
     }
     if !matches!(
         config.finality.kind,
@@ -3258,6 +3351,32 @@ fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec
             format!("must be in 1..={MAX_L1_ANCHOR_LOOKBACK}"),
         ));
     }
+}
+
+fn validate_sequencer_signer(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
+    match finality.sequencer_signer() {
+        Ok(Some(_)) if !matches!(finality.kind, FinalitySourceKind::OpGossip) => {
+            errors.push(ValidationError::new(
+                "finality.sequencer_signer",
+                "names the key op_gossip checks blocks against",
+            ));
+        }
+        Ok(_) => {}
+        Err(message) => errors.push(ValidationError::new("finality.sequencer_signer", message)),
+    }
+}
+
+/// A configured `0x`-prefixed address, named `field` in the error.
+fn parsed_address(
+    field: &str,
+    value: Option<&str>,
+) -> Result<Option<alloy_primitives::Address>, String> {
+    value
+        .map(|text| {
+            text.parse()
+                .map_err(|_| format!("{field} must be a 0x-prefixed 20-byte address"))
+        })
+        .transpose()
 }
 
 fn validate_enr_bootnodes(bootnodes: &[String], errors: &mut Vec<ValidationError>) {
@@ -5019,6 +5138,10 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
             discv5_port: 0,
             nat: "any".to_owned(),
             lookback_blocks: 600,
+            factory: None,
+            registry: None,
+            game_type: None,
+            claims: None,
         });
         // Ethereum mainnet settles on nothing.
         assert!(
@@ -5045,6 +5168,118 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
             2,
             "{:?}",
             anchor_errors(&config)
+        );
+    }
+
+    #[test]
+    fn configured_dispute_games_replace_the_entrys_or_define_them() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        let anchor_errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field.starts_with("l1_anchor"))
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+        };
+        config.l1_anchor = Some(L1AnchorConfig {
+            finality: config.finality.clone(),
+            listener_port: 0,
+            discovery_port: 0,
+            discv5_port: 0,
+            nat: "any".to_owned(),
+            lookback_blocks: 600,
+            factory: None,
+            registry: None,
+            game_type: None,
+            claims: None,
+        });
+        config.chain.name = "base-sepolia".to_owned();
+        config.chain.chain_id = 84_532;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        let (factory, registry) = (
+            alloy_primitives::Address::repeat_byte(0x11),
+            alloy_primitives::Address::repeat_byte(0x22),
+        );
+        // Base Sepolia's entry names none; all three settings define them.
+        let anchor = config.l1_anchor.as_mut().expect("anchor");
+        anchor.factory = Some(factory.to_string());
+        anchor.registry = Some(registry.to_string());
+        assert!(
+            anchor_errors(&config)
+                .iter()
+                .any(|message| message.contains("game_type")),
+            "{:?}",
+            anchor_errors(&config)
+        );
+        config.l1_anchor.as_mut().expect("anchor").game_type = Some(0);
+        assert!(
+            anchor_errors(&config).is_empty(),
+            "{:?}",
+            anchor_errors(&config)
+        );
+        assert_eq!(
+            config.l1_anchor_contracts(),
+            Ok(Some(leani_chain::L1Anchor::DisputeGames {
+                factory,
+                registry,
+                game_type: 0,
+                claims: leani_chain::GameClaims::OutputRoots,
+            }))
+        );
+        // A configured type replaces OP Mainnet's, which keeps its contracts.
+        config.chain.name = "op-mainnet".to_owned();
+        config.chain.chain_id = 10;
+        let anchor = config.l1_anchor.as_mut().expect("anchor");
+        anchor.factory = None;
+        anchor.registry = None;
+        anchor.game_type = Some(10);
+        assert!(matches!(
+            config.l1_anchor_contracts(),
+            Ok(Some(leani_chain::L1Anchor::DisputeGames {
+                game_type: 10,
+                claims: leani_chain::GameClaims::SuperRoots,
+                ..
+            }))
+        ));
+        // A Nitro rollup's anchor reads assertions, not games.
+        config.chain.name = "robinhood".to_owned();
+        config.chain.chain_id = 4663;
+        config.finality.kind = FinalitySourceKind::SequencerFeed;
+        assert!(
+            anchor_errors(&config)
+                .iter()
+                .any(|message| message.contains("dispute games")),
+            "{:?}",
+            anchor_errors(&config)
+        );
+    }
+
+    #[test]
+    fn a_configured_sequencer_signer_checks_op_gossip() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.finality.sequencer_signer =
+            Some(alloy_primitives::Address::repeat_byte(5).to_string());
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "finality.sequencer_signer"),
+            "{:?}",
+            config.validation_errors()
+        );
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        assert!(
+            !config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "finality.sequencer_signer"),
+            "{:?}",
+            config.validation_errors()
         );
     }
 

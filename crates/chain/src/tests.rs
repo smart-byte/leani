@@ -255,6 +255,12 @@ fn op_stack_entries_carry_their_schedule() {
     let schedule = op.op_stack.as_ref().unwrap();
     assert_eq!(schedule.first_block, 105_235_063);
     assert_eq!(schedule.block_time, 2);
+    assert_eq!(
+        schedule.system_config,
+        "0x229047fed2591dbec1eF1118d64F7aF3dB9EB290"
+            .parse::<Address>()
+            .unwrap()
+    );
     assert_eq!(schedule.activation("isthmus"), Some(1_746_806_401));
     assert_eq!(
         schedule.activation("delta"),
