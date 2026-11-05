@@ -108,7 +108,10 @@ listener_port = 30303
 discovery_port = 30303
 discv5_port = 30304
 enable_discv5 = true
-nat = "any"
+# The address peers dial, such as "extip:203.0.113.7"; "none" advertises
+# none. "any", "upnp", and "publicip" ask ipinfo.io, icanhazip.com, or
+# ifconfig.me for it at start and every five minutes.
+nat = "none"
 # Optional stable enode seeds supplement discovery; they are not an allowlist.
 trusted_peers = []
 # An optional Leani/community EIP-1459 tree can advertise peers prepared for

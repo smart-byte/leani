@@ -257,6 +257,12 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Execution P2P asks no public IP service for the host's address unless
+  `nat` says so: generated configurations set `sources.live.nat = "none"`
+  instead of `"any"`. A node whose configuration names `any`, `upnp`, or
+  `publicip`, which ask ipinfo.io, icanhazip.com, or ifconfig.me at start and
+  every five minutes, warns at startup. A node that takes inbound peers sets
+  `nat = "extip:<public address>"`.
 - EraE backfills run about 1.5 to 2.5 times as fast:
   `budgets.history_material.maximum_buffered_frames_per_acquisition` defaults
   to 1,024 frames instead of 128, so chunks read ahead keep downloading while
@@ -285,6 +291,8 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
+  the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
   refusing every chain but Ethereum mainnet, and its consumer renews its
   lease while it waits, as the SDK does: a source slower than the lease to
