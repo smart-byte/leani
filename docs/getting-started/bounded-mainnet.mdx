@@ -73,10 +73,10 @@ leani backfill --processor weth-transfers --from-block 17000000 --to-block 17000
 leani serve
 ```
 
-This example uses API port 8081 so it can run beside the Uniswap node. Query:
+This example uses API port 18081 so it can run beside the Uniswap node. Query:
 
 ```bash
-curl -s 'http://127.0.0.1:8081/v1/processors/weth-transfers/collections/weth.transfers/entities?limit=100'
+curl -s 'http://127.0.0.1:18081/v1/processors/weth-transfers/collections/weth.transfers/entities?limit=100'
 ```
 
 Expect 205 transfers across three pages. Each entity's `values` contains `from`,

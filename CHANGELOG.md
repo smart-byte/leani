@@ -372,6 +372,11 @@ record, and documented RPC contracts.
   refusing every chain but Ethereum mainnet, and its consumer renews its
   lease while it waits, as the SDK does: a source slower than the lease to
   deliver its first batch no longer ends the run.
+- `leani serve` refuses an API or JSON-RPC port another process already
+  listens on. macOS let the node bind `127.0.0.1` beside a server listening
+  on every address, such as a Node.js dev server, and clients of `localhost`
+  then reached that server. The `weth-transfers` example's API moves from
+  port 8081, a common dev port, to 18081.
 
 ## [0.1.1] - 2026-10-29
 
