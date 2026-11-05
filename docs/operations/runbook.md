@@ -101,6 +101,116 @@ Keep bearer tokens in `/etc/leani/environment`, not in TOML. Public
 exposure should go through a TLS reverse proxy with request and connection
 limits.
 
+### Inbound P2P on a public host
+
+A node that accepts inbound peers takes untrusted input from the open
+internet, and on a datacenter address its provider watches what it dials.
+These rules hold for any public host. The Docker ones apply when nodes run
+in containers, and the port numbers are examples, not requirements.
+
+- **Fix the peer ports the node needs.** Execution P2P listens on ephemeral
+  ports unless `sources.live.listener_port`, `discovery_port`, and
+  `discv5_port` are set, so set them for peers to dial in. An op-stack node
+  needs them: a fresh one that cannot be dialed often finds no execution
+  peer. It also takes gossip peers on `finality.listen_port` and
+  `finality.discovery_port`, 9222 in compact configurations. An Ethereum
+  node finds peers dialing out only, as does a rollup's L1 anchor on its own
+  execution P2P ports, and a Nitro chain's node only dials out, to its
+  sequencer feed and endpoints.
+- **Give each node on a host its own ports.** A single node can use 30303
+  for the execution listener and Discv4 (TCP and UDP), a UDP port such as
+  30304 for Discv5, and 9222 for gossip (TCP and UDP). Another node on the
+  same address takes another set, such as 30400, 30401, and 9230.
+- **Advertise the public address.** Behind NAT, Docker's bridge included,
+  the node sees only its private address, and advertising that sends peers
+  to an address that never answers. Set `sources.live.nat = "extip:<public
+  IPv4>"`; gossip learns its public address from its peers.
+- **Keep each port the same inside and outside.** The node announces its own
+  port numbers, so a NAT or container mapping must not renumber them:
+  `-p 30400:30400` works and `-p 30500:30400` does not.
+- **Refuse private destinations on the way out.** Discovery hands out peers'
+  LAN addresses (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, ...).
+  Dialing them from a datacenter address looks like a network scan, and
+  providers such as Hetzner send abuse reports for it and may lock the
+  server. Reject rather than drop, so that a dial fails at once instead of
+  holding a peer slot until its timeout, and filter only what leaves through
+  the public interface, so the host still reaches its own private networks.
+  For a node running on the host, with ufw:
+
+  ```sh
+  WAN=$(ip -4 route show default | awk 'NR == 1 {print $5}')
+  for range in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+               172.16.0.0/12 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do
+    ufw reject out on "$WAN" to "$range"
+  done
+  ```
+
+  Containers bypass the host's own rules, so filter their traffic in
+  `DOCKER-USER`. These rules are lost on reboot, and the script can run
+  again at any time, so run it from a systemd unit ordered after
+  `docker.service`:
+
+  ```sh
+  WAN=$(ip -4 route show default | awk 'NR == 1 {print $5}')
+  iptables -N CONTAINER-EGRESS 2>/dev/null || iptables -F CONTAINER-EGRESS
+  for range in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 \
+               172.16.0.0/12 192.168.0.0/16 198.18.0.0/15 224.0.0.0/4 240.0.0.0/4; do
+    iptables -A CONTAINER-EGRESS -d "$range" -j REJECT --reject-with icmp-net-unreachable
+  done
+  iptables -C DOCKER-USER -o "$WAN" -j CONTAINER-EGRESS 2>/dev/null ||
+    iptables -I DOCKER-USER 1 -o "$WAN" -j CONTAINER-EGRESS
+  ```
+
+  No real peer loses anything: a private address is unreachable from the
+  internet anyway.
+- **Docker: publish peer ports with an explicit host address.** Published
+  ports bypass host firewalls such as ufw, so `-p 30400:30400` is public even
+  when ufw denies it. Write `0.0.0.0:30400:30400` and `[::]:30400:30400` for
+  the peer ports, and bind the API and RPC to `127.0.0.1` behind a reverse
+  proxy, or publish them not at all. Setting the daemon's `ip` and the
+  `com.docker.network.bridge.host_binding_ipv4` option in
+  `default-network-opts` to `127.0.0.1` then turns a forgotten address into a
+  local port. First give every port that must stay public, such as a proxy's
+  80 and 443, an explicit address: one published without an address turns
+  local the next time its container is created. With `live-restore`, the
+  daemon restart that applies the setting keeps containers running.
+- **Docker: harden the container the way `compose.yaml` does.** That means
+  `read_only` with a tmpfs at `/tmp/leani`, `cap_drop: [ALL]`,
+  `no-new-privileges`, a memory limit, `restart: unless-stopped`, and the
+  image's unprivileged user (uid 10001). Give each node its own network:
+  never a database's, and not Docker's default bridge, where every container
+  can reach every other.
+- **Docker: run released images, or images you built.** Bind-mounting a
+  locally built binary over the image's entrypoint runs code that no image
+  digest or release signature describes. For an unreleased commit, build and
+  tag an image (`docker build -t leani:<commit> .`).
+- **Watch connection tracking.** On a NAT host, each peer session and
+  discovery exchange holds a conntrack entry. Compare
+  `/proc/sys/net/netfilter/nf_conntrack_count` with `nf_conntrack_max` after
+  adding nodes: a full table drops new connections for every service on the
+  host.
+
+A rollup node in Docker, on the second set of ports above:
+
+```sh
+docker run -d --name leani-op --restart unless-stopped \
+  --read-only --tmpfs /tmp/leani:size=1g,mode=1777 \
+  --cap-drop ALL --security-opt no-new-privileges --memory 3g --cpus 1.5 \
+  --network leani-op \
+  -p 0.0.0.0:30400:30400/tcp -p 0.0.0.0:30400:30400/udp -p 0.0.0.0:30401:30401/udp \
+  -p 0.0.0.0:9230:9230/tcp -p 0.0.0.0:9230:9230/udp \
+  -p [::]:30400:30400/tcp -p [::]:30400:30400/udp -p [::]:30401:30401/udp \
+  -p [::]:9230:9230/tcp -p [::]:9230:9230/udp \
+  -v leani-op-data:/var/lib/leani -v /srv/leani-op/leani.toml:/etc/leani/node.toml:ro \
+  ghcr.io/smart-byte/leani:<version> serve --config /etc/leani/node.toml --log-format json
+```
+
+Here `leani.toml` sets `sources.live.listener_port = 30400`,
+`discovery_port = 30400`, `discv5_port = 30401` and `nat =
+"extip:<public IPv4>"`, and `finality.listen_port = 9230` and
+`finality.discovery_port = 9230`. Create the network once with
+`docker network create leani-op`.
+
 ## Health and metrics
 
 - `GET /health/live` checks that the process serves requests and SQLite
