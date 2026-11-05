@@ -235,6 +235,10 @@ record, and documented RPC contracts.
   ones. A running run takes another module or other parameters
   (`PUT /admin/v1/wasm/runs/{run}/processor`), reruns the blocks it holds
   with them, and follows on with them.
+- Xatu serves withdrawals with its header, transaction, and log projections,
+  from `canonical_beacon_block_withdrawal`, whose consecutive indices prove a
+  chunk's rows complete. A processor that requires `withdrawals`, such as a
+  Wasm processor, no longer needs eraE or P2P history for them.
 - `leani doctor` warns when a block-local processor has `output = "latest"`:
   such a processor usually writes new keys every block, so `latest` keeps all
   of them, as `full` does.

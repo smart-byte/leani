@@ -17,7 +17,7 @@ use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
     ChainId, Completeness, FilterScope, Finality, HeaderEnvelope, Log, LogField, LogFieldSet,
     Material, MissingReason, ObjectIdentity, Provenance, Quantity, ReceiptEnvelope, SourceId,
-    SourceKind, TransactionEnvelope, TransactionHash, TrustModel, VerificationReport,
+    SourceKind, TransactionEnvelope, TransactionHash, TrustModel, VerificationReport, Withdrawal,
 };
 use leani_source_api::{FilterSet, SourceBudget};
 use object_store::{ObjectStore, ObjectStoreExt, path::Path as ObjectPath};
@@ -84,7 +84,7 @@ const BEACON_TRANSACTION_COLUMNS: &[&str] = &[
     "blob_gas_fee_cap",
     "blob_hashes",
 ];
-const WITHDRAWAL_COLUMNS: &[&str] = &[
+pub(crate) const WITHDRAWAL_COLUMNS: &[&str] = &[
     "slot",
     "withdrawal_index",
     "withdrawal_validator_index",
@@ -349,6 +349,16 @@ fn validate_column_types(
         }
     }
     Ok(())
+}
+
+/// The beacon block columns a generic projection reads for `groups`.
+pub(crate) fn generic_beacon_block_columns(groups: CapabilitySet) -> Vec<&'static str> {
+    let mut columns = GENERIC_BEACON_BLOCK_COLUMNS.to_vec();
+    // Withdrawals name their block by slot.
+    if groups.contains(Capability::Withdrawals) {
+        columns.push("slot");
+    }
+    columns
 }
 
 pub(crate) fn generic_log_columns(
@@ -789,6 +799,7 @@ impl XatuBlobsProjector {
             let start_date = XatuDate::from_unix_seconds(first.timestamp)?;
             let end_date = XatuDate::from_unix_seconds(last.timestamp)?;
 
+            let beacon_columns = generic_beacon_block_columns(groups);
             let mut beacon_blocks = BTreeMap::new();
             for object in
                 self.catalog
@@ -798,7 +809,7 @@ impl XatuBlobsProjector {
                     read_projected(
                         Arc::clone(&store),
                         &object,
-                        GENERIC_BEACON_BLOCK_COLUMNS,
+                        &beacon_columns,
                         &open,
                         batch_rows,
                         &cancellation,
@@ -807,7 +818,35 @@ impl XatuBlobsProjector {
                     .await?,
                 );
             }
-            Ok::<_, XatuError>((metrics, execution_blocks, beacon_blocks))
+            let withdrawals = if groups.contains(Capability::Withdrawals) {
+                let slots = beacon_blocks
+                    .values()
+                    .filter_map(|block| block.slot)
+                    .collect::<BTreeSet<_>>();
+                let mut withdrawals = BTreeMap::new();
+                for object in self.catalog.daily_objects(
+                    XatuTable::CanonicalBeaconBlockWithdrawal,
+                    start_date,
+                    end_date,
+                )? {
+                    metrics.push(
+                        read_projected(
+                            Arc::clone(&store),
+                            &object,
+                            WITHDRAWAL_COLUMNS,
+                            &open,
+                            batch_rows,
+                            &cancellation,
+                            |batch| parse_withdrawals(batch, &slots, &mut withdrawals),
+                        )
+                        .await?,
+                    );
+                }
+                Some(withdrawals)
+            } else {
+                None
+            };
+            Ok::<_, XatuError>((metrics, execution_blocks, beacon_blocks, withdrawals))
         };
 
         let columns = TransactionColumns::for_groups(groups, filters);
@@ -884,7 +923,7 @@ impl XatuBlobsProjector {
         // The execution blocks name the days of the beacon blocks; the
         // transaction or log table needs neither.
         let (
-            (mut metrics, execution_blocks, beacon_blocks),
+            (mut metrics, execution_blocks, beacon_blocks, withdrawals),
             (body_metrics, row_indices, transactions, receipts, logs),
         ) = futures::try_join!(headers, body)?;
         metrics.extend(body_metrics);
@@ -904,6 +943,7 @@ impl XatuBlobsProjector {
             receipts: (kind == GenericProjectionKind::Transactions && columns.outcome)
                 .then_some(receipts),
             logs,
+            withdrawals,
             provenance: &provenance,
         })?;
         validate_frame_budget(&frames, budget)?;
@@ -1231,14 +1271,6 @@ struct TransactionSizeRow {
     size_bytes: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct WithdrawalRow {
-    index: u64,
-    validator_index: u64,
-    address: Address,
-    amount_gwei: u64,
-}
-
 #[derive(Clone, Debug)]
 struct GenericExecutionBlockRow {
     hash: BlockHash,
@@ -1247,6 +1279,8 @@ struct GenericExecutionBlockRow {
 
 #[derive(Clone, Debug)]
 struct GenericBeaconBlockRow {
+    /// Read only for withdrawals, which name their block by slot.
+    slot: Option<u64>,
     hash: BlockHash,
     parent_hash: BlockHash,
     timestamp: u64,
@@ -1305,6 +1339,10 @@ fn parse_generic_beacon_blocks(
             output,
             number,
             GenericBeaconBlockRow {
+                slot: batch
+                    .column_by_name("slot")
+                    .map(|_| required_u64(batch, "slot", row))
+                    .transpose()?,
                 hash: required_hash(batch, "execution_payload_block_hash", row)?,
                 parent_hash: required_hash(batch, "execution_payload_parent_hash", row)?,
                 timestamp: required_u64(batch, "slot_start_date_time", row)?,
@@ -1503,6 +1541,9 @@ struct GenericNormalizationInputs<'a> {
     /// Receipt outcomes of the projected transactions, when requested.
     receipts: Option<BTreeMap<u64, Vec<ReceiptEnvelope>>>,
     logs: BTreeMap<u64, Vec<Log>>,
+    /// The withdrawal rows of the chunk's slots and of the nearest slots
+    /// around it, when requested.
+    withdrawals: Option<BTreeMap<u64, Vec<Withdrawal>>>,
     provenance: &'a [Provenance],
 }
 
@@ -1527,6 +1568,17 @@ fn normalize_generic_frames(
             expected,
             actual: inputs.beacon_blocks.len(),
         });
+    }
+    if let Some(withdrawals) = &inputs.withdrawals {
+        let slots = inputs
+            .beacon_blocks
+            .values()
+            .map(|block| block.slot)
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| {
+                XatuError::Data("beacon blocks lack the slots their withdrawals need".to_owned())
+            })?;
+        validate_withdrawal_coverage(inputs.range, &slots, withdrawals)?;
     }
     let effective = inputs.filters.effective_scope();
     let mut frames = Vec::with_capacity(expected);
@@ -1672,7 +1724,24 @@ fn normalize_generic_frames(
             transactions,
             receipts,
             logs,
-            withdrawals: Material::Missing(MissingReason::NotRequested),
+            withdrawals: match inputs.withdrawals.as_mut() {
+                Some(withdrawals) => {
+                    let mut values = beacon
+                        .slot
+                        .and_then(|slot| withdrawals.remove(&slot))
+                        .unwrap_or_default();
+                    values.sort_by_key(|withdrawal| withdrawal.index);
+                    Material::Filtered {
+                        value: values,
+                        scope: FilterScope {
+                            block_range: Some(BlockRange::single(number)),
+                            ..FilterScope::default()
+                        },
+                        completeness: Completeness::DatasetDeclared,
+                    }
+                }
+                None => Material::Missing(MissingReason::NotRequested),
+            },
             blob_sidecars: Material::Missing(MissingReason::NotRequested),
             traces: Material::Missing(MissingReason::Unsupported),
             state_diffs: Material::Missing(MissingReason::Unsupported),
@@ -1778,52 +1847,47 @@ fn validate_row_indices(
 /// exported yet.
 fn validate_withdrawal_coverage(
     range: BlockRange,
-    beacon_blocks: &BTreeMap<u64, BeaconBlockRow>,
-    withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+    slots: &[u64],
+    withdrawals: &BTreeMap<u64, Vec<Withdrawal>>,
 ) -> Result<(), XatuError> {
-    fn indices_of(rows: &[WithdrawalRow]) -> impl Iterator<Item = u64> + '_ {
+    fn indices_of(rows: &[Withdrawal]) -> impl Iterator<Item = u64> + '_ {
         rows.iter().map(|row| row.index)
     }
     let unproven = |detail: String| XatuError::IncompleteWithdrawals { range, detail };
-    let (Some(first), Some(last)) = (
-        beacon_blocks.values().next(),
-        beacon_blocks.values().next_back(),
-    ) else {
+    let (Some(&first), Some(&last)) = (slots.first(), slots.last()) else {
         return Ok(());
     };
     // The last index before the chunk, and the first after it.
     let mut previous = withdrawals
-        .range(..first.slot)
+        .range(..first)
         .next_back()
         .and_then(|(_, rows)| indices_of(rows).max());
     let next = withdrawals
-        .range(last.slot.saturating_add(1)..)
+        .range(last.saturating_add(1)..)
         .next()
         .and_then(|(_, rows)| indices_of(rows).min());
     let mut unproven_empty = None;
     let mut last_full = false;
-    for (position, block) in beacon_blocks.values().enumerate() {
+    for (position, &slot) in slots.iter().enumerate() {
         let mut indices = withdrawals
-            .get(&block.slot)
+            .get(&slot)
             .map_or_else(Vec::new, |rows| indices_of(rows).collect::<Vec<_>>());
         if indices.len() > MAX_WITHDRAWALS_PER_PAYLOAD {
             return Err(XatuError::Data(format!(
-                "slot {} has {} withdrawal rows; a payload holds at most {MAX_WITHDRAWALS_PER_PAYLOAD}",
-                block.slot,
+                "slot {slot} has {} withdrawal rows; a payload holds at most {MAX_WITHDRAWALS_PER_PAYLOAD}",
                 indices.len()
             )));
         }
         last_full = indices.len() == MAX_WITHDRAWALS_PER_PAYLOAD;
         indices.sort_unstable();
         let Some(&lowest) = indices.first() else {
-            unproven_empty.get_or_insert(block.slot);
+            unproven_empty.get_or_insert(slot);
             continue;
         };
         match previous {
             Some(before) if lowest <= before => {
                 return Err(XatuError::Data(format!(
-                    "slot {} repeats or reorders withdrawal index {lowest}",
-                    block.slot
+                    "slot {slot} repeats or reorders withdrawal index {lowest}"
                 )));
             }
             Some(before) if lowest == before.saturating_add(1) => {}
@@ -1831,18 +1895,16 @@ fn validate_withdrawal_coverage(
             _ if position == 0 && last_full => {}
             Some(before) => {
                 return Err(unproven(format!(
-                    "withdrawal indices jump from {before} to {lowest} at slot {}",
-                    block.slot
+                    "withdrawal indices jump from {before} to {lowest} at slot {slot}"
                 )));
             }
             None => {
                 return Err(unproven(match unproven_empty {
-                    Some(slot) => format!(
-                        "slot {slot} has no withdrawal rows, and no earlier slot shows it had none"
+                    Some(empty) => format!(
+                        "slot {empty} has no withdrawal rows, and no earlier slot shows it had none"
                     ),
                     None => format!(
-                        "no earlier slot shows that slot {} lacks no withdrawal index below {lowest}",
-                        block.slot
+                        "no earlier slot shows that slot {slot} lacks no withdrawal index below {lowest}"
                     ),
                 }));
             }
@@ -1850,14 +1912,14 @@ fn validate_withdrawal_coverage(
         for pair in indices.windows(2) {
             if pair[1] == pair[0] {
                 return Err(XatuError::Data(format!(
-                    "slot {} repeats withdrawal index {}",
-                    block.slot, pair[1]
+                    "slot {slot} repeats withdrawal index {}",
+                    pair[1]
                 )));
             }
             if pair[1] != pair[0].saturating_add(1) {
                 return Err(unproven(format!(
-                    "withdrawal indices jump from {} to {} at slot {}",
-                    pair[0], pair[1], block.slot
+                    "withdrawal indices jump from {} to {} at slot {slot}",
+                    pair[0], pair[1]
                 )));
             }
         }
@@ -1876,8 +1938,7 @@ fn validate_withdrawal_coverage(
                 format!("slot {slot} has no withdrawal rows, and no later slot shows it had none")
             }
             None => format!(
-                "no later slot shows that slot {} lacks no withdrawal index above {}",
-                last.slot,
+                "no later slot shows that slot {last} lacks no withdrawal index above {}",
                 previous.unwrap_or_default()
             ),
         })),
@@ -2031,7 +2092,7 @@ fn parse_beacon_transactions(
 fn parse_withdrawals(
     batch: &RecordBatch,
     slots: &BTreeSet<u64>,
-    output: &mut BTreeMap<u64, Vec<WithdrawalRow>>,
+    output: &mut BTreeMap<u64, Vec<Withdrawal>>,
 ) -> Result<u64, XatuError> {
     let (Some(&first), Some(&last)) = (slots.first(), slots.last()) else {
         return Ok(0);
@@ -2064,7 +2125,7 @@ fn parse_withdrawals(
         } else {
             continue;
         }
-        output.entry(slot).or_default().push(WithdrawalRow {
+        output.entry(slot).or_default().push(Withdrawal {
             index: required_u64(batch, "withdrawal_index", row)?,
             validator_index: required_u64(batch, "withdrawal_validator_index", row)?,
             address: required_address(batch, "withdrawal_address", row)?,
@@ -2110,7 +2171,7 @@ struct NormalizationInputs<'a> {
     beacon_blocks: &'a BTreeMap<u64, BeaconBlockRow>,
     beacon_transactions: Vec<BeaconTransactionRow>,
     transaction_sizes: &'a BTreeMap<u64, Vec<TransactionSizeRow>>,
-    withdrawals: &'a BTreeMap<u64, Vec<WithdrawalRow>>,
+    withdrawals: &'a BTreeMap<u64, Vec<Withdrawal>>,
     execution_transactions: &'a BTreeMap<TransactionHash, ExecutionTransactionRow>,
     provenance: &'a [Provenance],
 }
@@ -2146,7 +2207,11 @@ fn normalize_frames(inputs: NormalizationInputs<'_>) -> Result<Vec<BlockFrame>, 
         });
     }
     // Each block's execution size depends on its withdrawals.
-    validate_withdrawal_coverage(range, beacon_blocks, withdrawals)?;
+    let slots = beacon_blocks
+        .values()
+        .map(|block| block.slot)
+        .collect::<Vec<_>>();
+    validate_withdrawal_coverage(range, &slots, withdrawals)?;
     beacon_transactions.sort_by_key(|transaction| (transaction.slot, transaction.index));
     let mut transactions_by_slot = BTreeMap::<u64, Vec<BeaconTransactionRow>>::new();
     for transaction in beacon_transactions {
@@ -2380,7 +2445,7 @@ fn execution_block_rlp_len(
     execution: &ExecutionBlockRow,
     beacon: &BeaconBlockRow,
     transactions: &[TransactionSizeRow],
-    withdrawals: &[WithdrawalRow],
+    withdrawals: &[Withdrawal],
 ) -> Result<u64, XatuError> {
     if transactions.len() != usize::try_from(beacon.transaction_count).unwrap_or(usize::MAX) {
         return Err(XatuError::Data(format!(
@@ -3444,6 +3509,7 @@ mod tests {
             beacon_blocks: &BTreeMap::from([(
                 number,
                 GenericBeaconBlockRow {
+                    slot: None,
                     hash,
                     parent_hash: BlockHash::ZERO,
                     timestamp: 1_700_000_000,
@@ -3462,6 +3528,7 @@ mod tests {
             )]),
             receipts: None,
             logs: BTreeMap::new(),
+            withdrawals: None,
             provenance: &[],
         })
     }
@@ -3533,6 +3600,7 @@ mod tests {
                 .clone()
                 .map(|(number, (transaction_count, _))| {
                     let row = GenericBeaconBlockRow {
+                        slot: None,
                         hash: hash(number),
                         parent_hash: BlockHash::ZERO,
                         timestamp: 1_700_000_000,
@@ -3552,6 +3620,7 @@ mod tests {
             transactions: BTreeMap::new(),
             receipts: None,
             logs: BTreeMap::new(),
+            withdrawals: None,
             provenance: &[],
         })
     }
@@ -3633,6 +3702,7 @@ mod tests {
             beacon_blocks: &BTreeMap::from([(
                 42,
                 GenericBeaconBlockRow {
+                    slot: None,
                     hash,
                     parent_hash: BlockHash::ZERO,
                     timestamp: 1_700_000_000,
@@ -3648,6 +3718,7 @@ mod tests {
             transactions,
             receipts: None,
             logs: BTreeMap::new(),
+            withdrawals: None,
             provenance: &[],
         })
     }
@@ -4152,6 +4223,7 @@ mod tests {
             beacon_blocks: &BTreeMap::from([(
                 42,
                 GenericBeaconBlockRow {
+                    slot: None,
                     hash,
                     parent_hash: BlockHash::ZERO,
                     timestamp: 1_700_000_000,
@@ -4167,6 +4239,7 @@ mod tests {
             transactions,
             receipts: Some(receipts),
             logs: BTreeMap::new(),
+            withdrawals: None,
             provenance: &[],
         })
         .expect("frames");
@@ -4366,6 +4439,7 @@ mod tests {
             beacon_blocks: &BTreeMap::from([(
                 42,
                 GenericBeaconBlockRow {
+                    slot: None,
                     hash,
                     parent_hash: BlockHash::ZERO,
                     timestamp: 1_700_000_000,
@@ -4381,6 +4455,7 @@ mod tests {
             transactions: BTreeMap::new(),
             receipts: None,
             logs,
+            withdrawals: None,
             provenance: &[],
         })
     }
@@ -4589,9 +4664,9 @@ mod tests {
 
     /// The withdrawal rows of Dencun block 19,426,589, truncated or extended
     /// to `count`.
-    fn dencun_withdrawals(count: u64) -> Vec<WithdrawalRow> {
+    fn dencun_withdrawals(count: u64) -> Vec<Withdrawal> {
         (0..count)
-            .map(|offset| WithdrawalRow {
+            .map(|offset| Withdrawal {
                 index: 38_266_054 + offset,
                 validator_index: 1_268_201 + offset,
                 address: Address::new([0; 20]),
@@ -4631,7 +4706,7 @@ mod tests {
     /// Normalize Dencun block 19,426,589 with one blob transaction and the
     /// given withdrawal rows.
     fn dencun_blob_frames(
-        withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+        withdrawals: &BTreeMap<u64, Vec<Withdrawal>>,
     ) -> Result<Vec<BlockFrame>, XatuError> {
         dencun_blob_frames_with(withdrawals, true)
     }
@@ -4639,7 +4714,7 @@ mod tests {
     /// [`dencun_blob_frames`], with or without the blob transaction's
     /// execution row.
     fn dencun_blob_frames_with(
-        withdrawals: &BTreeMap<u64, Vec<WithdrawalRow>>,
+        withdrawals: &BTreeMap<u64, Vec<Withdrawal>>,
         execution_row: bool,
     ) -> Result<Vec<BlockFrame>, XatuError> {
         let transaction_hash = TransactionHash::new([0x33; 32]);
@@ -4723,7 +4798,7 @@ mod tests {
             );
             let payload = dencun_withdrawals(16)
                 .into_iter()
-                .map(|row| WithdrawalRow {
+                .map(|row| Withdrawal {
                     index: row.index + 16 * offset,
                     ..row
                 })
@@ -4833,7 +4908,138 @@ mod tests {
         ));
     }
 
-    fn dencun_slot_withdrawals(rows: Vec<WithdrawalRow>) -> BTreeMap<u64, Vec<WithdrawalRow>> {
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn generic_projections_read_beacon_slots_only_for_withdrawals() {
+        let numbers = |values: Vec<u64>| Arc::new(UInt64Array::from(values)) as ArrayRef;
+        let texts =
+            |value: String, rows: usize| Arc::new(StringArray::from(vec![value; rows])) as ArrayRef;
+        let little_endian = |values: Vec<u8>| {
+            Arc::new(
+                FixedSizeBinaryArray::try_from_iter(values.into_iter().map(|value| {
+                    let mut bytes = vec![0_u8; 32];
+                    bytes[0] = value;
+                    bytes
+                }))
+                .expect("little-endian values"),
+            ) as ArrayRef
+        };
+        let hash = format!("0x{}", "11".repeat(32));
+        // Block 0 is slot 9,000,000 on 2024-07-03; slots 8,999,999 and
+        // 9,000,001 prove its withdrawals complete.
+        let objects = [
+            (
+                EXECUTION_BLOCK_OBJECT,
+                parquet_object(vec![
+                    (
+                        "block_date_time",
+                        Arc::new(TimestampMillisecondArray::from(vec![1_720_000_000_000_i64]))
+                            as ArrayRef,
+                    ),
+                    ("block_number", numbers(vec![0])),
+                    ("block_hash", texts(hash.clone(), 1)),
+                ]),
+            ),
+            (
+                "canonical_beacon_block/2024/7/3.parquet",
+                parquet_object(vec![
+                    (
+                        "block_version",
+                        Arc::new(BinaryArray::from_vec(vec![b"deneb".as_slice()])) as ArrayRef,
+                    ),
+                    ("slot", numbers(vec![9_000_000])),
+                    ("slot_start_date_time", numbers(vec![1_720_000_000])),
+                    ("execution_payload_block_hash", texts(hash, 1)),
+                    ("execution_payload_block_number", numbers(vec![0])),
+                    (
+                        "execution_payload_parent_hash",
+                        texts(format!("0x{}", "22".repeat(32)), 1),
+                    ),
+                    ("execution_payload_transactions_count", numbers(vec![0])),
+                    ("execution_payload_gas_limit", numbers(vec![30_000_000])),
+                    ("execution_payload_gas_used", numbers(vec![0])),
+                    ("execution_payload_base_fee_per_gas", little_endian(vec![7])),
+                    ("execution_payload_blob_gas_used", numbers(vec![0])),
+                    ("execution_payload_excess_blob_gas", numbers(vec![0])),
+                ]),
+            ),
+            (
+                "canonical_beacon_block_withdrawal/2024/7/3.parquet",
+                parquet_object(vec![
+                    ("slot", numbers(vec![8_999_999, 9_000_000, 9_000_001])),
+                    ("withdrawal_index", numbers(vec![6, 7, 8])),
+                    (
+                        "withdrawal_validator_index",
+                        numbers(vec![1_006, 1_007, 1_008]),
+                    ),
+                    (
+                        "withdrawal_address",
+                        texts(format!("0x{}", "77".repeat(20)), 3),
+                    ),
+                    ("withdrawal_amount", little_endian(vec![30, 35, 40])),
+                ]),
+            ),
+        ];
+        let store = Arc::new(RecordingStore::default());
+        for (location, object) in objects {
+            store
+                .put(&ObjectPath::from(location), object.into())
+                .await
+                .expect("put");
+        }
+        let projector = XatuBlobsProjector::new(XatuCatalog::with_store(
+            crate::XatuCatalogConfig::default(),
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+        ));
+        let header = CapabilitySet::of(Capability::Header);
+        for groups in [header, header.with(Capability::Withdrawals)] {
+            let projection = projector
+                .project_generic(
+                    BlockRange::single(BlockNumber(0)),
+                    GenericProjectionKind::Headers,
+                    &FilterSet::default(),
+                    LogFieldSet::NONE,
+                    groups,
+                    test_budget(4),
+                    8_192,
+                    CancellationToken::new(),
+                )
+                .await
+                .expect("projection");
+            let withdrawals = groups.contains(Capability::Withdrawals);
+            let beacon = projection
+                .metrics
+                .objects
+                .iter()
+                .find(|object| object.table == XatuTable::CanonicalBeaconBlock)
+                .expect("beacon object");
+            assert_eq!(
+                beacon
+                    .selected_columns
+                    .iter()
+                    .any(|column| column == "slot"),
+                withdrawals,
+                "{groups:?}"
+            );
+            let expected = withdrawals.then(|| {
+                vec![Withdrawal {
+                    index: 7,
+                    validator_index: 1_007,
+                    address: Address::new([0x77; 20]),
+                    amount_gwei: 35,
+                }]
+            });
+            assert_eq!(
+                projection.frames[0].withdrawals.as_present(),
+                expected.as_ref(),
+                "{groups:?}"
+            );
+            let header = projection.frames[0].header.as_present().expect("header");
+            assert_eq!(header.base_fee_per_gas, Some(quantity_from_u64(7)));
+        }
+    }
+
+    fn dencun_slot_withdrawals(rows: Vec<Withdrawal>) -> BTreeMap<u64, Vec<Withdrawal>> {
         BTreeMap::from([(DENCUN_SLOT, rows)])
     }
 
@@ -5063,8 +5269,8 @@ mod tests {
         withdrawal_frames_between(None, slots, None)
     }
 
-    fn withdrawal_row(index: u64) -> WithdrawalRow {
-        WithdrawalRow {
+    fn withdrawal_row(index: u64) -> Withdrawal {
+        Withdrawal {
             index,
             validator_index: index,
             address: Address::new([0; 20]),
@@ -5337,6 +5543,91 @@ mod tests {
                 "{name}: {error}"
             );
         }
+    }
+
+    /// Normalize headerless blocks 40 and 41, at slots 100 and 101, with
+    /// `withdrawals`.
+    fn generic_withdrawal_frames(
+        withdrawals: &BTreeMap<u64, Vec<Withdrawal>>,
+    ) -> Result<Vec<BlockFrame>, XatuError> {
+        let blocks = [(40_u64, 100_u64), (41, 101)];
+        let hash = |number: u64| BlockHash::new([u8::try_from(number).unwrap_or(u8::MAX); 32]);
+        normalize_generic_frames(GenericNormalizationInputs {
+            range: BlockRange::new(BlockNumber(40), BlockNumber(41)).expect("range"),
+            kind: GenericProjectionKind::Headers,
+            include_header: false,
+            filters: &FilterSet::default(),
+            execution_blocks: &blocks
+                .iter()
+                .map(|&(number, _)| {
+                    let row = GenericExecutionBlockRow {
+                        hash: hash(number),
+                        timestamp: 1_700_000_000,
+                    };
+                    (number, row)
+                })
+                .collect(),
+            beacon_blocks: &blocks
+                .iter()
+                .map(|&(number, slot)| {
+                    let row = GenericBeaconBlockRow {
+                        slot: Some(slot),
+                        hash: hash(number),
+                        parent_hash: BlockHash::ZERO,
+                        timestamp: 1_700_000_000,
+                        transaction_count: 0,
+                        gas_limit: 30_000_000,
+                        gas_used: 0,
+                        base_fee_per_gas: quantity_from_u64(7),
+                        blob_gas_used: None,
+                        excess_blob_gas: None,
+                    };
+                    (number, row)
+                })
+                .collect(),
+            row_indices: BTreeMap::new(),
+            transactions: BTreeMap::new(),
+            receipts: None,
+            logs: BTreeMap::new(),
+            withdrawals: Some(withdrawals.clone()),
+            provenance: &[],
+        })
+    }
+
+    #[test]
+    fn generic_frames_carry_the_proven_withdrawals_of_their_slots() {
+        let row = |index: u64| Withdrawal {
+            index,
+            validator_index: 1_000 + index,
+            address: Address::new([0x77; 20]),
+            amount_gwei: 5 * index,
+        };
+        // Slots 99 and 102, outside the chunk, prove its edges.
+        let mut withdrawals = BTreeMap::from([
+            (99, vec![row(6)]),
+            (100, vec![row(8), row(7)]),
+            (101, vec![row(9)]),
+            (102, vec![row(10)]),
+        ]);
+        let frames = generic_withdrawal_frames(&withdrawals).expect("frames");
+        assert_eq!(
+            frames[0].withdrawals.as_present(),
+            Some(&vec![row(7), row(8)])
+        );
+        assert_eq!(frames[1].withdrawals.as_present(), Some(&vec![row(9)]));
+        assert_eq!(
+            frames[0].header,
+            Material::Missing(MissingReason::NotRequested)
+        );
+
+        withdrawals.insert(100, vec![row(7)]);
+        assert!(
+            matches!(
+                generic_withdrawal_frames(&withdrawals),
+                Err(XatuError::IncompleteWithdrawals { .. })
+            ),
+            "index 8 is missing"
+        );
     }
 
     #[test]

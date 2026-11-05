@@ -21,7 +21,10 @@ use tracing::debug;
 
 use crate::{
     XatuBlobsProjector, XatuCatalog, XatuCatalogConfig, XatuError,
-    projection::{GenericProjectionKind, TransactionColumns, generic_log_columns},
+    projection::{
+        GenericProjectionKind, TransactionColumns, WITHDRAWAL_COLUMNS,
+        generic_beacon_block_columns, generic_log_columns,
+    },
 };
 
 const SCHEMA_VERSION: &str = "xatu.history.v4";
@@ -114,6 +117,7 @@ impl XatuHistorySource {
             Capability::Calldata,
             Capability::Receipts,
             Capability::Logs,
+            Capability::Withdrawals,
         ]);
         Ok(Self {
             descriptor: SourceDescriptor {
@@ -449,12 +453,15 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
             || !request.filters.recipients.is_empty()
         {
             return Err(SourceError::InvalidPlan(
-                "Xatu blob fields and block sizes come only from the type-3 blobs projection, without calldata or logs"
+                "Xatu blob fields and block sizes come only from the type-3 blobs projection, without calldata, logs, or withdrawals"
                     .to_owned(),
             ));
         }
         return Ok(ProjectionMode::Blobs);
     }
+    // Every other projection reads the beacon blocks that name a block's
+    // withdrawals.
+    let required = required.without(Capability::Withdrawals);
     if required.contains(Capability::Logs) {
         let allowed = CapabilitySet::of(Capability::Header).with(Capability::Logs);
         if !allowed.contains_all(required) {
@@ -485,7 +492,7 @@ fn projection_mode(request: &DataRequest) -> Result<ProjectionMode, SourceError>
         }
         return Ok(ProjectionMode::Transactions);
     }
-    if required == CapabilitySet::of(Capability::Header) {
+    if CapabilitySet::of(Capability::Header).contains_all(required) {
         return Ok(ProjectionMode::Headers);
     }
     Err(SourceError::InvalidPlan(
@@ -532,9 +539,9 @@ fn supplied_groups(mode: ProjectionMode, request: &DataRequest) -> CapabilitySet
     } else {
         CapabilitySet::NONE
     };
-    match mode {
-        ProjectionMode::Blobs => BLOBS_GROUPS,
-        ProjectionMode::Headers => CapabilitySet::of(Capability::Header),
+    let fields = match mode {
+        ProjectionMode::Blobs => return BLOBS_GROUPS,
+        ProjectionMode::Headers => header,
         ProjectionMode::Logs => header.with(Capability::Logs),
         ProjectionMode::Transactions => {
             let columns = TransactionColumns::for_groups(request.required, &request.filters);
@@ -549,6 +556,11 @@ fn supplied_groups(mode: ProjectionMode, request: &DataRequest) -> CapabilitySet
                 supplied.with(group)
             })
         }
+    };
+    if request.required.contains(Capability::Withdrawals) {
+        fields.with(Capability::Withdrawals)
+    } else {
+        fields
     }
 }
 
@@ -664,18 +676,7 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
         operation(
             PhysicalReader::Block,
             "canonical_beacon_block",
-            &[
-                "slot_start_date_time",
-                "execution_payload_block_hash",
-                "execution_payload_block_number",
-                "execution_payload_parent_hash",
-                "execution_payload_transactions_count",
-                "execution_payload_gas_limit",
-                "execution_payload_gas_used",
-                "execution_payload_base_fee_per_gas",
-                "execution_payload_blob_gas_used",
-                "execution_payload_excess_blob_gas",
-            ],
+            &generic_beacon_block_columns(request.required),
             vec!["UTC date partitions derived from selected execution blocks".to_owned()],
         ),
     ];
@@ -697,6 +698,14 @@ fn physical_plan(mode: ProjectionMode, request: &DataRequest) -> Vec<PhysicalPla
             ));
         }
         ProjectionMode::Blobs => unreachable!(),
+    }
+    if request.required.contains(Capability::Withdrawals) {
+        plan.push(operation(
+            PhysicalReader::Block,
+            "canonical_beacon_block_withdrawal",
+            WITHDRAWAL_COLUMNS,
+            vec!["slots selected by canonical beacon blocks".to_owned()],
+        ));
     }
     plan
 }
@@ -1057,10 +1066,11 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines)]
     async fn planner_chooses_the_projection_from_field_groups() {
         use Capability::{
             BlobFields, BlockSize, Body, Calldata, Header, Logs, ReceiptOutcome, Receipts, Senders,
-            Transactions,
+            Transactions, Withdrawals,
         };
         let source = XatuHistorySource::new(XatuHistoryConfig::public("mainnet").expect("config"))
             .expect("source");
@@ -1129,6 +1139,35 @@ mod tests {
             .expect("headers");
         assert_eq!(mode(&headers_plan), ProjectionMode::Headers);
         assert_eq!(headers_plan.supplied, groups(&[Header]));
+        let reads_withdrawals = |plan: &SourcePlan| {
+            plan.physical_plan
+                .iter()
+                .any(|operation| operation.table == "canonical_beacon_block_withdrawal")
+        };
+        let reads_slots = |plan: &SourcePlan| {
+            plan.physical_plan.iter().any(|operation| {
+                operation.table == "canonical_beacon_block"
+                    && operation.columns.iter().any(|column| column == "slot")
+            })
+        };
+        assert!(!reads_withdrawals(&headers_plan));
+        assert!(!reads_slots(&headers_plan));
+
+        // Withdrawals join every projection but the blobs one.
+        for (required, expected) in [
+            (&[Withdrawals][..], ProjectionMode::Headers),
+            (&[Header, Withdrawals], ProjectionMode::Headers),
+            (&[Body, Senders, Withdrawals], ProjectionMode::Transactions),
+            (&[Header, Logs, Withdrawals], ProjectionMode::Logs),
+        ] {
+            let withdrawals_plan = plan(required, FilterSet::default())
+                .await
+                .expect("withdrawals");
+            assert_eq!(mode(&withdrawals_plan), expected, "{required:?}");
+            assert_eq!(withdrawals_plan.supplied, groups(required), "{required:?}");
+            assert!(reads_withdrawals(&withdrawals_plan), "{required:?}");
+            assert!(reads_slots(&withdrawals_plan), "{required:?}");
+        }
 
         // Calldata never joins the blobs projection, and bundles promise
         // fields no projection fills: transactions derive blob fields,
@@ -1140,6 +1179,7 @@ mod tests {
             &[Header, Receipts],
             &[Logs, ReceiptOutcome],
             &[BlockSize, Calldata],
+            &[Header, BlobFields, Withdrawals],
         ] {
             let result = plan(required, request(range).filters).await;
             assert!(
