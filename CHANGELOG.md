@@ -220,7 +220,8 @@ record, and documented RPC contracts.
   manifest requires; their code hash is the module's BLAKE3 hash. Native
   processors are unchanged. The binary ships four example modules as
   templates, among them an event decoder that decodes any contract's events
-  from their Solidity signatures with the SDK's `solidity` module.
+  from their Solidity signatures with the SDK's `solidity` module. The SDK's
+  `U256` adds, subtracts, and multiplies 256-bit amounts with overflow checks.
   See [Wasm processors](docs/guides/wasm-processors.mdx).
 - Wasm processors in TypeScript: `packages/wasm-guest`, a TypeScript guest SDK
   compiled with AssemblyScript, implements the ABI of `leani-wasm-guest`, and

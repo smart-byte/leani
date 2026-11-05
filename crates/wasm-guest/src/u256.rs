@@ -64,6 +64,34 @@ impl U256 {
         Some(Self(difference))
     }
 
+    /// The product, or `None` on overflow.
+    #[must_use]
+    pub fn checked_mul(self, other: Self) -> Option<Self> {
+        // Byte products by significance, least significant first. A sum
+        // holds at most 32 products of 255 * 255, far below 2^32.
+        let mut sums = [0_u32; 64];
+        for (i, a) in self.0.iter().rev().enumerate() {
+            for (j, b) in other.0.iter().rev().enumerate() {
+                sums[i + j] += u32::from(*a) * u32::from(*b);
+            }
+        }
+        let mut bytes = [0_u8; 64];
+        let mut carry = 0_u32;
+        for (byte, sum) in bytes.iter_mut().zip(sums) {
+            let total = sum + carry;
+            *byte = total.to_be_bytes()[3];
+            carry = total >> 8;
+        }
+        if bytes[32..].iter().any(|byte| *byte != 0) {
+            return None;
+        }
+        let mut product = [0; 32];
+        for (target, byte) in product.iter_mut().rev().zip(&bytes[..32]) {
+            *target = *byte;
+        }
+        Some(Self(product))
+    }
+
     /// Ten times the value plus a decimal digit; `None` on overflow.
     fn shift_in_digit(self, digit: u8) -> Option<Self> {
         let mut product = [0; 32];
@@ -192,6 +220,34 @@ mod tests {
         let encoded = postcard::to_allocvec(&value).expect("postcard");
         assert_eq!(encoded.len(), 33);
         assert_eq!(postcard::from_bytes::<Option<U256>>(&encoded), Ok(value));
+    }
+
+    #[test]
+    fn products_carry_across_bytes_and_report_overflow() {
+        let gwei = U256::from_u128(1_000_000_000);
+        assert_eq!(
+            U256::from_u128(21_000).checked_mul(gwei),
+            Some(U256::from_u128(21_000_000_000_000))
+        );
+        let square = U256::from_u128(u128::MAX)
+            .checked_mul(U256::from_u128(u128::MAX))
+            .expect("(2^128 - 1)^2 fits 256 bits");
+        assert_eq!(
+            square.to_string(),
+            "115792089237316195423570985008687907852589419931798687112530834793049593217025"
+        );
+        let mut half = [0xff; 32];
+        half[0] = 0x7f;
+        let two = U256::from_u128(2);
+        let below_max = U256::MAX.checked_sub(U256::from_u128(1));
+        assert_eq!(U256(half).checked_mul(two), below_max);
+        let mut top_bit = [0; 32];
+        top_bit[0] = 0x80;
+        assert_eq!(U256(top_bit).checked_mul(two), None);
+        assert_eq!(U256::MAX.checked_mul(two), None);
+        assert_eq!(U256::MAX.checked_mul(U256::ZERO), Some(U256::ZERO));
+        assert_eq!(U256::ZERO.checked_mul(U256::MAX), Some(U256::ZERO));
+        assert_eq!(U256::MAX.checked_mul(U256::from_u128(1)), Some(U256::MAX));
     }
 
     #[test]
