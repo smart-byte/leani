@@ -138,6 +138,12 @@ projection from the requested groups:
 4. `Header` alone uses headers, read from the minimal execution and beacon
    block columns.
 
+`Withdrawals` join any projection but the blobs one, which refuses them. They
+come from `canonical_beacon_block_withdrawal` for the chunk's slots and the
+nearest slots around it: withdrawal indices are consecutive, so these prove
+that no row is missing, and a chunk they cannot prove falls to the next
+source.
+
 Xatu serves `rollup-txs` history, which needs `Header`, `Body`, `Senders`,
 `Calldata` and `ReceiptOutcome`, scoped to the rule recipients. Requests for
 the full `Transactions` or `Receipts` bundles are refused by Xatu, because its
