@@ -97,4 +97,4 @@ historical_mode = "on_demand"
 minimum_recent_blocks = 128
 
 [api]
-bind = "127.0.0.1:8081"
+bind = "127.0.0.1:18081"

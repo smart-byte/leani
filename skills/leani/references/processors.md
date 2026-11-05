@@ -124,8 +124,8 @@ that is not the canonical ABI encoding, is skipped, not an error.
 leani doctor --json                                   # expect "valid": true
 leani backfill --from-block 17000000 --to-block 17000999
 leani serve                                           # background it
-curl -s 'http://127.0.0.1:8081/v1/processors/usdc-transfers/status'
-curl -s 'http://127.0.0.1:8081/v1/processors/usdc-transfers/collections/usdc.transfers/entities?limit=100'
+curl -s 'http://127.0.0.1:18081/v1/processors/usdc-transfers/status'
+curl -s 'http://127.0.0.1:18081/v1/processors/usdc-transfers/collections/usdc.transfers/entities?limit=100'
 ```
 
 - `--from-block` and `--to-block` are inclusive. `backfill` uses the
@@ -134,7 +134,7 @@ curl -s 'http://127.0.0.1:8081/v1/processors/usdc-transfers/collections/usdc.tra
   afterwards. `backfill` refuses to run while `serve` holds the data
   directory; with a node already running, add
   `--endpoint http://127.0.0.1:<api-port>` to submit the range to it.
-- The example's API port is 8081; read `[api] bind` for yours.
+- The example's API port is 18081; read `[api] bind` for yours.
 - Coverage: the status response's `available` intervals must include the
   requested range. A high `processedThrough` alone does not prove earlier
   blocks were indexed, and an unindexed range returns `range_incomplete`

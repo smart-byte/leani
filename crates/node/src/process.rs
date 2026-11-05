@@ -6277,6 +6277,35 @@ fn doctor(path: &Path, json: bool, registry: &ProcessorRegistry) -> Result<Exit>
     })
 }
 
+/// Bind `address`, refusing a port another process already serves there.
+///
+/// Tokio sets `SO_REUSEADDR`, with which macOS binds a specific address
+/// beside another process's wildcard listener on the same port, and clients
+/// of `localhost` then reach that process instead of the node.
+async fn bind_listener(address: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    if address.port() != 0 {
+        let mut probe = address;
+        if probe.ip().is_unspecified() {
+            probe.set_ip(match address {
+                std::net::SocketAddr::V4(_) => std::net::Ipv4Addr::LOCALHOST.into(),
+                std::net::SocketAddr::V6(_) => std::net::Ipv6Addr::LOCALHOST.into(),
+            });
+        }
+        let connected = tokio::time::timeout(
+            Duration::from_secs(1),
+            tokio::net::TcpStream::connect(probe),
+        )
+        .await;
+        if matches!(connected, Ok(Ok(_))) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrInUse,
+                format!("another process already listens on port {}", address.port()),
+            ));
+        }
+    }
+    tokio::net::TcpListener::bind(address).await
+}
+
 #[allow(clippy::too_many_lines)]
 async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     use std::sync::Arc;
@@ -6766,13 +6795,13 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         rpc_config,
         committed_events.clone(),
     );
-    let api_listener = tokio::net::TcpListener::bind(config.get().api.bind)
+    let api_listener = bind_listener(config.get().api.bind)
         .await
         .with_context(|| format!("bind native API {}", config.get().api.bind))?;
-    let rpc_listener = tokio::net::TcpListener::bind(config.get().rpc.http_bind)
+    let rpc_listener = bind_listener(config.get().rpc.http_bind)
         .await
         .with_context(|| format!("bind JSON-RPC {}", config.get().rpc.http_bind))?;
-    let rpc_websocket_listener = tokio::net::TcpListener::bind(config.get().rpc.ws_bind)
+    let rpc_websocket_listener = bind_listener(config.get().rpc.ws_bind)
         .await
         .with_context(|| format!("bind WebSocket JSON-RPC {}", config.get().rpc.ws_bind))?;
     // Installed before the listeners serve, so no signal finds them unset.
@@ -10648,6 +10677,19 @@ mod tests {
     use leani_testkit::{BlockLocalCounter, fixture_frame};
 
     use super::{shutdown::SHUTDOWN_DEADLINE, *};
+
+    #[tokio::test]
+    async fn a_port_another_process_serves_is_refused() {
+        // Like a Node.js dev server, which listens on every address: macOS
+        // lets a loopback listener share its port.
+        let other = std::net::TcpListener::bind("0.0.0.0:0").expect("listener");
+        let port = other.local_addr().expect("address").port();
+        let loopback = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+        let error = bind_listener(loopback).await.expect_err("a served port");
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse, "{error}");
+        drop(other);
+        bind_listener(loopback).await.expect("a free port");
+    }
 
     #[tokio::test]
     async fn a_live_feed_subscribes_with_its_processors_material_only() {
