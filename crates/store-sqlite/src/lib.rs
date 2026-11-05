@@ -44,6 +44,8 @@ use sqlx::{
 use thiserror::Error;
 use tokio::sync::{Mutex, Notify};
 
+mod frame_v1;
+
 const SCHEMA_V1: &str = include_str!("../migrations/0001_core.sql");
 const SCHEMA_V2: &str = include_str!("../migrations/0002_change_context.sql");
 const SCHEMA_V3: &str = include_str!("../migrations/0003_recent_transaction_locator.sql");
@@ -72,12 +74,16 @@ const SCHEMA_V25: &str = include_str!("../migrations/0025_output_block_index.sql
 const SCHEMA_V26: &str = include_str!("../migrations/0026_unattested_indexes.sql");
 const SCHEMA_V27: &str = include_str!("../migrations/0027_maintenance_indexes.sql");
 const SCHEMA_V28: &str = include_str!("../migrations/0028_settled_level.sql");
+const SCHEMA_V29: &str = include_str!("../migrations/0029_header_fee_recipients.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 28;
+pub const CURRENT_SCHEMA_VERSION: u32 = 29;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
 /// The first schema whose change log holds settled changes.
 const SETTLED_SCHEMA_VERSION: u32 = 28;
+/// Schema whose recent frames carry each header's fee recipient, which its
+/// migration reads from the header RLP.
+const HEADER_FEE_RECIPIENT_SCHEMA_VERSION: u32 = 29;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
 const NODE_SECRET_NAME: &str = "node";
 /// Key-derivation context of consumer credential hashes.
@@ -2095,6 +2101,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (26, SCHEMA_V26),
         (27, SCHEMA_V27),
         (28, SCHEMA_V28),
+        (29, SCHEMA_V29),
     ];
     for (target, migration) in migrations {
         if target > version {
@@ -2106,6 +2113,9 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     }
     if version < NODE_SECRET_SCHEMA_VERSION {
         install_node_secret(&mut transaction).await?;
+    }
+    if version < HEADER_FEE_RECIPIENT_SCHEMA_VERSION {
+        reencode_recent_frames(&mut transaction).await?;
     }
     transaction.commit().await?;
     if version <= 2 {
@@ -2349,6 +2359,65 @@ impl NodeSecret {
     /// the upgrade can key stored digests without their credentials.
     fn keyed_credential_digest(&self, digest: &[u8; 32]) -> blake3::Hash {
         blake3::keyed_hash(&self.derived_key(CONSUMER_CREDENTIAL_CONTEXT), digest)
+    }
+}
+
+/// Re-encode recent frames of frame schema 1 in the current schema. A page
+/// at a time, so a large recent window is never held in memory at once.
+async fn reencode_recent_frames(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StoreError> {
+    const PAGE: i64 = 256;
+    let mut after = (-1_i64, -1_i64, Vec::new());
+    loop {
+        let rows: Vec<(i64, i64, Vec<u8>, Vec<u8>)> = sqlx::query_as(
+            "SELECT chain_id, block_number, block_hash, encoded_frame FROM recent_blocks
+             WHERE (chain_id, block_number, block_hash) > (?, ?, ?)
+             ORDER BY chain_id, block_number, block_hash
+             LIMIT ?",
+        )
+        .bind(after.0)
+        .bind(after.1)
+        .bind(&after.2)
+        .bind(PAGE)
+        .fetch_all(&mut **transaction)
+        .await?;
+        let Some(last) = rows.last() else {
+            return Ok(());
+        };
+        after = (last.0, last.1, last.2.clone());
+        for (chain_id, block_number, block_hash, encoded) in rows {
+            let frame = leani_primitives::durable::decode::<frame_v1::BlockFrameV1>(
+                DurableKind::BlockFrame,
+                1,
+                &encoded,
+            )
+            .map_err(|error| StoreError::Encoding(error.to_string()))?
+            .upgrade()
+            .ok_or_else(|| {
+                StoreError::Invariant(format!(
+                    "recent frame {block_number} keeps a header without its RLP, so the \
+                     upgrade cannot read the header's fee recipient"
+                ))
+            })?;
+            let encoded = leani_primitives::durable::encode(
+                DurableKind::BlockFrame,
+                leani_primitives::BLOCK_FRAME_SCHEMA_VERSION,
+                &frame,
+            )
+            .map_err(|error| StoreError::Encoding(error.to_string()))?;
+            sqlx::query(
+                "UPDATE recent_blocks SET encoded_frame = ?, bytes = ?
+                 WHERE chain_id = ? AND block_number = ? AND block_hash = ?",
+            )
+            .bind(&encoded)
+            .bind(usize_i64(encoded.len(), "recent frame bytes")?)
+            .bind(chain_id)
+            .bind(block_number)
+            .bind(&block_hash)
+            .execute(&mut **transaction)
+            .await?;
+        }
     }
 }
 
@@ -20749,6 +20818,7 @@ mod tests {
                 transactions_root: None,
                 receipts_root: None,
                 withdrawals_root: None,
+                fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
                 gas_limit: None,
                 gas_used: None,
                 base_fee_per_gas: None,
@@ -30024,7 +30094,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -30240,10 +30310,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001d' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001e' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 29");
+            .expect("schema 30");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -30253,7 +30323,94 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 29);
+        assert_eq!(schema_on_disk(&newer).await, 30);
+    }
+
+    /// Store `current` as a recent frame in schema 1 frame encoding, then
+    /// rewind the store at `path` to schema 28 and reopen it.
+    async fn upgrade_schema_28_recent_frame(
+        path: &Path,
+        current: &BlockFrame,
+    ) -> Result<SqliteStore, StoreError> {
+        let store = SqliteStore::open(StoreConfig::new(path))
+            .await
+            .expect("open fresh store");
+        store
+            .store_recent_frame(current)
+            .await
+            .expect("recent frame");
+        // JSON names its fields, so reading it back drops the fee recipient
+        // schema 1 lacks.
+        let schema_1: frame_v1::BlockFrameV1 =
+            serde_json::from_value(serde_json::to_value(current).expect("JSON"))
+                .expect("schema 1 frame");
+        let encoded = leani_primitives::durable::encode(DurableKind::BlockFrame, 1, &schema_1)
+            .expect("schema 1 frame");
+        sqlx::query("UPDATE recent_blocks SET encoded_frame = ?, bytes = ?")
+            .bind(&encoded)
+            .bind(i64::try_from(encoded.len()).expect("bytes"))
+            .execute(&store.inner.pool)
+            .await
+            .expect("schema 1 frame");
+        sqlx::raw_sql("UPDATE node_meta SET value = X'0000001C' WHERE key = 'schema_version';")
+            .execute(&store.inner.pool)
+            .await
+            .expect("rewind to schema 28");
+        store.inner.pool.close().await;
+        SqliteStore::open(StoreConfig::new(path)).await
+    }
+
+    fn with_header_rlp(number: u64, rlp: Option<Vec<u8>>) -> BlockFrame {
+        let mut current = frame(number, BlockHash::ZERO);
+        if let Material::Complete(header) = &mut current.header {
+            header.rlp = rlp;
+        }
+        current
+    }
+
+    #[tokio::test]
+    async fn schema_28_recent_frames_take_their_fee_recipient_from_the_header() {
+        // A header list's prefix, parent and ommers hashes, then the beneficiary.
+        let mut rlp = vec![0xf9, 0x02, 0x1e, 0xa0];
+        rlp.extend([0x11; 32]);
+        rlp.push(0xa0);
+        rlp.extend([0x22; 32]);
+        rlp.push(0x94);
+        rlp.extend([0x96; 20]);
+        let current = with_header_rlp(7, Some(rlp));
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = upgrade_schema_28_recent_frame(&directory.path().join("node.sqlite"), &current)
+            .await
+            .expect("upgrade");
+        let upgraded = store
+            .recent_frame(ChainId(1), BlockNumber(7))
+            .await
+            .expect("read")
+            .expect("frame");
+        let Material::Complete(header) = &upgraded.header else {
+            panic!("the header stays complete");
+        };
+        assert_eq!(
+            header.fee_recipient,
+            Some(leani_primitives::Address::new([0x96; 20]))
+        );
+        assert_eq!(upgraded.block, current.block);
+        assert_eq!(
+            store.stats().await.expect("stats").schema_version,
+            CURRENT_SCHEMA_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_28_recent_header_without_its_rlp_refuses_the_upgrade() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let error = upgrade_schema_28_recent_frame(
+            &directory.path().join("node.sqlite"),
+            &with_header_rlp(7, None),
+        )
+        .await
+        .expect_err("no header bytes");
+        assert!(error.to_string().contains("fee recipient"), "{error}");
     }
 
     #[tokio::test]
@@ -30352,7 +30509,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION

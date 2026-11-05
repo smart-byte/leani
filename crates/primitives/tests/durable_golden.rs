@@ -57,11 +57,11 @@ fn processor_cursor_v1_encoding_is_stable() {
 }
 
 #[test]
-fn block_frame_v1_encoding_is_stable() {
+fn block_frame_v2_encoding_is_stable() {
     let frame = fixture_frame();
     let encoded = encode(DurableKind::BlockFrame, BLOCK_FRAME_SCHEMA_VERSION, &frame)
         .expect("encode fixture");
-    let expected = include_str!("fixtures/block_frame_v1.hex").trim();
+    let expected = include_str!("fixtures/block_frame_v2.hex").trim();
     assert_eq!(hex::encode(&encoded), expected);
     let decoded: BlockFrame = decode(
         DurableKind::BlockFrame,
@@ -73,7 +73,7 @@ fn block_frame_v1_encoding_is_stable() {
 }
 
 #[test]
-fn block_frame_missing_material_v1_encoding_is_stable() {
+fn block_frame_missing_material_v2_encoding_is_stable() {
     let mut frame = fixture_frame();
     frame.header = Material::Missing(MissingReason::NotRequested);
     frame.transactions = Material::Missing(MissingReason::Unsupported);
@@ -82,7 +82,7 @@ fn block_frame_missing_material_v1_encoding_is_stable() {
     frame.withdrawals = Material::Missing(MissingReason::Pruned);
     let encoded = encode(DurableKind::BlockFrame, BLOCK_FRAME_SCHEMA_VERSION, &frame)
         .expect("encode fixture");
-    let expected = include_str!("fixtures/block_frame_missing_v1.hex").trim();
+    let expected = include_str!("fixtures/block_frame_missing_v2.hex").trim();
     assert_eq!(hex::encode(&encoded), expected);
     let decoded: BlockFrame = decode(
         DurableKind::BlockFrame,
@@ -186,6 +186,7 @@ fn fixture_header() -> HeaderEnvelope {
         transactions_root: Some(BlockHash::new([0x81; 32])),
         receipts_root: Some(BlockHash::new([0x82; 32])),
         withdrawals_root: None,
+        fee_recipient: Some(Address::new([0x0f; 20])),
         gas_limit: Some(30_000_000),
         gas_used: Some(21_000),
         base_fee_per_gas: Some(Quantity::new([0x07; 32])),

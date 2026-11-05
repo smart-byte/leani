@@ -206,6 +206,10 @@ impl Projection {
             base_fee_per_gas: header.base_fee_per_gas.map(|fee| fee.0).filter(|_| fields),
             blob_gas_used: header.blob_gas_used.filter(|_| fields),
             excess_blob_gas: header.excess_blob_gas.filter(|_| fields),
+            fee_recipient: header
+                .fee_recipient
+                .map(|address| address.0)
+                .filter(|_| fields),
             size_bytes: header.size_bytes.filter(|_| size),
             transaction_count: header.transaction_count.filter(|_| size),
         })

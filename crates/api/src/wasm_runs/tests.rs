@@ -33,6 +33,7 @@ fn frame(number: u64, parent: BlockHash, salt: u8, values: &[u64]) -> BlockFrame
         transactions_root: None,
         receipts_root: None,
         withdrawals_root: None,
+        fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
         gas_limit: Some(30_000_000),
         gas_used: Some(1),
         base_fee_per_gas: None,

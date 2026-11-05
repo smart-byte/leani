@@ -530,6 +530,7 @@ mod tests {
                 transactions_root: Some(BlockHash::new([0xd1; 32])),
                 receipts_root: Some(BlockHash::new([0xd2; 32])),
                 withdrawals_root: Some(BlockHash::new([0xd3; 32])),
+                fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
                 gas_limit: Some(30_000_000),
                 gas_used: Some(105_000),
                 base_fee_per_gas: Some(wei(7)),

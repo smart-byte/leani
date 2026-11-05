@@ -9,7 +9,7 @@ const HEADER_LEN: usize = 16;
 const CHECKSUM_LEN: usize = 32;
 
 /// Current durable payload schema for [`crate::BlockFrame`].
-pub const BLOCK_FRAME_SCHEMA_VERSION: u16 = 1;
+pub const BLOCK_FRAME_SCHEMA_VERSION: u16 = 2;
 
 /// Stable durable record discriminator.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

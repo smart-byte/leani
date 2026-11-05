@@ -148,6 +148,7 @@ impl XatuTable {
                 "execution_payload_base_fee_per_gas",
                 "execution_payload_blob_gas_used",
                 "execution_payload_excess_blob_gas",
+                "execution_payload_fee_recipient",
                 "execution_payload_gas_limit",
                 "execution_payload_gas_used",
                 "execution_payload_parent_hash",

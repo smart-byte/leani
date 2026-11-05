@@ -63,8 +63,9 @@ export class Block {
 
 /**
  * Header fields. A field is `null` when the manifest does not require its
- * group, `Capability.Header` for gas and fees or `Capability.BlockSize` for
- * the size and transaction count, or the source could not supply it.
+ * group, `Capability.Header` for gas, fees, and the fee recipient or
+ * `Capability.BlockSize` for the size and transaction count, or the source
+ * could not supply it.
  */
 export class Header {
   gasLimit: Some<u64> | null = null;
@@ -72,6 +73,8 @@ export class Header {
   baseFeePerGas: U256 | null = null;
   blobGasUsed: Some<u64> | null = null;
   excessBlobGas: Some<u64> | null = null;
+  /** The address the block's priority fees go to, the header's `beneficiary`. */
+  feeRecipient: Uint8Array | null = null;
   sizeBytes: Some<u64> | null = null;
   transactionCount: Some<u32> | null = null;
 
@@ -82,6 +85,7 @@ export class Header {
     header.baseFeePerGas = optionalU256(input);
     header.blobGasUsed = optionalU64(input);
     header.excessBlobGas = optionalU64(input);
+    header.feeRecipient = optionalRaw(input, 20);
     header.sizeBytes = optionalU64(input);
     header.transactionCount = input.flag() ? new Some<u32>(<u32>input.uint()) : null;
     return header;

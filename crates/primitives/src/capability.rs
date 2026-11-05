@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum Capability {
-    /// Header material: guarantees gas limit and gas used.
+    /// Header material: guarantees gas limit, gas used, and fee recipient.
     Header = 0,
     /// Transaction-body fields: `to`, nonce, gas limit, and value of every
     /// transaction, and the header's transaction count.

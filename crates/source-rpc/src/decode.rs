@@ -638,6 +638,7 @@ pub fn frame(
                 transactions_root: Some(block_hash(header.transactions_root)),
                 receipts_root: Some(block_hash(header.receipts_root)),
                 withdrawals_root: header.withdrawals_root.map(block_hash),
+                fee_recipient: Some(address(header.beneficiary)),
                 gas_limit: Some(header.gas_limit),
                 gas_used: Some(header.gas_used),
                 base_fee_per_gas: header.base_fee_per_gas.map(U256::from).map(amount),
@@ -835,5 +836,14 @@ mod tests {
         assert_eq!(transactions[0].transaction_type, 0x6a);
         assert!(transactions.iter().all(|tx| tx.encoded.is_some()));
         assert_eq!(frame.block.number, BlockNumber(95_188_614));
+        let Material::Complete(header) = &frame.header else {
+            panic!("complete header");
+        };
+        assert_eq!(
+            header.fee_recipient,
+            Some(address(alloy_primitives::address!(
+                "a4b000000000000000000073657175656e636572"
+            )))
+        );
     }
 }

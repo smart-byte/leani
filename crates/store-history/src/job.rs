@@ -1260,6 +1260,7 @@ mod tests {
             transactions_root: Some(BlockHash::new(header.transactions_root.0)),
             receipts_root: Some(BlockHash::new(header.receipts_root.0)),
             withdrawals_root: header.withdrawals_root.map(|hash| BlockHash::new(hash.0)),
+            fee_recipient: Some(leani_primitives::Address::new(header.beneficiary.0.0)),
             gas_limit: Some(header.gas_limit),
             gas_used: Some(header.gas_used),
             base_fee_per_gas: header
