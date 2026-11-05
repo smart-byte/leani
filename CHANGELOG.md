@@ -235,6 +235,11 @@ record, and documented RPC contracts.
   ones. A running run takes another module or other parameters
   (`PUT /admin/v1/wasm/runs/{run}/processor`), reruns the blocks it holds
   with them, and follows on with them.
+- Block headers carry their fee recipient, the header's `beneficiary`, which
+  JSON-RPC names `miner`: execution P2P, eraE, JSON-RPC, AWS Open Data, and
+  Xatu (from the beacon payload's `fee_recipient`) fill it, and the `header`
+  field group guarantees it. Wasm processors read it as the header's
+  `fee_recipient` (`feeRecipient` in TypeScript).
 - Xatu serves withdrawals with its header, transaction, and log projections,
   from `canonical_beacon_block_withdrawal`, whose consecutive indices prove a
   chunk's rows complete. A processor that requires `withdrawals`, such as a
@@ -285,6 +290,15 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- Breaking: block frames use frame schema 2, which adds the header's fee
+  recipient. On its first start the node upgrades its store to schema 29 and
+  re-encodes the recent frames it keeps, reading each fee recipient from the
+  header bytes they hold: 293 Ethereum frames took about 1 s, 9,418 frames of
+  a Nitro chain about 3 s. A raw history store (`[raw_history]`) cannot be
+  upgraded: the node refuses its catalog until `data_dir/raw-history` is moved
+  aside, and then rebuilds raw history from its sources. Frames read from an
+  archive written before carry no fee recipient, so a processor that needs
+  headers takes those blocks from the next source.
 - Execution P2P asks no public IP service for the host's address unless
   `nat` says so: generated configurations set `sources.live.nat = "none"`
   instead of `"any"`. A node whose configuration names `any`, `upnp`, or

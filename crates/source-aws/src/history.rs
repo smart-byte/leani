@@ -712,6 +712,7 @@ fn frame(
         transactions_root: Some(BlockHash::new(block.transactions_root.0)),
         receipts_root: Some(BlockHash::new(block.receipts_root.0)),
         withdrawals_root: block.withdrawals_root.map(|root| BlockHash::new(root.0)),
+        fee_recipient: Some(leani_primitives::Address::new(block.fee_recipient.0.0)),
         gas_limit: Some(block.gas_limit),
         gas_used: Some(block.gas_used),
         base_fee_per_gas: block.base_fee.map(|fee| quantity(u128::from(fee))),
@@ -960,9 +961,20 @@ mod tests {
         assert_eq!(frames[1].block.parent_hash, frames[0].block.hash);
         let mut outcomes = Vec::new();
         let mut logs = 0;
+        // Base's sequencer fee vault; the verified header hash covers it.
+        let mut vault = [0; 20];
+        vault[0] = 0x42;
+        vault[19] = 0x11;
         for frame in &frames {
             frame.validate_shape().unwrap();
             assert_eq!(frame.verification.header_hash, VerificationCheck::VERIFIED);
+            assert_eq!(
+                frame
+                    .header
+                    .as_present()
+                    .and_then(|header| header.fee_recipient),
+                Some(Address::new(vault))
+            );
             assert_eq!(
                 frame.verification.receipts_root,
                 VerificationCheck::VERIFIED

@@ -1189,6 +1189,7 @@ mod tests {
                 transactions_root: None,
                 receipts_root: None,
                 withdrawals_root: None,
+                fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
                 gas_limit: None,
                 gas_used: None,
                 base_fee_per_gas: None,

@@ -26,7 +26,9 @@ use crate::segment::{
     SegmentWriter, VerificationClass,
 };
 
-const CATALOG_SCHEMA_VERSION: i64 = 5;
+/// Schema 6 keeps frames of block frame schema 2, which adds each header's fee
+/// recipient.
+const CATALOG_SCHEMA_VERSION: i64 = 6;
 /// Catalog bytes reserved for a segment's own rows and owners.
 const CATALOG_RESERVATION_OVERHEAD_BYTES: u64 = 64 * 1024;
 /// Catalog bytes reserved per locator row: its table and index entries, page
@@ -55,7 +57,7 @@ CREATE TABLE IF NOT EXISTS catalog_meta (
     value INTEGER NOT NULL
 ) WITHOUT ROWID, STRICT;
 
-INSERT OR IGNORE INTO catalog_meta(key, value) VALUES ('schema_version', 5);
+INSERT OR IGNORE INTO catalog_meta(key, value) VALUES ('schema_version', 6);
 
 CREATE TABLE IF NOT EXISTS raw_segment_reservations (
     segment_id TEXT PRIMARY KEY,
@@ -78,7 +80,7 @@ CREATE TABLE IF NOT EXISTS raw_segments (
     verification_class INTEGER NOT NULL CHECK(verification_class BETWEEN 0 AND 2),
     trust_model INTEGER NOT NULL CHECK(trust_model BETWEEN 0 AND 3),
     format_version INTEGER NOT NULL CHECK(format_version = 1),
-    frame_encoding_version INTEGER NOT NULL CHECK(frame_encoding_version = 1),
+    frame_encoding_version INTEGER NOT NULL CHECK(frame_encoding_version = 2),
     compression INTEGER NOT NULL CHECK(compression BETWEEN 0 AND 2),
     history_profile INTEGER NOT NULL CHECK(history_profile IN (0, 1)),
     merge_block INTEGER CHECK(merge_block IS NULL OR merge_block >= 0),
@@ -533,9 +535,13 @@ impl HistoryStore {
             sqlx::query_scalar("SELECT value FROM catalog_meta WHERE key = 'schema_version'")
                 .fetch_one(&pool)
                 .await?;
+        // Raw history is a cache of downloadable material: rebuilt, not
+        // migrated.
         if version != CATALOG_SCHEMA_VERSION {
             return Err(HistoryStoreError::InvalidConfig(format!(
-                "history catalog schema {version} is unsupported"
+                "history catalog schema {version} is unsupported; this binary keeps schema \
+                 {CATALOG_SCHEMA_VERSION}: move {} aside to rebuild raw history",
+                config.root.display()
             )));
         }
         // The quarantine holds at least one segment of the largest size the
@@ -2596,6 +2602,30 @@ mod tests {
 
     async fn close(store: &HistoryStore) {
         store.inner.pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_catalog_of_an_older_frame_encoding_names_its_rebuild() {
+        let directory = tempdir().expect("temporary directory");
+        let store = HistoryStore::open(test_config(directory.path()))
+            .await
+            .expect("open store");
+        sqlx::query("UPDATE catalog_meta SET value = 5 WHERE key = 'schema_version'")
+            .execute(&store.inner.pool)
+            .await
+            .expect("rewind to schema 5");
+        close(&store).await;
+        drop(store);
+
+        let Err(error) = HistoryStore::open(test_config(directory.path())).await else {
+            panic!("a schema 5 catalog opened");
+        };
+        let message = error.to_string();
+        assert!(message.contains("schema 5"), "{message}");
+        assert!(
+            message.contains(&directory.path().display().to_string()),
+            "{message}"
+        );
     }
 
     #[tokio::test]

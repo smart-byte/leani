@@ -84,6 +84,7 @@ fn frame(number: u64, parent: BlockHash, logs: Vec<Log>) -> BlockFrame {
         transactions_root: None,
         receipts_root: None,
         withdrawals_root: None,
+        fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
         gas_limit: Some(30_000_000),
         gas_used: Some(21_000),
         base_fee_per_gas: None,
@@ -1615,4 +1616,26 @@ async fn generated_typescript_matches_generated_rust() {
         .await;
         assert_eq!(published.len(), expected, "{spec}: {published:#?}");
     }
+}
+
+#[test]
+fn the_header_group_carries_the_fee_recipient() {
+    let project = |capabilities: Vec<leani_wasm_guest::Capability>| {
+        let requires = leani_wasm_guest::Requirements {
+            capabilities,
+            ..leani_wasm_guest::Requirements::default()
+        };
+        crate::frame::Projection::new(&requires)
+            .expect("projection")
+            .project(&frame(1, BlockHash::ZERO, Vec::new()))
+            .expect("block")
+            .header
+            .expect("header")
+    };
+    let header = project(vec![leani_wasm_guest::Capability::Header]);
+    assert_eq!(header.fee_recipient, Some([0x0f; 20]));
+    assert_eq!(header.gas_used, Some(21_000));
+    let sizes = project(vec![leani_wasm_guest::Capability::BlockSize]);
+    assert_eq!(sizes.fee_recipient, None);
+    assert_eq!(sizes.transaction_count, Some(0));
 }

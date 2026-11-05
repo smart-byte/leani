@@ -128,6 +128,7 @@ mod tests {
             receipts_root: header.receipts_root,
             transactions_root: header.transactions_root,
             bloom: header.logs_bloom,
+            fee_recipient: header.beneficiary,
             gas_limit: header.gas_limit,
             gas_used: header.gas_used,
             base_fee: header.base_fee_per_gas,

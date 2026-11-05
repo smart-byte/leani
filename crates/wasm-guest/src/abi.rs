@@ -42,8 +42,9 @@ pub struct Block {
 }
 
 /// Header fields. A field is `None` when the manifest does not require its
-/// group, [`Capability::Header`] for gas and fees or [`Capability::BlockSize`]
-/// for the size and transaction count, or the source could not supply it.
+/// group, [`Capability::Header`] for gas, fees, and the fee recipient or
+/// [`Capability::BlockSize`] for the size and transaction count, or the
+/// source could not supply it.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Header {
     pub gas_limit: Option<u64>,
@@ -51,6 +52,9 @@ pub struct Header {
     pub base_fee_per_gas: Option<Word>,
     pub blob_gas_used: Option<u64>,
     pub excess_blob_gas: Option<u64>,
+    /// The address the block's priority fees go to, the header's
+    /// `beneficiary`.
+    pub fee_recipient: Option<Address>,
     pub size_bytes: Option<u64>,
     pub transaction_count: Option<u32>,
 }
@@ -256,7 +260,7 @@ pub struct Requirements {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Capability {
-    /// Gas limit, gas used, base fee, and blob gas of the block.
+    /// Gas limit, gas used, base fee, blob gas, and fee recipient of the block.
     Header,
     /// `to`, nonce, gas limit, and value of every transaction.
     Body,

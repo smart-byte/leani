@@ -56,7 +56,7 @@ only on components whose material is present:
 
 | Group | Promise |
 |---|---|
-| `Header` | `gas_limit` and `gas_used`. The base fee and blob gas fields come with the header but are not checked, because the checks are chain-agnostic. |
+| `Header` | `gas_limit`, `gas_used` and `fee_recipient`, the header's `beneficiary`, which JSON-RPC names `miner`. The base fee and blob gas fields come with the header but are not checked, because the checks are chain-agnostic. |
 | `Body` | Every transaction's `to`, `nonce`, `gas_limit` and `value`, and the header's `transaction_count`. An absent `to` means a contract creation, never "not supplied". |
 | `Calldata` | Every transaction's `input`. Empty calldata is empty bytes. |
 | `Senders` | Every transaction's `from`. |

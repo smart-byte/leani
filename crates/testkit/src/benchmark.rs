@@ -783,6 +783,7 @@ fn generated_frame(kind: SyntheticCorpusKind, seed: u64, number: BlockNumber) ->
             transactions_root: Some(deterministic_hash(b"tx-root", seed, kind, number.0, 0)),
             receipts_root: Some(deterministic_hash(b"receipt-root", seed, kind, number.0, 0)),
             withdrawals_root: None,
+            fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
             gas_limit: Some(30_000_000),
             gas_used: Some(
                 21_000_u64.saturating_mul(u64::try_from(transaction_count).unwrap_or(u64::MAX)),

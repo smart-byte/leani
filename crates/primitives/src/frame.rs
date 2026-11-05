@@ -82,6 +82,10 @@ pub struct HeaderEnvelope {
     pub transactions_root: Option<BlockHash>,
     pub receipts_root: Option<BlockHash>,
     pub withdrawals_root: Option<BlockHash>,
+    /// The address the block's priority fees go to: the header's
+    /// `beneficiary`, which JSON-RPC names `miner` and the beacon execution
+    /// payload `fee_recipient`.
+    pub fee_recipient: Option<Address>,
     pub gas_limit: Option<u64>,
     pub gas_used: Option<u64>,
     pub base_fee_per_gas: Option<Quantity>,
@@ -277,9 +281,13 @@ impl BlockFrame {
             .map_or(&[][..], Vec::as_slice);
         let receipts = self.receipts.as_present();
         if groups.contains(Capability::Header)
-            && header.is_some_and(|header| header.gas_limit.is_none() || header.gas_used.is_none())
+            && header.is_some_and(|header| {
+                header.gas_limit.is_none()
+                    || header.gas_used.is_none()
+                    || header.fee_recipient.is_none()
+            })
         {
-            return Some("header lacks gas limit or gas used");
+            return Some("header lacks gas limit, gas used, or fee recipient");
         }
         if groups.contains(Capability::Body) {
             if transactions.iter().any(|transaction| {
@@ -656,6 +664,7 @@ mod tests {
                 transactions_root: None,
                 receipts_root: None,
                 withdrawals_root: None,
+                fee_recipient: Some(Address::new([0x0f; 20])),
                 gas_limit: Some(30_000_000),
                 gas_used: Some(42_000),
                 base_fee_per_gas: None,
@@ -710,11 +719,16 @@ mod tests {
 
     #[test]
     fn each_group_names_the_field_it_misses() {
-        let cases: [BrokenPromise; 11] = [
+        let cases: [BrokenPromise; 12] = [
             (
                 Capability::Header,
                 |frame| header(frame).gas_used = None,
-                "header lacks gas limit or gas used",
+                "header lacks gas limit, gas used, or fee recipient",
+            ),
+            (
+                Capability::Header,
+                |frame| header(frame).fee_recipient = None,
+                "header lacks gas limit, gas used, or fee recipient",
             ),
             (
                 Capability::Body,
