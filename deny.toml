@@ -12,6 +12,11 @@ ignore = [
   # revm use; leani's only secp256k1 secrets are peer identity keys. Revisit on
   # every Reth or alloy bump.
   { id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5.5 is pinned by elliptic-curve 0.13 and has no patched release" },
+  # An unmaintained notice: pin-utils' repository is archived, and wasmtimer
+  # 0.4.3, its newest release, still depends on it. helios-consensus-core pulls
+  # wasmtimer in for wasm32 only, which leani never builds the node for.
+  # Revisit on every Helios bump.
+  { id = "RUSTSEC-2026-0441", reason = "pin-utils is inherited through helios-consensus-core's wasm32-only wasmtimer, whose newest release still needs it" },
 ]
 
 [licenses]
