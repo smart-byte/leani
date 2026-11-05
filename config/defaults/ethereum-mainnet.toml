@@ -39,7 +39,7 @@ minimum_peers = 1
 listener_port = 0
 discovery_port = 0
 discv5_port = 0
-nat = "any"
+nat = "none"
 
 [finality]
 kind = "beacon_api"

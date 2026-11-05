@@ -72,7 +72,7 @@ use reth_network::types::{
     ReputationChangeKind,
 };
 use reth_network::{
-    DisconnectReason, FetchClient, NetworkConfigBuilder, NetworkEvent,
+    DisconnectReason, FetchClient, NetworkConfig, NetworkConfigBuilder, NetworkEvent,
     NetworkEventListenerProvider, NetworkHandle, NetworkManager, PeerRequest, PeerRequestSender,
     Peers, PeersConfig, SessionsConfig, config::rng_secret_key, events::PeerEvent,
 };
@@ -195,8 +195,8 @@ pub fn parse_block_hash(value: &str) -> Result<BlockHash, P2pError> {
 
 /// Parse an operator-facing Reth NAT resolver.
 ///
-/// `none` disables external address advertisement; all other values use
-/// Reth's resolver syntax (`any`, `upnp`, `publicip`, `extip:<ip>`, ...).
+/// `none` advertises no external address and looks none up; all other values
+/// use Reth's resolver syntax (`any`, `upnp`, `publicip`, `extip:<ip>`, ...).
 ///
 /// # Errors
 ///
@@ -210,6 +210,16 @@ pub fn parse_nat_resolver(value: &str) -> Result<Option<NatResolver>, P2pError> 
             "invalid execution P2P NAT resolver {value:?}: {error}"
         ))
     })
+}
+
+/// Advertise the external address `nat` resolves, and look up no other:
+/// Reth's Discv4 otherwise asks public IP services for it at start and every
+/// five minutes, even when no resolver is configured.
+fn set_nat<C>(config: &mut NetworkConfig<C, WireNetworkPrimitives>, nat: Option<NatResolver>) {
+    if let Some(discovery) = &mut config.discovery_v4_config {
+        discovery.external_ip_resolver.clone_from(&nat);
+    }
+    config.nat = nat;
 }
 
 /// Parse an `enode://` trusted execution peer.
@@ -4129,6 +4139,18 @@ impl RethP2pSource {
     /// or when peer, retry, or timeout bounds are invalid.
     pub fn new(chain: Arc<Chain>, config: RethP2pConfig) -> Result<Self, P2pError> {
         config.validate()?;
+        if let Some(nat) = &config.nat
+            && matches!(
+                nat,
+                NatResolver::Any | NatResolver::Upnp | NatResolver::PublicIp
+            )
+        {
+            warn!(
+                chain = %chain.name,
+                %nat,
+                "execution P2P asks ipinfo.io, icanhazip.com, or ifconfig.me for this host's public address at start and every five minutes; set nat = \"extip:<address>\" to keep it from asking"
+            );
+        }
         let chain_spec = leani_chain::execution_chain_spec(&chain)
             .map_err(|error| P2pError::InvalidConfig(error.to_string()))?;
         let cadence = chain
@@ -4811,10 +4833,6 @@ impl RethP2pSource {
                 .add_unsigned_boot_nodes(self.boot_nodes());
             builder = builder.discovery_v5(discv5);
         }
-        builder = match self.config.nat.clone() {
-            Some(nat) => builder.external_ip_resolver(nat),
-            None => builder.disable_nat(),
-        };
         let started = Instant::now();
         info!(?lane, "building the execution P2P network manager");
         let built = if self.config.enable_discv5
@@ -4834,7 +4852,8 @@ impl RethP2pSource {
             // runs to completion in its own task. Nobody receives a build
             // whose caller was dropped: its manager drops, and discovery
             // with it.
-            let config = builder.build_with_noop_provider(self.chain_spec.clone());
+            let mut config = builder.build_with_noop_provider(self.chain_spec.clone());
+            set_nat(&mut config, self.config.nat.clone());
             match tokio::spawn(async move { Box::pin(config.manager()).await }).await {
                 Ok(built) => built.map_err(|error| error.to_string()),
                 Err(error) => Err(format!("the network manager build stopped: {error}")),
@@ -13274,6 +13293,45 @@ mod tests {
         assert!(parse_nat_resolver("none").expect("disabled NAT").is_none());
         assert!(parse_nat_resolver("any").expect("automatic NAT").is_some());
         assert!(parse_nat_resolver("not-a-resolver").is_err());
+    }
+
+    #[tokio::test]
+    async fn discovery_resolves_the_external_address_only_through_nat() {
+        let config = |discv4: bool, nat: Option<NatResolver>| {
+            let mut builder = NetworkConfigBuilder::<WireNetworkPrimitives>::new(
+                rng_secret_key(),
+                Runtime::test(),
+            );
+            if !discv4 {
+                builder = builder.disable_discv4_discovery();
+            }
+            let mut config = builder.build_with_noop_provider(MAINNET.clone());
+            set_nat(&mut config, nat);
+            config
+        };
+        // Reth's Discv4 would otherwise ask public IP services by itself.
+        let unset = config(true, None);
+        assert_eq!(
+            unset
+                .discovery_v4_config
+                .map(|discovery| discovery.external_ip_resolver),
+            Some(None)
+        );
+        let address = NatResolver::ExternalIp(Ipv4Addr::new(203, 0, 113, 7).into());
+        let fixed = config(true, Some(address.clone()));
+        assert_eq!(
+            fixed
+                .discovery_v4_config
+                .map(|discovery| discovery.external_ip_resolver),
+            Some(Some(address.clone()))
+        );
+        assert_eq!(fixed.nat, Some(address));
+        // A chain without Discv4 keeps it off.
+        assert!(
+            config(false, Some(NatResolver::Any))
+                .discovery_v4_config
+                .is_none()
+        );
     }
 
     #[test]

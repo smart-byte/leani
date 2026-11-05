@@ -124,7 +124,9 @@ in containers, and the port numbers are examples, not requirements.
 - **Advertise the public address.** Behind NAT, Docker's bridge included,
   the node sees only its private address, and advertising that sends peers
   to an address that never answers. Set `sources.live.nat = "extip:<public
-  IPv4>"`; gossip learns its public address from its peers.
+  IPv4>"`; gossip learns its public address from its peers. The default,
+  `none`, advertises no address, and `any`, `upnp`, and `publicip` ask
+  ipinfo.io, icanhazip.com, or ifconfig.me for it every five minutes.
 - **Keep each port the same inside and outside.** The node announces its own
   port numbers, so a NAT or container mapping must not renumber them:
   `-p 30400:30400` works and `-p 30500:30400` does not.
