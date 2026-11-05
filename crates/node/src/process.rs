@@ -8180,8 +8180,39 @@ const FIRST_SIGNED_HEAD_TIMEOUT: Duration = Duration::from_secs(180);
 const RPC_CATCH_UP_GRID: u64 = 256;
 
 /// How often an op-stack node following over JSON-RPC asks whether execution
-/// peers serve it again.
+/// peers serve it again, at first.
 const P2P_RETURN_PROBE: Duration = Duration::from_mins(5);
+/// A return to execution P2P that lasts this long resets the probe's wait;
+/// one that ends sooner doubles it, up to [`P2P_RETURN_PROBE_MAX`].
+const P2P_RETURN_HELD: Duration = Duration::from_mins(10);
+const P2P_RETURN_PROBE_MAX: Duration = Duration::from_hours(1);
+
+/// When an op-stack node following over JSON-RPC asks for execution peers
+/// again, and when it last returned to them.
+#[derive(Debug)]
+pub(crate) struct P2pReturns {
+    wait: Duration,
+    returned_at: Option<tokio::time::Instant>,
+}
+
+impl Default for P2pReturns {
+    fn default() -> Self {
+        Self {
+            wait: P2P_RETURN_PROBE,
+            returned_at: None,
+        }
+    }
+}
+
+/// The probe's next wait after a P2P run that ended for want of peers:
+/// longer when it was a return that did not `held`.
+fn next_return_wait(wait: Duration, held: bool) -> Duration {
+    if held {
+        P2P_RETURN_PROBE
+    } else {
+        wait.saturating_mul(2).min(P2P_RETURN_PROBE_MAX)
+    }
+}
 
 /// The block a fresh store catches up from, below the signed `head`: the
 /// lowest start of the processors whose history the node fills, at most
@@ -8414,11 +8445,16 @@ async fn run_op_lanes(
         cancellation.clone(),
         finality_ready,
     );
+    let wait = op_heads
+        .returns
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .wait;
     let p2p_returns = p2p_returns(
         &live_source,
         op_heads.heads.clone(),
         config.sources.live.minimum_peers,
-        follows_rpc,
+        follows_rpc.then_some(wait),
         cancellation,
     );
     tokio::pin!(live);
@@ -8429,6 +8465,11 @@ async fn run_op_lanes(
             () = cancellation.cancelled() => return Ok(()),
             connected = &mut p2p_returns => {
                 info!(connected, "execution peers serve the chain again; following over P2P");
+                op_heads
+                    .returns
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .returned_at = Some(tokio::time::Instant::now());
                 return Err(LiveSwitch.into());
             }
             changed = heads.changed() => {
@@ -8468,6 +8509,16 @@ async fn run_op_lanes(
                     && op_heads.signed.is_some()
                 {
                     warn!(%reason, "no execution peer serves the chain; following over JSON-RPC");
+                    let mut returns = op_heads
+                        .returns
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let held = returns
+                        .returned_at
+                        .take()
+                        .is_none_or(|at| at.elapsed() >= P2P_RETURN_HELD);
+                    returns.wait = next_return_wait(returns.wait, held);
+                    drop(returns);
                     op_heads
                         .over_rpc
                         .store(true, std::sync::atomic::Ordering::Relaxed);
@@ -8514,20 +8565,20 @@ async fn prove_down_from(
 }
 
 /// Resolves to the connected peer count once execution P2P holds at least
-/// `minimum` peers, asked every [`P2P_RETURN_PROBE`] while `following_rpc`;
-/// never otherwise.
+/// `minimum` peers, asked after each `wait` while the node follows over
+/// JSON-RPC; never without one.
 async fn p2p_returns(
     source: &leani_source_p2p::RethP2pSource,
     mut heads: tokio::sync::watch::Receiver<Option<leani_finality_op_gossip::SignedBlock>>,
     minimum: usize,
-    following_rpc: bool,
+    wait: Option<Duration>,
     cancellation: &CancellationToken,
 ) -> usize {
-    if !following_rpc {
+    let Some(wait) = wait else {
         return std::future::pending().await;
-    }
+    };
     loop {
-        tokio::time::sleep(P2P_RETURN_PROBE).await;
+        tokio::time::sleep(wait).await;
         let Some(head) = *heads.borrow_and_update() else {
             continue;
         };
@@ -10889,6 +10940,16 @@ mod tests {
             detail: "the finalized hash is 0xf2…, the canonical hash 0x02…".to_owned(),
         })
         .context("finality network lane")
+    }
+
+    #[test]
+    fn returns_to_p2p_that_do_not_hold_wait_longer_each_time() {
+        let mut wait = P2P_RETURN_PROBE;
+        for expected in [10, 20, 40, 60, 60] {
+            wait = next_return_wait(wait, false);
+            assert_eq!(wait, Duration::from_mins(expected));
+        }
+        assert_eq!(next_return_wait(wait, true), P2P_RETURN_PROBE);
     }
 
     #[test]

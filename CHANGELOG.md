@@ -119,7 +119,8 @@ record, and documented RPC contracts.
   the chain entries bundle. A block from the endpoints must have the hash the
   sequencer signed on gossip, or link to one, and its transactions and
   receipts roots must hold; the node returns to execution P2P once peers
-  serve it again.
+  serve it again, and asks less often, up to once an hour, while its returns
+  end within ten minutes.
 - Op-stack blocks served over JSON-RPC check against their transactions and
   receipts roots: deposit transactions and receipts are re-encoded, and
   Regolith's receipts roots, which leave deposit nonces out, are recognized.

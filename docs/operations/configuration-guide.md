@@ -533,9 +533,11 @@ transactions and receipts roots must hold, so one endpoint suffices
 (`quorum` defaults to 1). The catch-up is proven by parent links down from
 the signed head, as over P2P. Every five minutes the node asks whether
 execution peers serve it again, and the next run returns to P2P once they
-do. `kind = "p2p"` keeps the node on execution P2P, which World Chain's
-compact configuration does: no keyless endpoint serves its blocks' receipts
-at a following pace, so the fallback there needs endpoints of your own.
+do. Each return that ends within ten minutes doubles that interval, up to
+an hour, and one that lasts resets it. `kind = "p2p"` keeps the node on
+execution P2P, which World Chain's compact configuration does: no keyless
+endpoint serves its blocks' receipts at a following pace, so the fallback
+there needs endpoints of your own.
 
 Nitro chains (Arbitrum One and Nova, Robinhood Chain) run no public execution
 P2P, so `sources.live.kind = "json_rpc"` serves their blocks. With
