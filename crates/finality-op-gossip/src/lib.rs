@@ -245,7 +245,9 @@ struct Behaviour {
 #[derive(Clone, Debug)]
 pub struct OpGossipConfig {
     pub chain_id: u64,
-    pub signer: Address,
+    /// The key the sequencer signs blocks with, which may change while the
+    /// gossip runs.
+    pub signer: watch::Receiver<Address>,
     /// Discv5 records of consensus peers to start discovery from.
     pub bootnodes: Vec<String>,
     pub discovery_port: u16,
@@ -268,7 +270,7 @@ impl OpGossipConfig {
         })?;
         Ok(Self {
             chain_id: chain.chain_id,
-            signer: op_stack.sequencer_signer,
+            signer: watch::channel(op_stack.sequencer_signer).1,
             bootnodes: op_stack.consensus_bootnodes.clone(),
             discovery_port: 0,
             listen_port: 0,
@@ -554,9 +556,10 @@ pub async fn follow(
                         else {
                             continue;
                         };
+                        let signer = *config.signer.borrow();
                         let acceptance = match verify_block(
                             config.chain_id,
-                            config.signer,
+                            signer,
                             version,
                             &message.data,
                         ) {

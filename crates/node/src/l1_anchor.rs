@@ -105,8 +105,8 @@ pub(crate) fn spawn(
         return Ok(None);
     }
     let anchor = config
-        .chain_entry()?
-        .l1_anchor
+        .l1_anchor_contracts()
+        .map_err(anyhow::Error::msg)?
         .context("the chain entry names no settlement contracts")?;
     let (sender, observations) = mpsc::channel(256);
     let config = config.clone();
@@ -151,8 +151,13 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
         },
     )?;
     let (finality, checkpoint) = l1_finality(config, l1, ethereum, &source).await?;
+    let system_config = config
+        .chain_entry()?
+        .op_stack
+        .as_ref()
+        .map(|op_stack| op_stack.system_config);
     let mut filters = FilterSet::default();
-    filters.scope.addresses = leani_l1_anchor::log_addresses(&anchor)
+    filters.scope.addresses = leani_l1_anchor::log_addresses(&anchor, system_config)
         .into_iter()
         .map(Address::from)
         .collect();
@@ -177,10 +182,17 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
         finality,
         checkpoint,
         blocks: P2pFinalizedBlocks { source, request },
-        cursor_path: config.data_dir.join("l1-anchor-cursor.json"),
+        cursor_path: anchor_cursor_path(config),
         lookback: l1.lookback_blocks,
         chain_id: config.chain_entry()?.chain_id,
+        system_config,
+        follow_game_type: l1.game_type.is_none(),
     })
+}
+
+/// Where the L1 anchor lane keeps how far it read and what it learned.
+fn anchor_cursor_path(config: &Config) -> std::path::PathBuf {
+    config.data_dir.join("l1-anchor-cursor.json")
 }
 
 /// An op-stack chain's signed heads, and the blocks its L1 anchor
@@ -205,14 +217,25 @@ pub(crate) async fn start_op_heads(
     cancellation: &CancellationToken,
 ) -> Result<OpHeads> {
     let chain = config.chain_entry()?;
-    // The slot length once every scheduled fork is active.
-    let fastest_block_ms = chain
+    let op_stack = chain
         .op_stack
         .as_ref()
-        .context("op_gossip finality needs an op-stack chain")?
-        .cadence()
-        .slot_ms(u64::MAX);
+        .context("op_gossip finality needs an op-stack chain")?;
+    // The slot length once every scheduled fork is active.
+    let fastest_block_ms = op_stack.cadence().slot_ms(u64::MAX);
     let mut gossip = leani_finality_op_gossip::OpGossipConfig::for_chain(&chain)?;
+    // A configured signer stays; otherwise the newest the L1 anchor read.
+    let learned = leani_l1_anchor::learned(&anchor_cursor_path(config))?;
+    let configured = config
+        .finality
+        .sequencer_signer()
+        .map_err(anyhow::Error::msg)?;
+    let (rotations, signer_watch) = watch::channel(
+        configured
+            .or(learned.signer)
+            .unwrap_or(op_stack.sequencer_signer),
+    );
+    gossip.signer = signer_watch;
     gossip.listen_port = config.finality.listen_port;
     gossip.discovery_port = config.finality.discovery_port;
     gossip.peers_path = Some(config.data_dir.join("op-gossip-peers.txt"));
@@ -246,6 +269,7 @@ pub(crate) async fn start_op_heads(
             fastest_block_ms,
             signed,
             observations,
+            rotations,
             cancellation.child_token(),
         )?),
         _ => None,
@@ -370,14 +394,20 @@ async fn l1_finality(
 
 /// Finalize the op-stack blocks whose dispute game the registry anchors:
 /// each game's claim is checked against the output root of the block the
-/// sequencer signed, which `signed` delivers.
+/// sequencer signed, which `signed` delivers. A new signer the `SystemConfig`
+/// names goes to `rotations`, unless the configuration fixes one.
 fn follow_dispute_games(
     config: &Config,
     fastest_block_ms: u64,
     mut signed: mpsc::Receiver<leani_finality_op_gossip::SignedBlock>,
     mut observations: mpsc::Receiver<Observation>,
+    rotations: watch::Sender<alloy_primitives::Address>,
     cancellation: CancellationToken,
 ) -> Result<watch::Receiver<FinalizedBlock>> {
+    let configured_signer = config
+        .finality
+        .sequencer_signer()
+        .map_err(anyhow::Error::msg)?;
     // Games are created within about an hour of their block; keep four
     // hours at the fastest scheduled cadence, so a fork like Denim fits too.
     let capacity = usize::try_from(4 * 3_600_000 / fastest_block_ms.max(1)).unwrap_or(usize::MAX);
@@ -399,6 +429,17 @@ fn follow_dispute_games(
                     // A closed lane drops the sender: the finality stream
                     // then ends and the lanes restart with it.
                     let Some(observation) = observation else { return };
+                    if let Observation::SignerChanged { signer } = observation {
+                        match configured_signer {
+                            Some(kept) if kept != signer => warn!(%signer, %kept, "the SystemConfig names another sequencer signer; finality.sequencer_signer stays"),
+                            Some(_) => {}
+                            None => {
+                                if rotations.send_replace(signer) != signer {
+                                    info!(%signer, "the SystemConfig names a new sequencer signer; gossip blocks are checked against it");
+                                }
+                            }
+                        }
+                    }
                     match ledger.observe(observation) {
                         Ok(Some((number, hash))) => {
                             info!(block = number, "the L1 anchor finalized a block");

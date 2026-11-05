@@ -317,6 +317,7 @@
       }
     },
     "liveSourceKind": { "enum": ["p2p", "json_rpc", "disabled"] },
+    "address": { "type": "string", "pattern": "^0x[0-9a-fA-F]{40}$" },
     "liveSource": {
       "type": "object",
       "additionalProperties": false,
@@ -463,6 +464,10 @@
         "settle_blocks": {
           "description": "op_gossip only: recent frames are pruned this many blocks below the tip while finalized waits for an L1 anchor; omitted, about one hour of blocks.",
           "$ref": "#/$defs/positiveInteger"
+        },
+        "sequencer_signer": {
+          "description": "op_gossip only: the key the sequencer signs blocks with, in place of the chain entry's and any new one the L1 anchor reads.",
+          "$ref": "#/$defs/address"
         }
       }
     },
@@ -497,6 +502,24 @@
           "type": "integer",
           "minimum": 1,
           "maximum": 50400
+        },
+        "factory": {
+          "description": "An op-stack chain's dispute game factory in place of the chain entry's; with registry and game_type, the contracts of a chain whose entry names none.",
+          "$ref": "#/$defs/address"
+        },
+        "registry": {
+          "description": "The anchor state registry in place of the chain entry's.",
+          "$ref": "#/$defs/address"
+        },
+        "game_type": {
+          "description": "The game type the anchor reads, kept even when the registry comes to respect another.",
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 4294967295
+        },
+        "claims": {
+          "description": "What the games claim: output_roots, or super_roots whose preimage holds the chain's output root.",
+          "enum": ["output_roots", "super_roots"]
         }
       }
     },

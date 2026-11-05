@@ -30,6 +30,9 @@ const SUPER_ROOT: B256 =
     b256!("0xb31a67f36e5f000742b986f81a174aae2c5cc99720cdb5dd0dc9548f16c15dc3");
 const OP_OUTPUT_ROOT: B256 =
     b256!("0x5940406c69fa8dc5c2609b6d45bcdd424db059bceb732993db4146400b5e51b0");
+/// OP Mainnet's `SystemConfig`, as its registry config names it.
+const SYSTEM_CONFIG: Address = address!("0x229047fed2591dbec1eF1118d64F7aF3dB9EB290");
+const OP_REGISTRY: Address = address!("0x23b2c62946350f4246f9f9d027e071f0264fd113");
 
 fn byte(number: u64) -> u8 {
     u8::try_from(number % 256).expect("one byte")
@@ -74,6 +77,39 @@ fn super_root_call(preimage: &[u8]) -> Vec<u8> {
     input.extend(preimage);
     input.resize(4 + 128 + preimage.len().next_multiple_of(32), 0);
     input
+}
+
+/// `ConfigUpdate(version, update_type, data)`, as a `SystemConfig` emits it.
+fn config_update(address: Address, update_type: u64, data: Vec<u8>) -> Log {
+    log(
+        address,
+        vec![
+            CONFIG_UPDATE,
+            B256::ZERO,
+            B256::from(U256::from(update_type)),
+        ],
+        data,
+        0,
+    )
+}
+
+/// The data of a signer update: `abi.encode(bytes(abi.encode(signer)))`.
+fn signer_update(signer: Address) -> Vec<u8> {
+    [
+        word(U256::from(32)),
+        word(U256::from(32)),
+        signer.into_word().0,
+    ]
+    .concat()
+}
+
+fn respected_game_type(game_type: u64) -> Log {
+    log(
+        OP_REGISTRY,
+        vec![RESPECTED_GAME_TYPE_SET],
+        word(U256::from(game_type)).to_vec(),
+        0,
+    )
 }
 
 fn log(address: Address, topics: Vec<B256>, data: Vec<u8>, transaction_index: u32) -> Log {
@@ -143,6 +179,8 @@ fn event_ids_are_the_signatures_hashes() {
             ASSERTION_CONFIRMED,
             "AssertionConfirmed(bytes32,bytes32,bytes32)",
         ),
+        (CONFIG_UPDATE, "ConfigUpdate(uint256,uint8,bytes)"),
+        (RESPECTED_GAME_TYPE_SET, "RespectedGameTypeSet(uint32)"),
     ] {
         assert_eq!(id, keccak256(signature), "{signature}");
     }
@@ -181,7 +219,7 @@ fn games_of_the_respected_type_name_their_block_and_claim() {
         vec![(7, creation_call(53_042_760))],
     );
     assert_eq!(
-        observe(&BASE, 8453, &block),
+        observe(&BASE, 8453, None, &block),
         vec![
             Observation::GameCreated {
                 game: GAME,
@@ -193,7 +231,7 @@ fn games_of_the_respected_type_name_their_block_and_claim() {
     );
     // Without its creation call the game cannot be placed.
     let unreadable = frame(1, vec![created(621)], Vec::new());
-    assert!(observe(&BASE, 8453, &unreadable).is_empty());
+    assert!(observe(&BASE, 8453, None, &unreadable).is_empty());
 }
 
 #[test]
@@ -217,7 +255,7 @@ fn super_root_games_name_their_block_by_time_and_hold_the_chains_output_root() {
         )
     };
     assert_eq!(
-        observe(&OP_MAINNET, 10, &block(&super_root_preimage())),
+        observe(&OP_MAINNET, 10, None, &block(&super_root_preimage())),
         vec![Observation::GameCreated {
             game: SUPER_GAME,
             l2_block: ClaimedBlock::Time(1_793_744_951),
@@ -228,8 +266,36 @@ fn super_root_games_name_their_block_by_time_and_hold_the_chains_output_root() {
     // one without the chain.
     let mut forged = super_root_preimage();
     forged[72] ^= 1;
-    assert!(observe(&OP_MAINNET, 10, &block(&forged)).is_empty());
-    assert!(observe(&OP_MAINNET, 8453, &block(&super_root_preimage())).is_empty());
+    assert!(observe(&OP_MAINNET, 10, None, &block(&forged)).is_empty());
+    assert!(observe(&OP_MAINNET, 8453, None, &block(&super_root_preimage())).is_empty());
+}
+
+#[test]
+fn signer_rotations_and_respected_game_types_come_from_their_contracts() {
+    let signer = address!("0xfaaca0a10e4a23c5e01485de07767547d4d8056d");
+    let block = frame(
+        26_340_000,
+        vec![
+            config_update(SYSTEM_CONFIG, 3, signer_update(signer)),
+            // A gas limit update, and a signer update another contract emits.
+            config_update(SYSTEM_CONFIG, 2, word(U256::from(60_000_000)).to_vec()),
+            config_update(Address::repeat_byte(7), 3, signer_update(signer)),
+            respected_game_type(1),
+        ],
+        Vec::new(),
+    );
+    assert_eq!(
+        observe(&OP_MAINNET, 10, Some(SYSTEM_CONFIG), &block),
+        vec![
+            Observation::SignerChanged { signer },
+            Observation::GameTypeChanged { game_type: 1 },
+        ]
+    );
+    // Without its SystemConfig, the anchor reads no signer.
+    assert_eq!(
+        observe(&OP_MAINNET, 10, None, &block),
+        vec![Observation::GameTypeChanged { game_type: 1 }]
+    );
 }
 
 #[test]
@@ -251,6 +317,7 @@ fn confirmed_assertions_name_their_block_hash() {
         observe(
             &ROBINHOOD,
             4663,
+            None,
             &frame(1, vec![confirmed, elsewhere], Vec::new())
         ),
         vec![Observation::AssertionConfirmed {
@@ -434,6 +501,8 @@ async fn the_lane_reads_each_finalized_range_once_and_resumes_after_it() {
             cursor_path: cursor_path.clone(),
             lookback: 2,
             chain_id: 4663,
+            system_config: None,
+            follow_game_type: true,
         };
         async move {
             let (sender, mut received) = mpsc::channel(64);
@@ -457,6 +526,160 @@ struct ChainRef(Arc<Chain>);
 
 #[async_trait::async_trait]
 impl FinalizedBlocks for ChainRef {
+    async fn frames(
+        &self,
+        range: BlockRange,
+        tip: FinalizedTip,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<BlockFrame>, SourceError> {
+        self.0.frames(range, tip, cancellation).await
+    }
+}
+
+/// A block's logs and its calls' inputs by transaction index.
+type Contents = (Vec<Log>, Vec<(u32, Vec<u8>)>);
+
+/// Blocks holding the contents given for their number, empty otherwise.
+struct Frames(std::collections::BTreeMap<u64, Contents>);
+
+#[async_trait::async_trait]
+impl FinalizedBlocks for Frames {
+    async fn frames(
+        &self,
+        range: BlockRange,
+        _tip: FinalizedTip,
+        _cancellation: &CancellationToken,
+    ) -> Result<Vec<BlockFrame>, SourceError> {
+        Ok((range.start().0..=range.end().0)
+            .map(|number| {
+                let (logs, inputs) = self.0.get(&number).cloned().unwrap_or_default();
+                frame(number, logs, inputs)
+            })
+            .collect())
+    }
+}
+
+/// OP Mainnet's factory creating `game` of `game_type` in transaction 6.
+fn super_game(game: Address, game_type: u64) -> (Log, (u32, Vec<u8>)) {
+    (
+        log(
+            address!("0xe5965Ab5962eDc7477C8520243A95517CD252fA9"),
+            vec![
+                DISPUTE_GAME_CREATED,
+                game.into_word(),
+                B256::from(U256::from(game_type)),
+                SUPER_ROOT,
+            ],
+            Vec::new(),
+            6,
+        ),
+        (6, super_root_call(&super_root_preimage())),
+    )
+}
+
+#[tokio::test]
+async fn the_lane_follows_a_new_respected_game_type_and_keeps_what_it_learned() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let cursor_path = directory.path().join("cursor.json");
+    let checkpoint = ConsensusCheckpoint {
+        beacon_slot: 0,
+        beacon_block_root: [0; 32],
+        execution_block_hash: BlockHash::ZERO,
+        obtained_at_unix_seconds: 0,
+        source: "fixture".to_owned(),
+    };
+    let signer = Address::repeat_byte(0x51);
+    let game = Address::repeat_byte;
+    let (old_type, old_call) = super_game(game(0xa1), 9);
+    let (unwatched, unwatched_call) = super_game(game(0xa2), 9);
+    let (new_type, new_call) = super_game(game(0xa3), 1);
+    let (after_restart, after_restart_call) = super_game(game(0xa4), 1);
+    let blocks = std::collections::BTreeMap::from([
+        (8, (vec![old_type], vec![old_call])),
+        (
+            9,
+            (
+                vec![
+                    respected_game_type(1),
+                    config_update(SYSTEM_CONFIG, 3, signer_update(signer)),
+                ],
+                Vec::new(),
+            ),
+        ),
+        (
+            10,
+            (
+                vec![unwatched.clone(), new_type],
+                vec![unwatched_call.clone(), new_call],
+            ),
+        ),
+        (
+            11,
+            (
+                vec![unwatched, after_restart],
+                vec![unwatched_call, after_restart_call],
+            ),
+        ),
+    ]);
+    let blocks = Arc::new(Frames(blocks));
+    let run = |tip: u64, follow_game_type: bool| {
+        let lane = AnchorLane {
+            anchor: OP_MAINNET,
+            finality: Arc::new(Scripted {
+                events: vec![finalized(tip)],
+            }),
+            checkpoint: checkpoint.clone(),
+            blocks: FramesRef(blocks.clone()),
+            cursor_path: cursor_path.clone(),
+            lookback: 2,
+            chain_id: 10,
+            system_config: Some(SYSTEM_CONFIG),
+            follow_game_type,
+        };
+        async move {
+            let (sender, mut received) = mpsc::channel(64);
+            let _ = lane.run(sender, CancellationToken::new()).await;
+            let mut observed = Vec::new();
+            while let Ok(observation) = received.try_recv() {
+                observed.push(match observation {
+                    Observation::GameCreated { game, .. } => format!("game {:x}", game.0[0]),
+                    other => format!("{other:?}"),
+                });
+            }
+            observed
+        }
+    };
+    assert_eq!(
+        run(10, true).await,
+        [
+            "game a1".to_owned(),
+            "GameTypeChanged { game_type: 1 }".to_owned(),
+            format!("SignerChanged {{ signer: {signer} }}"),
+            "game a3".to_owned(),
+        ]
+    );
+    assert_eq!(
+        learned(&cursor_path).expect("learned"),
+        Learned {
+            signer: Some(signer),
+            game_type: Some(1),
+        }
+    );
+    // A restart keeps the learned type; a configured type stays fixed.
+    std::fs::write(
+        directory.path().join("kept.json"),
+        std::fs::read(&cursor_path).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(run(11, true).await, ["game a4".to_owned()]);
+    std::fs::copy(directory.path().join("kept.json"), &cursor_path).unwrap();
+    assert_eq!(run(11, false).await, ["game a2".to_owned()]);
+}
+
+struct FramesRef(Arc<Frames>);
+
+#[async_trait::async_trait]
+impl FinalizedBlocks for FramesRef {
     async fn frames(
         &self,
         range: BlockRange,
