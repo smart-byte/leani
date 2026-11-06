@@ -766,7 +766,8 @@ fn generated_frame(kind: SyntheticCorpusKind, seed: u64, number: BlockNumber) ->
             encoded: Some(deterministic_bytes(seed ^ 0x33, number.0, index_u32, 128)),
             success: Some(true),
             gas_used: Some(21_000),
-            effective_gas_price: Some(quantity(2_000_000_000)),
+            // The 10 gwei base fee plus a 2 gwei tip.
+            effective_gas_price: Some(quantity(12_000_000_000)),
             blob_gas_used: blob.then_some(
                 131_072_u64.saturating_mul(u64::try_from(blob_hash_count).unwrap_or(u64::MAX)),
             ),

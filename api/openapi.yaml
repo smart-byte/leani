@@ -2658,7 +2658,7 @@ components:
       type: object
       additionalProperties: false
       required:
-        [network, blockNumber, blockHash, txHash, transactionIndex, senderAddress, toAddress, blobVersionedHashes, blobCount, totalBurnedWei, executionBurnedWei, blobBurnedWei]
+        [network, blockNumber, blockHash, txHash, transactionIndex, senderAddress, toAddress, blobVersionedHashes, blobCount, totalBurnedWei, executionBurnedWei, blobBurnedWei, tipWei]
       properties:
         network:
           type: string
@@ -2690,6 +2690,11 @@ components:
           $ref: "#/components/schemas/DecimalQuantity"
         blobBurnedWei:
           description: The block's blobBaseFee times this transaction's blob gas.
+          $ref: "#/components/schemas/DecimalQuantity"
+        tipWei:
+          description: >-
+            Priority fee paid to the block proposer: (effective gas price −
+            execution base fee) × gas used.
           $ref: "#/components/schemas/DecimalQuantity"
     BlobSchedule:
       type: object

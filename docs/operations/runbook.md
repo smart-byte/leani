@@ -60,11 +60,12 @@ the compose service name `leani`, so other services can call
 `http://leani:8080`. To add the names your clients use, mount a copy of the
 profile with them over `/etc/leani/node.toml`.
 
-The profile runs `blobs-money` as the instance `blobs-container-1-6`. A new
+The profile runs `blobs-money` as the instance `blobs-container-1-7`. A new
 processor version that changes the processor's identity takes a new instance
 ID, because the store refuses another version under an instance it holds.
-Version 0.1.0-rc.1 ran `blobs-money` 1.4.0 as `blobs-container`, and rc.2 to
-rc.8 ran 1.5.0 as `blobs-container-1-5`, so on an earlier volume the new image
+Version 0.1.0-rc.1 ran `blobs-money` 1.4.0 as `blobs-container`, rc.2 to rc.8
+ran 1.5.0 as `blobs-container-1-5`, and rc.9 to 0.1.1 ran 1.6.0 as
+`blobs-container-1-6`, so on an earlier volume the new image
 starts beside that instance and leaves it inert: nothing indexes or serves
 it, but its rows stay in the volume and count toward
 `[budgets.store] maximum_physical_bytes`. This upgrade is itself an instance

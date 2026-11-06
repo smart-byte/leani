@@ -2013,6 +2013,8 @@ export interface components {
             executionBurnedWei: components["schemas"]["DecimalQuantity"];
             /** @description The block's blobBaseFee times this transaction's blob gas. */
             blobBurnedWei: components["schemas"]["DecimalQuantity"];
+            /** @description Priority fee paid to the block proposer: (effective gas price − execution base fee) × gas used. */
+            tipWei: components["schemas"]["DecimalQuantity"];
         };
         BlobSchedule: {
             name: string;

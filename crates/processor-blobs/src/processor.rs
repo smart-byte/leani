@@ -26,8 +26,8 @@ pub const BLOCK_COLLECTION: &str = "blobs.blocks";
 pub const TRANSACTION_COLLECTION: &str = "blobs.transactions";
 pub const TRANSACTION_BLOCK_INDEX: &str = "blobs.transactions.by_block";
 /// Stamped on every block: blobs.money refetches blocks stored under an older
-/// one. Version 4 adds each transaction's `to`.
-pub const TRANSFORM_VERSION: u16 = 4;
+/// one. Version 5 adds each transaction's tip.
+pub const TRANSFORM_VERSION: u16 = 5;
 
 #[derive(Clone, Debug)]
 pub struct BlobsProcessor {
@@ -77,10 +77,10 @@ impl BlobsProcessor {
         // compatible with databases created before starts were reflected in
         // the descriptor.
         let config_hash = BlockHash::new(*blake3::hash(&encoded_schedule).as_bytes());
-        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.6.0").as_bytes());
+        let code_hash = BlockHash::new(*blake3::hash(b"leani/blobs-processor/1.7.0").as_bytes());
         let id = ProcessorId::new("blobs-money")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 6, 0);
+        let version = Version::new(1, 7, 0);
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
                 .map_err(|error| ProcessorError::Input(error.to_string()))?,
@@ -109,8 +109,8 @@ impl BlobsProcessor {
             publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 3,
-                entity_schema: "blobs.entity.v4".to_owned(),
+                delta_version: 4,
+                entity_schema: "blobs.entity.v5".to_owned(),
                 change_schema: "blobs.block-bundle.v1".to_owned(),
             },
         };
@@ -463,6 +463,16 @@ fn map_transaction(
     }
     let receipt_gas_used = required(receipt.gas_used, "receipt.gas_used")?;
     let execution_burn = checked_mul(execution_base_fee, U256::from(receipt_gas_used))?;
+    let effective_price = quantity_to_u256(required(
+        receipt.effective_gas_price,
+        "receipt.effective_gas_price",
+    )?);
+    let tip_per_gas = effective_price
+        .checked_sub(execution_base_fee)
+        .ok_or_else(|| {
+            ProcessorError::Invariant("effective gas price below base fee".to_owned())
+        })?;
+    let tip = checked_mul(tip_per_gas, U256::from(receipt_gas_used))?;
     let blob_burn = checked_mul(blob_base_fee, U256::from(expected_blob_gas))?;
     let total_burn = execution_burn
         .checked_add(blob_burn)
@@ -480,6 +490,7 @@ fn map_transaction(
         total_burn: total_burn.into(),
         execution_burn: execution_burn.into(),
         blob_burn: blob_burn.into(),
+        tip: tip.into(),
     })
 }
 
@@ -603,7 +614,8 @@ pub(crate) mod tests {
     }
 
     /// The one-blob fixture at `number` and `timestamp`, with the header's
-    /// excess blob gas and execution base fee replaced.
+    /// excess blob gas and execution base fee replaced; the receipt pays the
+    /// base fee and no tip.
     pub(crate) fn blob_frame(
         number: u64,
         timestamp: u64,
@@ -618,6 +630,13 @@ pub(crate) mod tests {
         };
         header.excess_blob_gas = Some(excess_blob_gas);
         header.base_fee_per_gas = Some(quantity(execution_base_fee));
+        let Material::Filtered {
+            value: receipts, ..
+        } = &mut frame.receipts
+        else {
+            panic!("fixture receipts are filtered");
+        };
+        receipts[0].effective_gas_price = Some(quantity(execution_base_fee));
         frame
     }
 
@@ -847,6 +866,11 @@ pub(crate) mod tests {
             quantity_to_u256(decoded.transactions[0].total_burn),
             U256::from(BLOB_GAS_PER_BLOB + 200)
         );
+        // 20 gas at an effective price of 11 over a base fee of 10.
+        assert_eq!(
+            quantity_to_u256(decoded.transactions[0].tip),
+            U256::from(20)
+        );
         assert_eq!(decoded.transactions[0].to, Address::new([6; 20]));
 
         let cursor = ProcessorCursor {
@@ -878,6 +902,23 @@ pub(crate) mod tests {
                 .entity("blobs.block_bundles", &frame.block.number.0.to_be_bytes())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn an_effective_price_below_the_base_fee_is_an_invariant_error() {
+        let processor = BlobsProcessor::default();
+        let mut frame = frame(Completeness::DatasetDeclared);
+        let Material::Filtered {
+            value: receipts, ..
+        } = &mut frame.receipts
+        else {
+            panic!("fixture receipts are filtered");
+        };
+        receipts[0].effective_gas_price = Some(quantity(9));
+        assert!(matches!(
+            processor.map(&frame).await,
+            Err(ProcessorError::Invariant(reason)) if reason == "effective gas price below base fee"
+        ));
     }
 
     #[tokio::test]

@@ -222,6 +222,8 @@ export interface BlobTransaction {
   executionBurnedWei: string;
   /** The block's `blobBaseFee` times this transaction's blob gas. */
   blobBurnedWei: string;
+  /** Priority fee paid to the block proposer: (effective price − base fee) × gas used. */
+  tipWei: string;
 }
 
 export interface BlobsSnapshotEntry {

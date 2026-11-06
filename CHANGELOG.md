@@ -299,6 +299,17 @@ record, and documented RPC contracts.
   aside, and then rebuilds raw history from its sources. Frames read from an
   archive written before carry no fee recipient, so a processor that needs
   headers takes those blocks from the next source.
+- Breaking: `blobs-money` 1.7.0 reports each blob transaction's priority fee
+  as `tipWei`, (effective gas price − execution base fee) × gas used, in its
+  changes, its `blobs.transactions` entities, the blobs query routes, and the
+  SDK's `BlobTransaction`: a rollup's L1 cost is its execution and blob burn
+  plus this tip. It stores a new entity and delta encoding (`blobs.entity.v5`,
+  delta version 4; the change schema stays `blobs.block-bundle.v1` and only
+  gains the field), and blocks carry `transformVersion` 5. Rebuild existing
+  instances as for 1.6.0: set `version = "1.7.0"` and configure a new
+  `instance`, which indexes from its `start_block`. `deploy/container.toml`
+  runs it as the new instance `blobs-container-1-7`, and the 1.6.0 rows of
+  `blobs-container-1-6` stay inert in an earlier volume.
 - Breaking: `block-summary` 1.3.0 publishes each block's `feeRecipient`, in
   its changes, its entities, the `/latest` and `/blocks/{number}` query routes,
   the SDK's `BlockSummary`, and `leani subscribe blocks` output. It stores a
