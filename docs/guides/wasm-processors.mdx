@@ -389,6 +389,34 @@ P2P block map alike. A log is kept when its transaction matches the
 transaction filters and the log matches the address and topic filters. The
 block's finality is never visible, so a delta never depends on it.
 
+Each field arrives only with its capability; without it the field is `None`
+(`null` in TypeScript) or empty, whatever the source holds. The names are the
+Rust SDK's; TypeScript spells them in camel case.
+
+| Capability | Fields |
+|---|---|
+| `header` | the header's `gas_limit`, `gas_used`, `base_fee_per_gas`, `blob_gas_used`, `excess_blob_gas`, and `fee_recipient` |
+| `block_size` | the header's `size_bytes` and `transaction_count` |
+| `body` | a transaction's `to`, `nonce`, `gas_limit`, and `value` |
+| `calldata` | a transaction's `input` |
+| `senders` | a transaction's `from` |
+| `blob_fields` | a type-3 transaction's `max_fee_per_blob_gas` and `blob_versioned_hashes`, and its receipt's `blob_gas_used` |
+| `receipt_outcome` | a receipt's `success`, `gas_used`, and `effective_gas_price` |
+| `receipts` | a receipt's `logs`, with `receipt_outcome` |
+| `logs` | the block's `logs`; a log's `transaction_hash` also needs `logs_with_transaction_hash` |
+| `withdrawals` | the block's `withdrawals` |
+
+`transactions` stands for `body`, `calldata`, `senders`, `blob_fields`, and
+`block_size`. A transaction's hash, index, and type, and a receipt's, come
+with any group of theirs.
+
+Not every source fills every combination. Xatu's public tables fill
+`blob_fields` and `block_size` only for type-3 transactions, without
+`calldata`, `logs`, `withdrawals`, or a sender or recipient filter, and
+`logs` only without transaction or receipt groups. Such a manifest takes its
+history from eraE or execution P2P instead: see
+[Xatu](/docs/concepts/data-sources/#3-xatu).
+
 **Reduction.** `block_local` processors reduce each block alone: they cannot
 read state, and their keys must not repeat across blocks. `ordered`
 processors reduce in chain order and may read what earlier blocks wrote; their
