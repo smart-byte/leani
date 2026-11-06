@@ -2,7 +2,7 @@ import { expect, test } from "bun:test";
 import type { BlobsSnapshotEntry, BlockSummary, ChangeEnvelope } from "@smart-byte/leani-sdk";
 import { unpack } from "../../site/src/lib/live/feed.ts";
 import type { HubEvent } from "../../site/src/lib/live/model.ts";
-import { inboxBatch, pack, postings, toEvent } from "./hub.ts";
+import { inboxBatch, pack, placeBatches, postings, toEvent } from "./hub.ts";
 
 const change = (operation: string, number: number, data: unknown, finality = "unattested") => ({
   apiVersion: "1", sequence: String(number), cursor: `c${number}`, operation, originKind: "live",
@@ -100,4 +100,26 @@ test("a packed recording keeps two blocks a second of a chain, and from before i
     replay.filter(({ event }) => event.type === type).map(({ event }) => ("number" in event ? event.number : (event as { through: number }).through));
   expect(through("block")).toEqual([100, 105]);
   expect(through("level")).toEqual([100, 105]);
+});
+
+test("a batch's blocks follow the block its parent check names, which Base's whole-second timestamps no longer do", () => {
+  const base = { genesisBlock: 0, genesisTime: 1_686_789_347, blockSeconds: 2, until: 1_793_901_600 };
+  const check = (number: number) => `0x${number.toString(16).padStart(40, "0")}`;
+  const seen = new Map([53_625_064, 53_625_065, 53_625_066].map((number) => [check(number), number]));
+  const run = (time: number, parent: number, transactions = [3]) => ({
+    relTimestamp: time - base.genesisTime, l1Origin: 1, parentCheck: check(parent), transactions,
+  });
+  // After Denim: three 200 ms blocks, two in one second, make one run; a block after a parent the hub never saw is left out.
+  expect(
+    placeBatches(
+      [run(1_793_915_388, 53_625_064), run(1_793_915_388, 53_625_065), run(1_793_915_389, 53_625_066), run(1_793_915_390, 53_625_099)],
+      base,
+      (parentCheck) => seen.get(parentCheck),
+      () => undefined,
+    ),
+  ).toEqual([{ first: 53_625_065, last: 53_625_067, firstTime: 1_793_915_388, lastTime: 1_793_915_389, txs: 9, verified: true }]);
+  // Before it, an unseen parent leaves the block the timestamp names, checked against the hash held for its parent.
+  expect(placeBatches([run(1_793_800_001, 1, [2, 4])], base, () => undefined, () => "0xffff")).toEqual([
+    { first: 53_505_327, last: 53_505_328, firstTime: 1_793_800_001, lastTime: 1_793_800_003, txs: 6, verified: false },
+  ]);
 });
