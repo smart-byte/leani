@@ -7,7 +7,7 @@ import {
   type ChangeEnvelope,
 } from "@smart-byte/leani-sdk";
 import { POSTERS, type HubEvent, type Level } from "../../site/src/lib/live/model.ts";
-import { Channels, blobData, channelBatches, frames } from "./batches.ts";
+import { Channels, blobData, channelBatches, frames, type Batch as Run, type Clock } from "./batches.ts";
 
 type Block = Extract<HubEvent, { type: "block" }>;
 type Batch = Extract<HubEvent, { type: "batch" }>;
@@ -33,11 +33,16 @@ const PACKED_HISTORY_MS = DECODED_POSTING_SECONDS * 1_000;
 const PACKED_SPACING_MS = 500;
 const ETHEREUM = "ethereum-mainnet";
 const BEACON_GENESIS = 1_606_824_023;
-const OP_STACK: Record<string, { genesisBlock: number; genesisTime: number; blockSeconds: number; until?: number }> = {
+const OP_STACK: Record<string, OpStackClock> = {
   "op-mainnet": { genesisBlock: 105_235_063, genesisTime: 1_686_068_903, blockSeconds: 2 },
-  // Denim's 200 ms blocks change which blocks a batch's timestamps name.
+  // Denim's 200 ms blocks keep whole-second timestamps, so from then on only a batch's parent check names its blocks.
   "base-mainnet": { genesisBlock: 0, genesisTime: 1_686_789_347, blockSeconds: 2, until: 1_793_901_600 },
 };
+
+interface OpStackClock extends Clock {
+  genesisBlock: number;
+  until?: number;
+}
 /**
  * Nitro chains whose batch posts the hub reads: block `genesisBlock` + n is
  * message n, as NodeInterface's `findBatchContainingBlock` agrees at batch
@@ -143,12 +148,56 @@ async function fetchBlobs(beacon: string, timestamp: number, hashes: string[]): 
   return body.data.map((blob) => Buffer.from(blob.replace(/^0x/, ""), "hex"));
 }
 
+export interface Placed {
+  first: number;
+  last: number;
+  firstTime: number;
+  lastTime: number;
+  txs: number;
+  verified: boolean | null;
+}
+
 /**
- * Decode each posting's blobs into batches, one posting at a time so a
- * channel's frames arrive in order. `hashOf` names a rollup block's hash
- * where the hub still holds it, to check a batch's parent.
+ * Number a channel's runs: each starts after the block whose hash its parent
+ * check begins, or, while the chain's block time holds, at the block its
+ * timestamp names, checked against `hashOf` that block's parent. A single
+ * block that follows the run before it joins that run.
  */
-function batcher(beacon: string, emit: (event: HubEvent) => void, hashOf: (chain: string, number: number) => string | undefined) {
+export function placeBatches(
+  runs: Run[],
+  clock: OpStackClock,
+  numberOf: (parentCheck: string) => number | undefined,
+  hashOf: (number: number) => string | undefined,
+): Placed[] {
+  const placed: Placed[] = [];
+  for (const run of runs) {
+    const firstTime = clock.genesisTime + run.relTimestamp;
+    const timed = clock.until === undefined || firstTime < clock.until;
+    const parent = numberOf(run.parentCheck);
+    if (parent === undefined && !timed) continue;
+    const first = parent === undefined ? clock.genesisBlock + Math.floor(run.relTimestamp / clock.blockSeconds) : parent + 1;
+    const parentHash = parent === undefined ? hashOf(first - 1) : undefined;
+    const verified = parent !== undefined ? true : parentHash === undefined ? null : parentHash.toLowerCase().startsWith(run.parentCheck);
+    const last = first + run.transactions.length - 1;
+    const lastTime = timed ? firstTime + (run.transactions.length - 1) * clock.blockSeconds : firstTime;
+    const txs = run.transactions.reduce((total, count) => total + count, 0);
+    const previous = placed.at(-1);
+    if (previous && run.transactions.length === 1 && previous.verified === verified && first === previous.last + 1) {
+      Object.assign(previous, { last, lastTime, txs: previous.txs + txs });
+    } else {
+      placed.push({ first, last, firstTime, lastTime, txs, verified });
+    }
+  }
+  return placed;
+}
+
+/** Decode one posting at a time, so a channel's frames arrive in order. */
+function batcher(
+  beacon: string,
+  emit: (event: HubEvent) => void,
+  numberOf: (chain: string, parentCheck: string) => number | undefined,
+  hashOf: (chain: string, number: number) => string | undefined,
+) {
   const channels = new Map<string, Channels>();
   let queue = Promise.resolve();
   const decode = async (posting: Posting) => {
@@ -164,18 +213,19 @@ function batcher(beacon: string, emit: (event: HubEvent) => void, hashOf: (chain
     }
     const open = channels.get(posting.chain) ?? new Channels();
     channels.set(posting.chain, open);
-    const { genesisBlock, genesisTime, blockSeconds, until } = OP_STACK[posting.chain];
+    const clock = OP_STACK[posting.chain];
     for (const blob of blobs) {
       for (const frame of frames(blobData(blob))) {
         const channel = open.add(frame);
         if (!channel) continue;
-        const { batches, bytes } = channelBatches(channel.bytes, { genesisTime, blockSeconds });
-        for (const batch of batches) {
-          const first = genesisBlock + Math.floor(batch.relTimestamp / blockSeconds);
-          const firstTime = genesisTime + batch.relTimestamp;
-          const lastTime = firstTime + (batch.transactions.length - 1) * blockSeconds;
-          if (until !== undefined && lastTime >= until) continue;
-          const parent = hashOf(posting.chain, first - 1);
+        const { batches, bytes } = channelBatches(channel.bytes, clock);
+        const placed = placeBatches(
+          batches,
+          clock,
+          (parentCheck) => numberOf(posting.chain, parentCheck),
+          (number) => hashOf(posting.chain, number),
+        );
+        for (const batch of placed) {
           emit({
             type: "batch",
             chain: posting.chain,
@@ -184,14 +234,9 @@ function batcher(beacon: string, emit: (event: HubEvent) => void, hashOf: (chain
             l1Time: posting.timestamp,
             at: Date.now(),
             blobs: channel.frames,
-            first,
-            last: first + batch.transactions.length - 1,
-            firstTime,
-            lastTime,
-            txs: batch.transactions.reduce((total, count) => total + count, 0),
+            ...batch,
             bytes: channel.bytes.length,
             raw: bytes,
-            verified: parent === undefined ? null : parent.toLowerCase().startsWith(batch.parentCheck),
             source: "blobs",
           });
         }
@@ -362,6 +407,9 @@ function serve(
   const lanes = new Map<string, Lane>(
     [...shown].map((chain) => [chain, { blocks: [], levels: [], batches: [], connected: false }]),
   );
+  // Each chain's blocks by their hash's first 20 bytes, as long as a posting
+  // may still name them: a faster chain outruns the lanes' replay window.
+  const parents = new Map<string, Map<string, { number: number; time: number }>>();
   const clients = new Set<ReadableStreamDefaultController<Uint8Array>>();
   const encoder = new TextEncoder();
   const frame = (name: string, data: unknown) => encoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -373,6 +421,13 @@ function serve(
     if (event.type === "block") {
       lane.blocks.push(event);
       if (lane.blocks.length > RECENT_BLOCKS) lane.blocks.shift();
+      const index = parents.get(event.chain) ?? new Map<string, { number: number; time: number }>();
+      parents.set(event.chain, index);
+      index.set(event.hash.slice(0, 42).toLowerCase(), { number: event.number, time: event.time });
+      for (const [check, block] of index) {
+        if (block.time >= event.time - DECODED_POSTING_SECONDS) break;
+        index.delete(check);
+      }
     } else if (event.type === "level") {
       lane.levels.push(event);
       if (lane.levels.length > RECENT_LEVELS) lane.levels.shift();
@@ -393,7 +448,8 @@ function serve(
   };
   const hashOf = (chain: string, number: number) =>
     lanes.get(chain)?.blocks.find((block) => block.number === number)?.hash;
-  const decode = beacon ? batcher(beacon, emit, hashOf) : null;
+  const numberOf = (chain: string, parentCheck: string) => parents.get(chain)?.get(parentCheck)?.number;
+  const decode = beacon ? batcher(beacon, emit, numberOf, hashOf) : null;
   const read = ethereumRpc ? inbox(ethereumRpc, emit, (chain) => lanes.get(chain)?.blocks ?? []) : null;
   // A node replays its retained window when the stream reconnects: each posting is read once.
   const seenPostings = new Set<string>();
