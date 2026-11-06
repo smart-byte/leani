@@ -51,6 +51,9 @@ pub struct BlobTransactionEntity {
     pub execution_burn: Quantity,
     /// The block's `blob_base_fee` times this transaction's blob gas.
     pub blob_burn: Quantity,
+    /// Priority fee paid to the block proposer: (effective price − base fee) ×
+    /// gas used.
+    pub tip: Quantity,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

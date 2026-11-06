@@ -4021,6 +4021,9 @@ pub struct BlobTransaction {
     execution_burned_wei: String,
     /// The block's protocol blob base fee times this transaction's blob gas.
     blob_burned_wei: String,
+    /// Priority fee paid to the block proposer: (effective price − base fee) ×
+    /// gas used.
+    tip_wei: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -4063,6 +4066,7 @@ impl From<&BlobTransactionEntity> for BlobTransaction {
             total_burned_wei: quantity_decimal(value.total_burn),
             execution_burned_wei: quantity_decimal(value.execution_burn),
             blob_burned_wei: quantity_decimal(value.blob_burn),
+            tip_wei: quantity_decimal(value.tip),
         }
     }
 }
@@ -8904,6 +8908,7 @@ mod tests {
                     total_burn: Quantity::new([7; 32]),
                     execution_burn: Quantity::new([8; 32]),
                     blob_burn: Quantity::new([9; 32]),
+                    tip: Quantity::new([1; 32]),
                 }
             })
             .collect();
@@ -9560,6 +9565,7 @@ mod tests {
             total_burn: Quantity::new([6; 32]),
             execution_burn: Quantity::new([7; 32]),
             blob_burn: Quantity::new([8; 32]),
+            tip: Quantity::new([1; 32]),
         };
         let value = serde_json::to_value(BlobTransaction::from(&entity)).expect("JSON");
         assert_eq!(value["transactionIndex"], 3);
@@ -9585,6 +9591,7 @@ mod tests {
             total_burn: Quantity::new([6; 32]),
             execution_burn: Quantity::new([7; 32]),
             blob_burn: Quantity::new([8; 32]),
+            tip: Quantity::new([1; 32]),
         };
         let bundle = BlobsDelta {
             block: block(),

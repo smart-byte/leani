@@ -14,7 +14,7 @@ These processors ship in the standard binary. Downstream projects can assemble
 a custom binary and register independent native processors through the public
 factory/registry API; see [Build a custom processor](https://leani.dev/docs/guides/custom-processor/).
 
-## blobs-money 1.6.0
+## blobs-money 1.7.0
 
 Block-local Dencun-and-later blob economics and type-3 transaction output. It
 accepts the filtered Xatu projection or complete normalized execution frames.
@@ -47,6 +47,12 @@ Each transaction reports its `toAddress` besides its `senderAddress`. EIP-4844
 forbids contract creation, so every blob transaction has one: usually a
 rollup's inbox, which stays put while its batchers rotate. Version 1.6 adds it
 and reads the `Body` group for it.
+
+Each transaction also reports its `tipWei`, the priority fee paid to the block
+proposer: (effective gas price − execution base fee) × gas used, from the
+`ReceiptOutcome` group it already reads. With `executionBurnedWei` and
+`blobBurnedWei`, it accounts for everything the transaction paid. Version 1.7
+adds it.
 
 ## evm-events 1.1.0
 

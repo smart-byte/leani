@@ -895,7 +895,7 @@ software could theoretically implement:
     {
       "id": "blobs-money",
       "instance": "blobs-production",
-      "version": "1.6.0",
+      "version": "1.7.0",
       "codeHash": "0x...",
       "configHash": "0x...",
       "genericApi": "processor-v1",
@@ -978,6 +978,7 @@ export interface BlobTransaction {
   totalBurnedWei: string;
   executionBurnedWei: string;
   blobBurnedWei: string;
+  tipWei: string;
 }
 
 export interface BlobSchedule {
