@@ -47,8 +47,13 @@ export interface Stage {
   name: string;
   evidence: string;
   undo: string;
-  typical: string;
+  /** How long after a block it typically comes: one value for every chain,
+   * or each chain's by its id. */
+  typical: string | Record<string, string>;
 }
+
+const settles = (family: Family) =>
+  Object.fromEntries(CHAINS.filter((chain) => chain.family === family && chain.settlement).map((chain) => [chain.id, chain.settlement!.typical]));
 
 export const STAGES: Record<Family, Stage[]> = {
   ethereum: [
@@ -99,7 +104,7 @@ export const STAGES: Record<Family, Stage[]> = {
       evidence:
         'The batcher compresses a run of blocks into a channel and posts it as blobs to the chain’s batch inbox. Leani’s blobs processor sees the transaction in an Ethereum block; the page decodes which blocks the blobs carry. From here on, anyone can derive the blocks from Ethereum.',
       undo: 'An Ethereum reorg of the block that carries the blobs; the batcher then posts them again.',
-      typical: 'every ~30 s on Base, minutes on OP Mainnet',
+      typical: { 'op-mainnet': 'minutes', 'base-mainnet': '~30 s' },
     },
     {
       level: null,
@@ -115,7 +120,7 @@ export const STAGES: Record<Family, Stage[]> = {
       evidence:
         'A dispute game claimed the block’s output root, or on OP Mainnet a super root over it, and the anchor state registry moved to it after its challenge window, read from finalized Ethereum blocks and their receipts: withdrawals can complete.',
       undo: 'Never.',
-      typical: '~5 d on Base, ~7 d on OP Mainnet',
+      typical: settles('op-stack'),
     },
   ],
   arbitrum: [
@@ -148,7 +153,7 @@ export const STAGES: Record<Family, Stage[]> = {
       evidence:
         'The rollup confirmed the assertion after the challenge period, read from finalized Ethereum blocks and their receipts.',
       undo: 'Never.',
-      typical: '~6.4 d',
+      typical: settles('arbitrum'),
     },
   ],
 };
