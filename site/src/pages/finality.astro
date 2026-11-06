@@ -4,7 +4,7 @@ import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
 import TerminalFrame from '../components/TerminalFrame.astro';
 import { hlShell, hlToml, hlTs } from '../lib/highlight';
-import { CHAINS, FAMILY_LABELS, STAGES, type Family } from '../lib/live/model';
+import { CHAINS, FAMILY_LABELS, STAGES, type Family, type Stage } from '../lib/live/model';
 
 const families: Family[] = ['op-stack', 'ethereum', 'arbitrum'];
 const columns = [
@@ -12,6 +12,13 @@ const columns = [
   ['confirmed', 'confirmed after'], ['finalized', 'final after'], ['settled', 'settled'],
 ];
 const anchored = CHAINS.filter((chain) => chain.settlement);
+/** A stage's typical time: once when every chain shares it, else per chain in the page's chain order. */
+const timings = (typical: Stage['typical']) => {
+  if (typeof typical === 'string') return [{ chain: null, value: typical }];
+  const values = new Set(Object.values(typical));
+  if (values.size === 1) return [{ chain: null, value: [...values][0] }];
+  return CHAINS.filter((chain) => chain.id in typical).map((chain) => ({ chain, value: typical[chain.id] }));
+};
 
 const levels = [
   {
@@ -145,9 +152,12 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
         <ol class="stages">
           {STAGES[family].map((stage) => (
             <li class:list={['stage-card', { milestone: stage.level === null }]}>
-              <p class="stage-level mono">{stage.level ?? 'milestone'}<span>{stage.typical}</span></p>
+              <p class="stage-level mono">{stage.level ?? 'milestone'}</p>
               <h3>{stage.name}</h3>
               <p>{stage.evidence}</p>
+              <p class="typical"><span class="mono">typical</span><span class="timings">{timings(stage.typical).map(({ chain, value }) => (
+                <span class="timing">{chain && <><i class="chip" style={`--chain: ${chain.color}`}></i>{chain.label} </>}<b>{value}</b></span>
+              ))}</span></p>
               <p class="undo"><span class="mono">undone by</span> {stage.undo}</p>
             </li>
           ))}
@@ -466,10 +476,17 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   .stage-card h3, .level-card h3 { font-size: 1.05rem; margin-block: 0.3rem 0.5rem; }
   .stage-card p, .level-card p { color: var(--ink-dim); font-size: 0.9rem; }
   .stage-level { display: flex; justify-content: space-between; gap: 0.6rem; color: var(--accent); font-size: 0.74rem; text-transform: uppercase; letter-spacing: 0.06em; }
-  .stage-level span { color: var(--ink-dim); text-transform: none; letter-spacing: 0; text-align: right; }
   .milestone .stage-level { color: var(--ink-dim); }
-  .undo { margin-top: 0.6rem; font-size: 0.82rem !important; }
-  .undo .mono { color: var(--ink); font-size: 0.72rem; margin-right: 0.3rem; }
+  /* Every card in a row shares its five row heights, so titles, timings and undos line up. */
+  .stage-card { display: grid; grid-row: span 5; grid-template-rows: subgrid; row-gap: 0.5rem; }
+  .stage-card > * { margin: 0; }
+  .undo, .typical { font-size: 0.82rem !important; }
+  .undo .mono, .typical > .mono { color: var(--ink); font-size: 0.72rem; margin-right: 0.3rem; }
+  .typical { display: flex; align-items: baseline; }
+  .timings { display: flex; flex-wrap: wrap; column-gap: 0.7rem; }
+  .timing { white-space: nowrap; }
+  .timing b { color: var(--ink); font-weight: 500; }
+  .timing .chip { margin-right: 0.35rem; }
 
   .levels { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.9rem; margin-bottom: 1.2rem; }
   .level-card pre { margin-top: 0.7rem; font-size: 0.76rem; background: #0b0f0d; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.5rem 0.65rem; overflow-x: auto; }
