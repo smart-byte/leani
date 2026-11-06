@@ -11,19 +11,20 @@ export interface Chain {
   family: Family;
   chainId: number;
   color: string;
-  /** Where leani's `finalized` comes from: Ethereum's own consensus, the
-   * entry's L1 anchor, or nothing yet. */
-  finality: 'consensus' | 'dispute-games' | 'bold' | 'none';
+  /** How Ethereum settles the rollup, which leani reports as `finalized`:
+   * the claims its L1 anchor reads, and how long after a block that
+   * typically takes. `null` for Ethereum, final by its own consensus. */
+  settlement: { via: string; typical: string; seconds: number } | null;
 }
 
 // Ethereum sits in the middle, the op-stack chains to its left, the Nitro
 // chains to its right, so every blob and anchor line runs to one column.
 export const CHAINS: Chain[] = [
-  { id: 'op-mainnet', label: 'OP Mainnet', family: 'op-stack', chainId: 10, color: '#ff4d5e', finality: 'none' },
-  { id: 'base-mainnet', label: 'Base', family: 'op-stack', chainId: 8453, color: '#3d7bff', finality: 'dispute-games' },
-  { id: 'ethereum-mainnet', label: 'Ethereum', family: 'ethereum', chainId: 1, color: '#9aa8ff', finality: 'consensus' },
-  { id: 'arbitrum-one', label: 'Arbitrum One', family: 'arbitrum', chainId: 42161, color: '#2fa8f5', finality: 'bold' },
-  { id: 'robinhood-mainnet', label: 'Robinhood Chain', family: 'arbitrum', chainId: 4663, color: '#c8f53a', finality: 'bold' },
+  { id: 'op-mainnet', label: 'OP Mainnet', family: 'op-stack', chainId: 10, color: '#ff4d5e', settlement: { via: 'super-root games', typical: '~7 d', seconds: 7 * 86400 } },
+  { id: 'base-mainnet', label: 'Base', family: 'op-stack', chainId: 8453, color: '#3d7bff', settlement: { via: 'dispute games', typical: '~5 d', seconds: 5 * 86400 } },
+  { id: 'ethereum-mainnet', label: 'Ethereum', family: 'ethereum', chainId: 1, color: '#9aa8ff', settlement: null },
+  { id: 'arbitrum-one', label: 'Arbitrum One', family: 'arbitrum', chainId: 42161, color: '#2fa8f5', settlement: { via: 'BoLD', typical: '~6.4 d', seconds: 6.4 * 86400 } },
+  { id: 'robinhood-mainnet', label: 'Robinhood Chain', family: 'arbitrum', chainId: 4663, color: '#c8f53a', settlement: { via: 'BoLD', typical: '~6.4 d', seconds: 6.4 * 86400 } },
 ];
 
 export const POSTERS: { chain: string; from: string; to: string }[] = [
@@ -47,8 +48,6 @@ export interface Stage {
   evidence: string;
   undo: string;
   typical: string;
-  /** Where its tick sits on the age axis, in seconds after the block. */
-  seconds: number;
 }
 
 export const STAGES: Record<Family, Stage[]> = {
@@ -60,7 +59,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'At least two execution peers served the same header, it passes leani’s header rules (base fee, gas limit, blob gas, slot timing, fork fields), and it extends the delivered chain.',
       undo: 'A reorg, an attested head on another block, or 60 s without an attestation.',
       typical: '~2–5 s',
-      seconds: 3,
     },
     {
       level: 'attested',
@@ -69,7 +67,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'At least 342 of the 512 sync-committee members signed it or a descendant, verified locally from a light-client update.',
       undo: 'A reorg.',
       typical: '~15 s',
-      seconds: 15,
     },
     {
       level: 'confirmed',
@@ -78,7 +75,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The fast confirmation rule: enough of the slot’s attestations back the block that no reorg removes it while the network is synchronous. The page reads it from a public beacon node’s fast_confirmation stream, the source leani’s confirmed level will read.',
       undo: 'Only a reorg during a long network partition.',
       typical: '~13 s',
-      seconds: 13,
     },
     {
       level: 'finalized',
@@ -86,7 +82,6 @@ export const STAGES: Record<Family, Stage[]> = {
       evidence: 'Casper FFG finality, verified locally from a light-client finality update.',
       undo: 'Never.',
       typical: '~13–19 min',
-      seconds: 16 * 60,
     },
   ],
   'op-stack': [
@@ -97,7 +92,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The chain’s sequencer signed the block in its gossip, checked against the key in leani’s chain entry. Blocks reach attested about as fast as unattested.',
       undo: 'Only if the sequencer reorgs its own unsafe chain.',
       typical: '~1 s',
-      seconds: 1,
     },
     {
       level: null,
@@ -106,7 +100,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The batcher compresses a run of blocks into a channel and posts it as blobs to the chain’s batch inbox. Leani’s blobs processor sees the transaction in an Ethereum block; the page decodes which blocks the blobs carry. From here on, anyone can derive the blocks from Ethereum.',
       undo: 'An Ethereum reorg of the block that carries the blobs; the batcher then posts them again.',
       typical: 'every ~30 s on Base, minutes on OP Mainnet',
-      seconds: 4 * 60,
     },
     {
       level: null,
@@ -115,16 +108,14 @@ export const STAGES: Record<Family, Stage[]> = {
         'The Ethereum block that carries the blobs is finalized, so the blocks’ data can no longer change. Op-stack nodes call these blocks finalized; leani does not report it as a level.',
       undo: 'Never.',
       typical: '~15–30 min',
-      seconds: 20 * 60,
     },
     {
       level: 'finalized',
       name: 'Settled on Ethereum',
       evidence:
-        'A dispute game claimed the block’s output root and the anchor state registry moved to it after its challenge window, read from finalized Ethereum blocks and their receipts: withdrawals can complete. Of these chains, only Base has an L1 anchor in leani.',
+        'A dispute game claimed the block’s output root, or on OP Mainnet a super root over it, and the anchor state registry moved to it after its challenge window, read from finalized Ethereum blocks and their receipts: withdrawals can complete.',
       undo: 'Never.',
-      typical: '~5 d on Base',
-      seconds: 5 * 86400,
+      typical: '~5 d on Base, ~7 d on OP Mainnet',
     },
   ],
   arbitrum: [
@@ -135,7 +126,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The sequencer feed message carries the block’s hash signed by the batch poster. Endpoints only carry blocks: one with another hash is refused.',
       undo: 'Only if the sequencer reorgs its own chain.',
       typical: '<1 s',
-      seconds: 0.5,
     },
     {
       level: null,
@@ -144,7 +134,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The batch poster posts the sequenced transactions to Ethereum, calling the chain’s SequencerInbox with its message counts before and after the batch: the page reads which blocks the batch carries from that call. Leani does not report this as a level.',
       undo: 'An Ethereum reorg before the batch’s L1 block is final.',
       typical: 'minutes',
-      seconds: 5 * 60,
     },
     {
       level: null,
@@ -152,7 +141,6 @@ export const STAGES: Record<Family, Stage[]> = {
       evidence: 'A validator posts a BoLD assertion naming the block hash at the end of its range. Anyone can challenge it.',
       undo: 'A successful challenge.',
       typical: '~1 h',
-      seconds: 3600,
     },
     {
       level: 'finalized',
@@ -161,7 +149,6 @@ export const STAGES: Record<Family, Stage[]> = {
         'The rollup confirmed the assertion after the challenge period, read from finalized Ethereum blocks and their receipts.',
       undo: 'Never.',
       typical: '~6.4 d',
-      seconds: 6.4 * 86400,
     },
   ],
 };

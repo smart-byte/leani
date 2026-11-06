@@ -1,6 +1,6 @@
 import { expect, test } from 'bun:test';
 import type { Level } from '../src/lib/live/model';
-import { applyLevel, bornAt, landingBlocks } from '../src/lib/live/scene';
+import { applyLevel, bornAt, landingBlocks, turnsAt } from '../src/lib/live/scene';
 
 const block = (number: number, time: number) => ({
   number, time, born: time, seen: (time + 3) * 1000, level: 'attested' as Level, levelAt: (time + 3) * 1000,
@@ -54,4 +54,19 @@ test("blocks that share a second spread across it by their place in it", () => {
   // A chain with a second or more per block, or one not measured yet, keeps its timestamps.
   expect(bornAt(1_000, 7, 6, 2)).toBe(1_000);
   expect(bornAt(1_000, 105, 100, null)).toBe(1_000);
+});
+
+test('an Ethereum block turns upright once confirmed, and at 40 s at the latest', () => {
+  const capsule = (level: Level, levelAt: number, confirmedAt: number | null) => ({
+    born: 1_000, level, levelAt: levelAt * 1000, confirmedAt: confirmedAt === null ? null : confirmedAt * 1000,
+  });
+  // The fast confirmation rule confirmed it 13 s after its slot.
+  expect(turnsAt(capsule('confirmed', 1_013, 1_013))).toBeCloseTo(13);
+  // Not confirmed yet, or confirmed late.
+  expect(turnsAt(capsule('attested', 1_003, null))).toBe(40);
+  expect(turnsAt(capsule('confirmed', 1_090, 1_090))).toBe(40);
+  // Confirmed by the first marker the page saw, which does not time it: it turns when the page learns.
+  expect(turnsAt(capsule('confirmed', 1_020, null))).toBeCloseTo(20);
+  // Final without a confirmation the page saw: finality comes long after 40 s.
+  expect(turnsAt(capsule('finalized', 1_900, null))).toBe(40);
 });

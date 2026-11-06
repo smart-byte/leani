@@ -2,7 +2,7 @@
 // with age on a log axis. A rollup's posted blocks drop as a blob into the
 // Ethereum block carrying them and are final once that block is.
 
-import { CHAINS, POSTERS, RANK, STAGES, type Chain, type HubEvent, type Level } from './model';
+import { CHAINS, POSTERS, RANK, type Chain, type HubEvent, type Level } from './model';
 
 /** What the axis spans: the realtime window, and with the days of settlement open. */
 const WINDOW = 30 * 60;
@@ -15,7 +15,10 @@ const BED = 8;
 const SETTLE_AFTER = 12;
 const SETTLE_SECONDS = 60;
 const BLOB_PX = 2.5;
-/** At this age a block turns upright, before it is too small to read, then narrows into its bar while its border fades. */
+/** Below this width each row's name moves into a strip along its top, so the graph gets the full width. */
+const NARROW = 640;
+const NAME_STRIP = 16;
+/** A block turns upright once confirmed, at this age at the latest, then narrows into its bar while its border fades. */
 const ROTATE_AFTER = 40;
 const ROTATE_SECONDS = 5;
 const SHAPE_SECONDS = 15;
@@ -150,6 +153,7 @@ export interface Passage {
 export interface Hover {
   chain: Chain;
   block: { number: number; hash: string; level: Level; age: number; txs: number | null; gas: number | null; blobs: Record<string, number> | null } | null;
+  followed: boolean;
   batch: Batch | null;
   x: number;
   y: number;
@@ -158,7 +162,6 @@ export interface Hover {
 export interface SceneOptions {
   now(): number;
   onHover(hover: Hover | null): void;
-  onSelect(chain: Chain): void;
   onExpand(expanded: boolean): void;
   reducedMotion: boolean;
 }
@@ -234,6 +237,15 @@ export function landingBlocks<B extends { number: number; blobs: Record<string, 
   return landed;
 }
 
+/**
+ * The age in seconds at which an Ethereum block turns upright: when it was
+ * confirmed, or when the page learned it was, and at ROTATE_AFTER at the latest.
+ */
+export function turnsAt(block: Pick<Block, 'born' | 'level' | 'levelAt' | 'confirmedAt'>) {
+  const confirmed = block.confirmedAt ?? (RANK[block.level] >= RANK.confirmed ? block.levelAt : null);
+  return confirmed === null ? ROTATE_AFTER : Math.min(ROTATE_AFTER, confirmed / 1000 - block.born);
+}
+
 interface LevelLane {
   blocks: Pick<Block, 'number' | 'time' | 'born' | 'seen' | 'level' | 'levelAt' | 'attestedAt' | 'confirmedAt' | 'finalizedAt' | 'undoneAt'>[];
   attested: number;
@@ -293,6 +305,8 @@ export class Scene {
   private hovered: string | null = null;
   private frontiers = new Map<string, { value: number; previous: number | null; since: number }>();
   private followed: { chain: string; number: number } | null = null;
+  /** Whether the last pointer was a finger, which needs bigger targets and has no hover. */
+  private touch = false;
 
   constructor(private readonly canvas: HTMLCanvasElement, private readonly options: SceneOptions) {
     const context = canvas.getContext('2d');
@@ -300,6 +314,9 @@ export class Scene {
     this.context = context;
     this.visible = new Set(CHAINS.map((chain) => chain.id));
     this.reset();
+    canvas.addEventListener('pointerdown', (event) => {
+      this.touch = event.pointerType === 'touch';
+    });
     canvas.addEventListener('pointermove', (event) => this.pointer(event));
     canvas.addEventListener('pointerleave', () => {
       this.hovered = null;
@@ -319,6 +336,10 @@ export class Scene {
   show(chains: string[]) {
     this.visible = new Set(chains);
     this.layout();
+  }
+
+  unfollow() {
+    this.followed = null;
   }
 
   /** Open or fold the days of settlement. */
@@ -413,15 +434,11 @@ export class Scene {
     };
   }
 
-  /** The followed block's journey, following `chain`'s newest block when none is. */
-  journey(chain: string): Journey | null {
-    if (!this.followed || !this.lane(this.followed.chain)?.blocks.some((block) => block.number === this.followed!.number)) {
-      const newest = this.lane(chain)?.blocks.filter((block) => !block.batch && block.undoneAt === null).at(-1);
-      this.followed = newest ? { chain, number: newest.number } : null;
-    }
-    if (!this.followed) return null;
-    const lane = this.lane(this.followed.chain)!;
-    const block = lane.blocks.find((candidate) => candidate.number === this.followed!.number)!;
+  /** The journey of the block a click follows, `null` while none is followed or it left the picture. */
+  journey(): Journey | null {
+    const lane = this.followed && this.lane(this.followed.chain);
+    const block = lane && lane.blocks.find((candidate) => candidate.number === this.followed!.number);
+    if (!lane || !block) return null;
     const carrier = block.batch ? this.carrier(block.batch) : null;
     return {
       chain: lane.chain,
@@ -566,14 +583,17 @@ export class Scene {
     this.canvas.width = Math.round(rect.width * ratio);
     this.canvas.height = Math.round(rect.height * ratio);
     this.context.setTransform(ratio, 0, 0, ratio, 0, 0);
-    const narrow = this.width < 640;
-    this.gx = narrow ? 70 : 132;
-    this.edge = this.expanded ? 16 : narrow ? 56 : 132;
+    const narrow = this.narrow;
+    this.gx = narrow ? 8 : 132;
+    // A narrow canvas has no room for the days edge; the legend's button opens them.
+    this.edge = narrow ? 8 : this.expanded ? 16 : 132;
     this.gw = Math.max(120, this.width - this.gx - this.edge);
     const rollups = this.rollups();
-    const laneHeight = narrow ? 64 : 88;
-    const ethereumHeight = narrow ? 96 : 116;
-    const wanted = 12 + rollups.length * laneHeight + (rollups.length ? 36 : 0) + ethereumHeight + 36;
+    const laneHeight = narrow ? 76 : 88;
+    const ethereumHeight = narrow ? 112 : 116;
+    // Room between the rows and Ethereum for its frontiers' labels.
+    const gap = rollups.length ? 14 : 0;
+    const wanted = 12 + rollups.length * laneHeight + gap + ethereumHeight + 36;
     // The canvas grows and shrinks with its lanes; the resize lays it out again.
     if (Math.abs(rect.height - wanted) > 1) {
       this.canvas.style.height = `${wanted}px`;
@@ -588,8 +608,17 @@ export class Scene {
       y += laneHeight;
     }
     const ethereum = this.lane(ETHEREUM)!;
-    ethereum.top = y + (rollups.length ? 36 : 0);
+    ethereum.top = y + gap;
     ethereum.height = ethereumHeight;
+  }
+
+  private get narrow() {
+    return this.width < NARROW;
+  }
+
+  /** How far a row's drawing starts below its top: past its name strip on a narrow canvas. */
+  private get strip() {
+    return this.narrow ? NAME_STRIP : 0;
   }
 
   private share(age: number) {
@@ -606,28 +635,27 @@ export class Scene {
 
   /**
    * An Ethereum block with `blobs` blobs at `age`: a capsule on the surface
-   * that sinks, slower and slower, turns upright, and narrows into a bar
-   * standing on the bed, a slot wide and as tall as its blobs, while its
+   * that sinks, slower and slower, turns upright at `turns`, and narrows into
+   * a bar standing on the bed, a slot wide and as tall as its blobs, while its
    * border fades. `length` and `thickness` are the slab's own, along its
    * cells and across them; `width` and `height` are on screen.
    */
-  private slab(age: number, blobs: number) {
+  private slab(age: number, blobs: number, turns = ROTATE_AFTER) {
     const ethereum = this.lane(ETHEREUM)!;
-    const narrow = this.width < 640;
-    const capsuleLength = narrow ? 32 : 46;
-    const capsuleThickness = narrow ? 12 : 16;
+    const capsuleLength = this.narrow ? 32 : 46;
+    const capsuleThickness = this.narrow ? 12 : 16;
     const bed = ethereum.top + ethereum.height - 4 - BED;
     // A slot's width on the log axis at this age, so settled bars stand side by side.
     const barWidth = Math.min(10, Math.max(1.5, this.x(age + 6) - this.x(age - 6) - 1));
     const t = Math.min(1, Math.max(0, (age - SETTLE_AFTER) / SETTLE_SECONDS));
     const settle = 1 - (1 - t) ** 3;
-    const angle = (Math.PI / 2) * phase(age, ROTATE_AFTER, ROTATE_SECONDS);
-    const shape = phase(age, ROTATE_AFTER + ROTATE_SECONDS, SHAPE_SECONDS);
+    const angle = (Math.PI / 2) * phase(age, turns, ROTATE_SECONDS);
+    const shape = phase(age, turns + ROTATE_SECONDS, SHAPE_SECONDS);
     const length = capsuleLength + (blobs * BLOB_PX - capsuleLength) * shape;
     const thickness = capsuleThickness + (barWidth - capsuleThickness) * shape;
     const width = Math.abs(Math.cos(angle)) * length + Math.abs(Math.sin(angle)) * thickness;
     const height = Math.abs(Math.cos(angle)) * thickness + Math.abs(Math.sin(angle)) * length;
-    const surface = ethereum.top + 6 + capsuleThickness / 2;
+    const surface = ethereum.top + this.strip + 6 + capsuleThickness / 2;
     const slots = Math.max(blobs, 9) - (Math.max(blobs, 9) - blobs) * shape;
     return {
       x: this.x(age),
@@ -638,7 +666,7 @@ export class Scene {
       thickness,
       angle,
       /** How much of its border, and of its empty slots' outlines, remains. */
-      border: 1 - phase(age, ROTATE_AFTER + ROTATE_SECONDS, BORDER_SECONDS),
+      border: 1 - phase(age, turns + ROTATE_SECONDS, BORDER_SECONDS),
       /** How many blob places it spans: at least nine on a capsule, its blobs on a bar. */
       slots,
       settle,
@@ -646,18 +674,21 @@ export class Scene {
     };
   }
 
-  private blockPoint(lane: Lane, block: Block, now: number) {
-    return { x: this.x(now - block.born), y: lane.top + 8 + (lane.height - 24) * block.jitter };
+  private capsule(block: Block, now: number) {
+    return this.slab(now - block.born, blobCount(block), turnsAt(block));
   }
 
-  /** A batch's bracket under the blocks it carried. */
+  private blockPoint(lane: Lane, block: Block, now: number) {
+    return { x: this.x(now - block.born), y: lane.top + this.strip + 8 + (lane.height - this.strip - 16) * block.jitter };
+  }
+
   private bracket(lane: Lane, batch: Batch, now: number) {
-    return { from: this.x(now - batch.lastTime), to: this.x(now - batch.firstTime), y: lane.top + lane.height - 7 };
+    return { from: this.x(now - batch.lastTime), to: this.x(now - batch.firstTime), y: lane.top + (lane.height + this.strip) / 2 };
   }
 
   private regionAt(y: number) {
     const ethereum = this.lane(ETHEREUM)!;
-    if (y >= ethereum.top - 20) return ethereum;
+    if (y >= ethereum.top - 10) return ethereum;
     return this.rollups().find((lane) => y >= lane.top - 4 && y <= lane.top + lane.height + 4) ?? null;
   }
 
@@ -666,10 +697,10 @@ export class Scene {
     if (lane.chain.id === ETHEREUM) {
       let best: { block: Block; distance: number } | null = null;
       for (const block of lane.blocks) {
-        const slab = this.slab(now - block.born, blobCount(block));
+        const slab = this.capsule(block, now);
         const distance = Math.abs(slab.x - x);
         const inside = y >= slab.y - slab.height / 2 - 4 && y <= slab.bed + BED + 2;
-        if (inside && distance < Math.max(3, slab.width / 2 + 1) && (!best || distance < best.distance)) best = { block, distance };
+        if (inside && distance < Math.max(this.touch ? 12 : 3, slab.width / 2 + 1) && (!best || distance < best.distance)) best = { block, distance };
       }
       return { block: best?.block ?? null, batch: null };
     }
@@ -678,41 +709,46 @@ export class Scene {
       if (block.batch || this.postedUnseen(lane, block)) continue;
       const point = this.blockPoint(lane, block, now);
       const distance = Math.hypot(point.x - x, point.y - y);
-      if (distance < 10 && (!best || distance < best.distance)) best = { block, distance };
+      if (distance < (this.touch ? 22 : 10) && (!best || distance < best.distance)) best = { block, distance };
     }
     if (best) return { block: best.block, batch: null };
     const batch = lane.batches.find((candidate) => {
       const bracket = this.bracket(lane, candidate, now);
-      return Math.abs(y - bracket.y) < 9 && x >= bracket.from - 3 && x <= bracket.to + 3;
+      return Math.abs(y - bracket.y) < (this.touch ? 16 : 9) && x >= bracket.from - 3 && x <= bracket.to + 3;
     }) ?? null;
     return { block: null, batch };
   }
 
   private click(x: number, y: number) {
-    if (!this.expanded && x > this.width - this.edge) {
+    this.followed = null;
+    if (!this.narrow && !this.expanded && x > this.width - this.edge) {
       this.expand(true);
       return;
     }
-    if (this.expanded && x > this.width - 110 && y < 30) {
+    if (!this.narrow && this.expanded && x > this.width - 110 && y < 30) {
       this.expand(false);
       return;
     }
     const lane = this.regionAt(y);
-    if (!lane) return;
-    const { block } = this.found(lane, x, y);
-    if (block && lane.chain.id !== ETHEREUM) this.followed = { chain: lane.chain.id, number: block.number };
-    else this.options.onSelect(lane.chain);
+    const block = lane && lane.chain.id !== ETHEREUM ? this.found(lane, x, y).block : null;
+    if (lane && block) this.followed = { chain: lane.chain.id, number: block.number };
+    // A finger has no hover: its tap shows what it hit until the next one.
+    if (this.touch) this.hover(x, y);
   }
 
   private pointer(event: PointerEvent) {
-    const lane = this.regionAt(event.offsetY);
+    this.canvas.style.cursor = !this.narrow && !this.expanded && event.offsetX > this.width - this.edge ? 'pointer' : 'crosshair';
+    this.hover(event.offsetX, event.offsetY);
+  }
+
+  private hover(x: number, y: number) {
+    const lane = this.regionAt(y);
     this.hovered = lane?.chain.id ?? null;
-    this.canvas.style.cursor = !this.expanded && event.offsetX > this.width - this.edge ? 'pointer' : 'crosshair';
     if (!lane) {
       this.options.onHover(null);
       return;
     }
-    const { block, batch } = this.found(lane, event.offsetX, event.offsetY);
+    const { block, batch } = this.found(lane, x, y);
     if (!block && !batch) {
       this.options.onHover(null);
       return;
@@ -724,9 +760,10 @@ export class Scene {
         number: block.number, hash: block.hash, level: block.level, age: now - block.born,
         txs: block.txs, gas: block.gas, blobs: block.blobs,
       },
+      followed: block !== null && this.followed?.chain === lane.chain.id && this.followed.number === block.number,
       batch: batch ?? block?.batch ?? null,
-      x: event.offsetX,
-      y: event.offsetY,
+      x,
+      y,
     });
   }
 
@@ -754,6 +791,7 @@ export class Scene {
     this.drawFollowed(now);
     this.drawEdge(now);
     this.drawAxis();
+    this.drawLabels();
   }
 
   private drawGrid() {
@@ -778,27 +816,41 @@ export class Scene {
     let previous = -Infinity;
     for (const [age, label] of TICKS) {
       if (age > this.window * 1.001) continue;
-      const x = this.x(age);
+      const x = Math.min(Math.max(this.gx + 12, this.x(age)), this.width - context.measureText(label).width / 2 - 4);
       if (x - previous < 44) continue;
       previous = x;
       context.fillStyle = age === 0 ? '#3ee07f' : '#8fa89a';
-      context.fillText(label, Math.max(this.gx + 12, x), this.axisY + 8);
+      context.fillText(label, x, this.axisY + 8);
     }
   }
 
+  /** A row's name and `lines` under it, or on a narrow canvas its name and first line in the strip along its top. */
   private label(lane: Lane, title: string, lines: string[], color: string) {
     const context = this.context;
-    const narrow = this.width < 640;
-    const x = 12;
-    const y = lane.top + Math.min(18, lane.height / 2);
+    const narrow = this.narrow;
+    const x = narrow ? this.gx + 2 : 12;
+    const y = narrow ? lane.top + NAME_STRIP / 2 + 1 : lane.top + Math.min(18, lane.height / 2);
     context.fillStyle = color;
     context.fillRect(x, y - 6, 3, 12);
     context.textAlign = 'left';
     context.textBaseline = 'middle';
     context.fillStyle = lane.connected || lane.batches.length ? '#e6f0ea' : '#536b5e';
-    context.font = `650 ${narrow ? 10 : 12}px "Inter Variable", system-ui, sans-serif`;
-    context.fillText(narrow ? title.replace('Arbitrum ', 'Arb ').replace(' Chain', '').replace(' Mainnet', '') : title, x + 9, y, this.gx - x - 14);
-    context.font = `400 ${narrow ? 8.5 : 10}px "JetBrains Mono", ui-monospace, monospace`;
+    context.font = `650 ${narrow ? 10.5 : 12}px "Inter Variable", system-ui, sans-serif`;
+    if (narrow) {
+      const after = x + 14 + context.measureText(title).width;
+      const name = context.fillStyle;
+      context.font = '400 9.5px "JetBrains Mono", ui-monospace, monospace';
+      context.fillStyle = 'rgba(11, 15, 13, 0.8)';
+      context.fillRect(x + 5, y - 7, after - x - 1 + context.measureText(lines[0]).width, 14);
+      context.fillStyle = '#8fa89a';
+      context.fillText(lines[0], after, y);
+      context.font = '650 10.5px "Inter Variable", system-ui, sans-serif';
+      context.fillStyle = name;
+      context.fillText(title, x + 8, y);
+      return;
+    }
+    context.fillText(title, x + 9, y, this.gx - x - 14);
+    context.font = '400 10px "JetBrains Mono", ui-monospace, monospace';
     context.fillStyle = '#8fa89a';
     lines.forEach((line, index) => context.fillText(line, x + 9, y + 15 + index * 13, this.gx - x - 14));
   }
@@ -809,17 +861,13 @@ export class Scene {
     context.beginPath();
     context.roundRect(this.gx - 6, lane.top, this.gw + 12, lane.height, 6);
     context.fill();
-    const head = lane.blocks.at(-1)?.number ?? lane.batches.at(-1)?.last;
-    const lines = [head ? `#${head.toLocaleString('en-US')}` : lane.connected ? '…' : 'offline'];
-    if (lane.height > 54) lines.push(lane.chain.family === 'arbitrum' ? 'feed-signed' : 'sequencer-signed');
-    this.label(lane, lane.chain.label, lines, lane.chain.color);
     if (lane.blocks.length === 0 && lane.batches.length && lane.height > 40) {
       context.font = '400 10px "Inter Variable", system-ui, sans-serif';
       context.fillStyle = '#536b5e';
       context.textAlign = 'left';
       context.textBaseline = 'middle';
-      const note = this.width < 640 ? 'its blocks as Ethereum carries them' : 'its blocks as Ethereum carries them: live gossip needs a public host';
-      context.fillText(note, this.gx + 6, lane.top + 14, this.gw - 12);
+      const note = this.narrow ? 'its blocks as Ethereum carries them' : 'its blocks as Ethereum carries them: live gossip needs a public host';
+      context.fillText(note, this.gx + 6, lane.top + this.strip + 10, this.gw - 12);
     }
   }
 
@@ -834,8 +882,17 @@ export class Scene {
     context.stroke();
     context.fillStyle = 'rgba(154, 168, 255, 0.06)';
     context.fillRect(this.gx - 6, lane.top + lane.height - 4 - BED, this.gw + 12, BED);
-    const head = lane.blocks.at(-1);
-    this.label(lane, 'Ethereum', [head ? `#${head.number.toLocaleString('en-US')}` : lane.connected ? '…' : 'offline', 'settlement layer'], lane.chain.color);
+  }
+
+  /** Each row's name and head, drawn last so the threads and frontiers crossing a narrow canvas's strips pass behind them. */
+  private drawLabels() {
+    for (const lane of [...this.rollups(), this.lane(ETHEREUM)!]) {
+      const head = lane.blocks.at(-1)?.number ?? lane.batches.at(-1)?.last;
+      const lines = [head ? `#${head.toLocaleString('en-US')}` : lane.connected ? '…' : 'offline'];
+      if (lane.chain.id === ETHEREUM) lines.push('settlement layer');
+      else if (lane.height > 54) lines.push(lane.chain.family === 'arbitrum' ? 'feed-signed' : 'sequencer-signed');
+      this.label(lane, lane.chain.label, lines, lane.chain.color);
+    }
   }
 
   private drawCapsules(lane: Lane, now: number, clock: number) {
@@ -845,7 +902,7 @@ export class Scene {
     for (const block of lane.blocks) {
       const age = now - block.born;
       if (age > this.window) continue;
-      const capsule = this.slab(age, blobCount(block));
+      const capsule = this.capsule(block, now);
       let { x } = capsule;
       // Blocks no shown rollup posted in fade as they settle.
       let alpha = this.carries(block) ? 1 : 1 - 0.78 * capsule.settle;
@@ -1002,18 +1059,20 @@ export class Scene {
       context.fillRect(bracket.from, bracket.y - 2, Math.max(2, to - bracket.from), 4);
       context.globalAlpha = appear;
       const width = to - bracket.from;
-      if (width > 84 && lane.height > 40) {
-        context.font = '500 9px "JetBrains Mono", ui-monospace, monospace';
+      context.font = '500 9px "JetBrains Mono", ui-monospace, monospace';
+      const blocks = `${(batch.last - batch.first + 1).toLocaleString('en-US')} blocks`;
+      const text = [`${blocks} → #${batch.l1.toLocaleString('en-US')}`, blocks].find((candidate) => context.measureText(candidate).width < width - 4);
+      if (text && lane.height > 40) {
         context.textAlign = 'left';
         context.textBaseline = 'bottom';
         context.fillStyle = level === 'finalized' ? '#9ff0c4' : '#c9d6cf';
-        context.fillText(`${(batch.last - batch.first + 1).toLocaleString('en-US')} blocks → #${batch.l1.toLocaleString('en-US')}`, bracket.from + 2, bracket.y - 4, width - 4);
+        context.fillText(text, bracket.from + 2, bracket.y - 4);
       }
       const carrier = this.carrier(batch);
       const age = carrier ? now - carrier.born : now - batch.l1Time;
       const dropped = this.options.reducedMotion || this.late(batch) || since > this.gather(lane) + DROP_MS;
       if (dropped && age <= this.window) {
-        const capsule = this.slab(age, carrier ? blobCount(carrier) : batch.blobs);
+        const capsule = carrier ? this.capsule(carrier, now) : this.slab(age, batch.blobs);
         const highlight = this.hovered === lane.chain.id;
         context.strokeStyle = level === 'finalized' ? '#3ee07f' : lane.chain.color;
         // Older threads step back, so the newest postings lead.
@@ -1041,7 +1100,7 @@ export class Scene {
       if (since < -gather || since > DROP_MS + 600) continue;
       const carrier = this.carrier(batch);
       const bracket = this.bracket(lane, batch, now);
-      const capsule = this.slab(carrier ? now - carrier.born : now - batch.l1Time, carrier ? blobCount(carrier) : batch.blobs);
+      const capsule = carrier ? this.capsule(carrier, now) : this.slab(now - batch.l1Time, batch.blobs);
       const from = { x: Math.min(bracket.from, this.gx + this.gw), y: bracket.y };
       const to = { x: capsule.x, y: capsule.y - capsule.height / 2 };
       if (since > DROP_MS) {
@@ -1089,19 +1148,19 @@ export class Scene {
     const confirmed = ethereum.blocks.filter((block) => block.level === 'confirmed').at(-1);
     if (confirmed) {
       for (const { value, alpha } of this.crossfade('confirmed', confirmed.born)) {
-        this.frontier(this.x(now - value), ethereum.top, ethereum.top + ethereum.height, `confirmed · ${duration(now - value)}`, '#d6dbff', true, ethereum.top - 20, alpha);
+        this.frontier(this.x(now - value), ethereum.top, ethereum.top + ethereum.height, `confirmed · ${duration(now - value)}`, '#d6dbff', true, ethereum.top - 18, alpha);
       }
     }
     if (ethereum.finalizedTime !== null) {
       for (const { value, alpha } of this.crossfade('final', ethereum.finalizedTime)) {
         if (now - value > this.window) continue;
-        this.frontier(this.x(now - value), ethereum.top, ethereum.top + ethereum.height, `final · ${duration(now - value)}`, '#3ee07f', false, ethereum.top - 20, alpha);
+        this.frontier(this.x(now - value), ethereum.top, ethereum.top + ethereum.height, `final · ${duration(now - value)}`, '#3ee07f', false, ethereum.top - 18, alpha);
       }
     }
     for (const lane of this.rollups()) {
       const final = lane.batches.filter((batch) => this.carrierLevel(batch) === 'finalized').at(-1);
       if (final && now - final.lastTime <= this.window) {
-        this.frontier(this.x(now - final.lastTime), lane.top, lane.top + lane.height, `final on Ethereum · ${duration(now - final.lastTime)}`, '#3ee07f', true, lane.top + 4);
+        this.frontier(this.x(now - final.lastTime), lane.top, lane.top + lane.height, `${this.narrow ? 'final' : 'final on Ethereum'} · ${duration(now - final.lastTime)}`, '#3ee07f', true, lane.top + 4);
       }
       if (this.expanded) this.drawSettlement(lane, now);
     }
@@ -1150,25 +1209,18 @@ export class Scene {
   }
 
   private drawSettlement(lane: Lane, now: number) {
-    const stage = STAGES[lane.chain.family].find((candidate) => candidate.level === 'finalized');
-    if (lane.chain.finality === 'none' || !stage) {
-      const context = this.context;
-      context.font = '400 10px "Inter Variable", system-ui, sans-serif';
-      context.fillStyle = '#536b5e';
-      context.textAlign = 'right';
-      context.textBaseline = 'middle';
-      context.fillText('settlement not read by leani yet', this.gx + this.gw - 8, lane.top + lane.height / 2);
-      return;
-    }
+    const settlement = lane.chain.settlement;
+    if (!settlement) return;
     if (lane.finalizedTime !== null) {
       this.frontier(this.x(now - lane.finalizedTime), lane.top, lane.top + lane.height, `settled · ${duration(now - lane.finalizedTime)}`, '#3ee07f', false, lane.top + 24);
     } else {
-      this.frontier(this.x(stage.seconds), lane.top, lane.top + lane.height, `settles ${stage.typical}`, 'rgba(62, 224, 127, 0.6)', true, lane.top + 24);
+      this.frontier(this.x(settlement.seconds), lane.top, lane.top + lane.height, `settles ${settlement.typical}`, 'rgba(62, 224, 127, 0.6)', true, lane.top + 24);
     }
   }
 
   private drawEdge(now: number) {
     const context = this.context;
+    if (this.narrow) return;
     if (this.expanded) {
       context.font = '600 10px "JetBrains Mono", ui-monospace, monospace';
       context.fillStyle = '#9ff0c4';
@@ -1178,7 +1230,6 @@ export class Scene {
       return;
     }
     const left = this.width - this.edge + 10;
-    const narrow = this.width < 640;
     context.fillStyle = 'rgba(230, 240, 234, 0.025)';
     context.strokeStyle = 'rgba(62, 224, 127, 0.25)';
     context.setLineDash([3, 4]);
@@ -1189,17 +1240,13 @@ export class Scene {
     context.setLineDash([]);
     context.textAlign = 'left';
     context.textBaseline = 'middle';
-    context.font = `600 ${narrow ? 9 : 10.5}px "JetBrains Mono", ui-monospace, monospace`;
+    context.font = '600 10.5px "JetBrains Mono", ui-monospace, monospace';
     context.fillStyle = '#9ff0c4';
-    context.fillText(narrow ? 'days ▸' : 'days of settlement ▸', left + 8, 22, this.edge - 28);
-    if (narrow) return;
+    context.fillText('days of settlement ▸', left + 8, 22, this.edge - 28);
     context.font = '400 10px "Inter Variable", system-ui, sans-serif';
     for (const lane of this.rollups()) {
-      const stage = STAGES[lane.chain.family].find((candidate) => candidate.level === 'finalized');
-      const text = lane.chain.finality === 'none'
-        ? 'not read yet'
-        : lane.finalizedTime !== null ? `settled ${duration(now - lane.finalizedTime)} ago` : `settles ${stage?.typical ?? ''}`;
-      context.fillStyle = lane.chain.finality === 'none' ? '#536b5e' : '#8fa89a';
+      const text = lane.finalizedTime !== null ? `settled ${duration(now - lane.finalizedTime)} ago` : `settles ${lane.chain.settlement?.typical ?? ''}`;
+      context.fillStyle = '#8fa89a';
       context.fillText(text, left + 8, lane.top + lane.height / 2, this.edge - 28);
     }
     const ethereum = this.lane(ETHEREUM)!;
@@ -1261,7 +1308,7 @@ export class Scene {
     context.stroke();
     const carrier = this.carrier(block.batch);
     if (carrier) {
-      const capsule = this.slab(now - carrier.born, blobCount(carrier));
+      const capsule = this.capsule(carrier, now);
       context.beginPath();
       context.roundRect(capsule.x - capsule.width / 2 - 4, capsule.y - capsule.height / 2 - 4, capsule.width + 8, capsule.height + 8, 5);
       context.stroke();
