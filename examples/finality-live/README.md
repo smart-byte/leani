@@ -1,6 +1,6 @@
 # Finality, live
 
-The data behind [leani.dev/live](https://leani.dev/live): one leani node per
+The data behind [leani.dev/finality](https://leani.dev/finality): one leani node per
 chain, and `hub.ts`, which follows every node's change stream with the SDK
 and serves all of them as one server-sent event stream. Rollup nodes run the
 `block-summary` processor; the Ethereum node runs `blobs`, whose every blob
@@ -23,7 +23,7 @@ bun hub.ts $(./nodes.sh hub ./nodes) \
   --port 8797 --record recording.jsonl
 
 # The page, live from the hub.
-open "https://leani.dev/live?hub=http://127.0.0.1:8797"
+open "https://leani.dev/finality?hub=http://127.0.0.1:8797"
 ```
 
 Without `CHAINS`, `nodes.sh` runs Ethereum, OP Mainnet, Base, Arbitrum One,
@@ -57,7 +57,7 @@ hub's recording; events before the window's start happen at once, so the
 replay opens on the state of a page connecting then:
 
 ```sh
-bun hub.ts pack recording.jsonl FROM_MS TO_MS | gzip -9 > ../../site/public/live/replay.json.gz
+bun hub.ts pack recording.jsonl FROM_MS TO_MS | gzip -9 > ../../site/public/finality/replay.json.gz
 ```
 
 ## What a host needs
