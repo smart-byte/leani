@@ -89,6 +89,7 @@ pub struct Receipt {
     pub success: Option<bool>,
     pub gas_used: Option<u64>,
     pub effective_gas_price: Option<Word>,
+    /// Present when the manifest requires blob fields.
     pub blob_gas_used: Option<u64>,
     pub logs: Vec<Log>,
 }

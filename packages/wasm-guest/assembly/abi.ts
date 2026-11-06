@@ -140,6 +140,7 @@ export class Receipt {
   success: Some<bool> | null = null;
   gasUsed: Some<u64> | null = null;
   effectiveGasPrice: U256 | null = null;
+  /** Present when the manifest requires blob fields. */
   blobGasUsed: Some<u64> | null = null;
   logs: Log[] = [];
 
