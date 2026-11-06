@@ -424,6 +424,8 @@ export interface BlockSummary {
   blockHash: Hex;
   parentHash: Hex;
   timestamp: number;
+  /** The address the block's priority fees go to, the header's beneficiary. */
+  feeRecipient: Hex | null;
   gasLimit: number | null;
   gasUsed: number | null;
   baseFeePerGas: string | null;

@@ -299,6 +299,16 @@ record, and documented RPC contracts.
   aside, and then rebuilds raw history from its sources. Frames read from an
   archive written before carry no fee recipient, so a processor that needs
   headers takes those blocks from the next source.
+- Breaking: `block-summary` 1.3.0 publishes each block's `feeRecipient`, in
+  its changes, its entities, the `/latest` and `/blocks/{number}` query routes,
+  the SDK's `BlockSummary`, and `leani subscribe blocks` output. It stores a
+  new entity and delta encoding (`ethereum.block-summary.entity.v2`, delta
+  version 2; the change schema stays `ethereum.block-summary.change.v1` and
+  only gains the field). Rebuild existing summaries under a new `instance`
+  with `version = "1.3.0"`; compact `[blocks]` configurations run the new
+  instance `block-summary-1-3`, so the 1.2.0 rows of `block-summary-1-2` stay
+  inert. `leani subscribe blocks` keys its state directory by this version,
+  so it starts cold.
 - Execution P2P asks no public IP service for the host's address unless
   `nat` says so: generated configurations set `sources.live.nat = "none"`
   instead of `"any"`. A node whose configuration names `any`, `upnp`, or

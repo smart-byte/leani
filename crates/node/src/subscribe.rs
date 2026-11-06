@@ -237,6 +237,7 @@ struct AttachedBlockSummary {
     block_hash: String,
     parent_hash: String,
     timestamp: u64,
+    fee_recipient: Option<String>,
     gas_limit: Option<u64>,
     gas_used: Option<u64>,
     base_fee_per_gas: Option<String>,
@@ -283,6 +284,7 @@ struct RenderedBlockSummary {
     block_hash: String,
     parent_hash: String,
     timestamp: u64,
+    fee_recipient: Option<String>,
     gas_limit: Option<u64>,
     gas_used: Option<u64>,
     base_fee_wei: Option<String>,
@@ -2299,6 +2301,7 @@ fn rendered_block_summary(
         block_hash: entity.block_hash.to_string(),
         parent_hash: entity.parent_hash.to_string(),
         timestamp: entity.timestamp,
+        fee_recipient: entity.fee_recipient.map(|address| address.to_string()),
         gas_limit: entity.gas_limit,
         gas_used: entity.gas_used,
         base_fee_wei: entity
@@ -2517,6 +2520,7 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                 "blockHash": output.block_hash,
                 "parentHash": output.parent_hash,
                 "timestamp": output.timestamp,
+                "feeRecipient": output.fee_recipient,
                 "gasLimit": output.gas_limit,
                 "gasUsed": output.gas_used,
                 "baseFeePerGas": output.base_fee_wei,
@@ -3703,6 +3707,7 @@ fn render_attached_block_summary(
             block_hash: entity.block_hash,
             parent_hash: entity.parent_hash,
             timestamp: entity.timestamp,
+            fee_recipient: entity.fee_recipient,
             gas_limit: entity.gas_limit,
             gas_used: entity.gas_used,
             base_fee_wei,
@@ -4063,6 +4068,7 @@ mod tests {
                 block_hash: block.hash,
                 parent_hash: block.parent_hash,
                 timestamp: block.timestamp,
+                fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
                 gas_limit: Some(60_000_000),
                 gas_used: Some(30_000_000),
                 base_fee_per_gas: None,
@@ -4577,6 +4583,7 @@ mod tests {
                 block_hash: format!("0x{}", hex::encode([99; 32])),
                 parent_hash: format!("0x{}", hex::encode([98; 32])),
                 timestamp: now,
+                fee_recipient: None,
                 gas_limit: None,
                 gas_used: None,
                 base_fee_per_gas: None,
@@ -4708,7 +4715,8 @@ mod tests {
                 "put",
                 json!({
                     "chainId": 1, "blockNumber": block, "blockHash": hash,
-                    "parentHash": parent, "timestamp": timestamp, "gasLimit": 60_000_000,
+                    "parentHash": parent, "timestamp": timestamp,
+                    "feeRecipient": format!("0x{}", "96".repeat(20)), "gasLimit": 60_000_000,
                     "gasUsed": 30_000_000, "baseFeePerGas": null, "blobGasUsed": null,
                     "excessBlobGas": null, "transactionCount": 3, "sizeBytes": null,
                     "finality": finality,
@@ -5145,6 +5153,7 @@ mod tests {
         assert_eq!(undone["schema"], "leani.block-summary.v1");
         assert_eq!(undone["operation"], "undo");
         assert_eq!(undone["blockNumber"], 100);
+        assert_eq!(undone["feeRecipient"], format!("0x{}", "96".repeat(20)));
     }
 
     #[test]
@@ -5526,6 +5535,7 @@ mod tests {
             block_hash,
             parent_hash: BlockHash::new([0; 32]),
             timestamp,
+            fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
             gas_limit: Some(60_000_000),
             gas_used: Some(30_000_000),
             base_fee_per_gas: None,

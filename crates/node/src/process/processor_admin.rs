@@ -410,7 +410,7 @@ mod tests {
         processor_contract(
             "block-summary",
             "summary",
-            "1.2.0",
+            "1.3.0",
             21_000_000,
             PublishMode::Finalized,
         )

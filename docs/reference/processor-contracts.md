@@ -387,12 +387,13 @@ tokens = ["0x2222222222222222222222222222222222222222"]
 complete_from_start = true
 ```
 
-## block-summary 1.2.0
+## block-summary 1.3.0
 
 A receipt-free, block-local view of every Ethereum execution block. It declares
 the `Header` and `Body` field groups, then publishes timestamp, parent/hash
-identity, gas limit and usage, decimal base fee, blob gas fields, transaction
-count, exact execution-block size when available, and finality. Blocks come
+identity, fee recipient, gas limit and usage, decimal base fee, blob gas
+fields, transaction count, exact execution-block size when available, and
+finality. Blocks come
 from verified material or, under the trusted-dataset policy, from Xatu's
 dataset-declared header and transaction projections, whose body indices and
 payload transaction count must agree. Dataset rows carry no execution-block
