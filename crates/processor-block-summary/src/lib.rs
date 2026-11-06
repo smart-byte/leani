@@ -3,8 +3,8 @@
 use alloy_primitives::U256;
 use async_trait::async_trait;
 use leani_primitives::{
-    BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, FilterScope, Finality,
-    Material, ProcessorCursor, Quantity,
+    Address, BlockFrame, BlockHash, BlockNumber, Capability, CapabilitySet, ChainId, FilterScope,
+    Finality, Material, ProcessorCursor, Quantity,
 };
 use leani_processor_api::{
     ChangeOperation, DataRequirement, DeliveryOrdering, DomainChange, DomainChanges, EncodedDelta,
@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 pub const BLOCK_COLLECTION: &str = "ethereum.blocks";
 pub const BLOCK_NUMBER_INDEX_COLLECTION: &str = "ethereum.blocks.by-number";
 pub const BLOCK_SUMMARY_KIND: &str = "ethereum.block.summary";
-pub const BLOCK_SUMMARY_VERSION: &str = "1.2.0";
+pub const BLOCK_SUMMARY_VERSION: &str = "1.3.0";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct BlockSummaryConfig {
@@ -34,6 +34,8 @@ pub struct BlockSummaryEntity {
     pub block_hash: BlockHash,
     pub parent_hash: BlockHash,
     pub timestamp: u64,
+    /// The address the block's priority fees go to.
+    pub fee_recipient: Option<Address>,
     pub gas_limit: Option<u64>,
     pub gas_used: Option<u64>,
     pub base_fee_per_gas: Option<Quantity>,
@@ -60,7 +62,7 @@ impl BlockSummaryProcessor {
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
         let id = ProcessorId::new("block-summary")
             .map_err(|error| ProcessorError::Input(error.to_string()))?;
-        let version = Version::new(1, 2, 0);
+        let version = Version::new(1, 3, 0);
         let config_hash = BlockHash::new(*blake3::hash(&encoded).as_bytes());
         let descriptor = ProcessorDescriptor {
             instance: ProcessorInstanceId::legacy(&id, &version, config_hash)
@@ -85,8 +87,8 @@ impl BlockSummaryProcessor {
             publication: PublicationPolicy::Attested,
             lifecycle: LifecyclePolicies::from_legacy(RetentionPolicy::FullOutputHistory),
             schemas: ProcessorSchemas {
-                delta_version: 1,
-                entity_schema: "ethereum.block-summary.entity.v1".to_owned(),
+                delta_version: 2,
+                entity_schema: "ethereum.block-summary.entity.v2".to_owned(),
                 change_schema: "ethereum.block-summary.change.v1".to_owned(),
             },
         };
@@ -171,6 +173,7 @@ impl Processor for BlockSummaryProcessor {
             block_hash: block.block.hash,
             parent_hash: block.block.parent_hash,
             timestamp: block.block.timestamp,
+            fee_recipient: header.fee_recipient,
             gas_limit: header.gas_limit,
             gas_used: header.gas_used,
             base_fee_per_gas: header.base_fee_per_gas,
@@ -289,6 +292,7 @@ fn entity_json(payload: &[u8]) -> Result<serde_json::Value, ProcessorError> {
         "blockHash": entity.block_hash.to_string(),
         "parentHash": entity.parent_hash.to_string(),
         "timestamp": entity.timestamp,
+        "feeRecipient": entity.fee_recipient.map(|address| address.to_string()),
         "gasLimit": entity.gas_limit,
         "gasUsed": entity.gas_used,
         "baseFeePerGas": entity
@@ -397,6 +401,10 @@ mod tests {
         assert_eq!(entity.block_number, BlockNumber(42));
         assert_eq!(entity.gas_used, Some(30_000_000));
         assert_eq!(entity.transaction_count, Some(2));
+        assert_eq!(
+            entity.fee_recipient,
+            Some(leani_primitives::Address::new([0x0f; 20]))
+        );
 
         let mut reducer = MemoryReducer::default();
         let changes = processor
@@ -410,6 +418,7 @@ mod tests {
             .expect("change JSON")
             .expect("owned JSON");
         assert_eq!(json["blockNumber"], 42);
+        assert_eq!(json["feeRecipient"], format!("0x{}", "0f".repeat(20)));
         assert_eq!(json["finality"], "attested");
         assert_eq!(json["blockHash"], frame.block.hash.to_string());
         assert!(

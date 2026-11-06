@@ -2074,6 +2074,8 @@ export interface components {
             blockHash: components["schemas"]["Hash32"];
             parentHash: components["schemas"]["Hash32"];
             timestamp: components["schemas"]["SafeInteger"];
+            /** @description The address the block's priority fees go to, the header's beneficiary. */
+            feeRecipient: components["schemas"]["Address"] | null;
             gasLimit: components["schemas"]["SafeInteger"] | null;
             gasUsed: components["schemas"]["SafeInteger"] | null;
             baseFeePerGas: components["schemas"]["DecimalQuantity"] | null;

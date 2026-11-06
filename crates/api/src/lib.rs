@@ -9026,6 +9026,7 @@ mod tests {
             block_hash: block.hash,
             parent_hash: block.parent_hash,
             timestamp: block.timestamp,
+            fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
             gas_limit: Some(60_000_000),
             gas_used: Some(31_000_000),
             base_fee_per_gas: Some(Quantity::new([7; 32])),
@@ -10145,6 +10146,10 @@ mod tests {
         assert_eq!(body["data"]["blockNumber"], block.number.0);
         assert_eq!(body["data"]["blockHash"], block.hash.to_string());
         assert_eq!(body["data"]["gasUsed"], 31_000_000);
+        assert_eq!(
+            body["data"]["feeRecipient"],
+            format!("0x{}", "0f".repeat(20))
+        );
         assert_eq!(body["data"]["transactionCount"], 123);
         assert_eq!(body["data"]["finality"], "attested");
     }
@@ -15904,6 +15909,7 @@ mod tests {
             block_hash,
             parent_hash: BlockHash::ZERO,
             timestamp: 1_700_000_000,
+            fee_recipient: Some(leani_primitives::Address::new([0x0f; 20])),
             gas_limit: Some(60_000_000),
             gas_used: Some(30_000_000),
             base_fee_per_gas: None,

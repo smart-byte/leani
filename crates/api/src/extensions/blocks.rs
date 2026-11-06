@@ -43,6 +43,7 @@ struct PublicBlockSummary {
     block_hash: String,
     parent_hash: String,
     timestamp: u64,
+    fee_recipient: Option<String>,
     gas_limit: Option<u64>,
     gas_used: Option<u64>,
     base_fee_per_gas: Option<String>,
@@ -61,6 +62,7 @@ impl From<BlockSummaryEntity> for PublicBlockSummary {
             block_hash: entity.block_hash.to_string(),
             parent_hash: entity.parent_hash.to_string(),
             timestamp: entity.timestamp,
+            fee_recipient: entity.fee_recipient.map(|address| address.to_string()),
             gas_limit: entity.gas_limit,
             gas_used: entity.gas_used,
             base_fee_per_gas: entity

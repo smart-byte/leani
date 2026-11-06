@@ -5748,7 +5748,7 @@ markets = ["LINK/ETH"]
             config.processors[0].instance,
             crate::block_summaries::COMPACT_INSTANCE
         );
-        assert_eq!(config.processors[0].version, "1.2.0");
+        assert_eq!(config.processors[0].version, "1.3.0");
         assert!(config.processors[0].settings.is_empty());
     }
 

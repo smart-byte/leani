@@ -2824,7 +2824,7 @@ components:
     BlockSummary:
       type: object
       additionalProperties: false
-      required: [chainId, blockNumber, blockHash, parentHash, timestamp, gasLimit, gasUsed, baseFeePerGas, blobGasUsed, excessBlobGas, transactionCount, sizeBytes, finality]
+      required: [chainId, blockNumber, blockHash, parentHash, timestamp, feeRecipient, gasLimit, gasUsed, baseFeePerGas, blobGasUsed, excessBlobGas, transactionCount, sizeBytes, finality]
       properties:
         chainId:
           $ref: "#/components/schemas/SafeInteger"
@@ -2836,6 +2836,11 @@ components:
           $ref: "#/components/schemas/Hash32"
         timestamp:
           $ref: "#/components/schemas/SafeInteger"
+        feeRecipient:
+          description: The address the block's priority fees go to, the header's beneficiary.
+          oneOf:
+            - $ref: "#/components/schemas/Address"
+            - type: "null"
         gasLimit:
           oneOf:
             - $ref: "#/components/schemas/SafeInteger"

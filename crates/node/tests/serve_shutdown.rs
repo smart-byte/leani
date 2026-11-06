@@ -103,7 +103,7 @@ checkpoint = ""
 [[processors]]
 id = "block-summary"
 instance = "shutdown-blocks"
-version = "1.2.0"
+version = "1.3.0"
 history_mode = "on_demand"
 start_block = 0
 
