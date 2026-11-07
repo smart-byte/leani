@@ -105,16 +105,6 @@ pub fn log_addresses(anchor: &L1Anchor, system_config: Option<Address>) -> Vec<A
     }
 }
 
-/// The contract whose calldata the anchor reads, if any: a game's L2 block
-/// is only in its creation call.
-#[must_use]
-pub const fn calldata_recipient(anchor: &L1Anchor) -> Option<Address> {
-    match *anchor {
-        L1Anchor::DisputeGames { factory, .. } => Some(factory),
-        L1Anchor::NitroRollup { .. } => None,
-    }
-}
-
 /// The anchor's observations in one L1 block of rollup `chain_id`, in log
 /// order, with the signer updates of the rollup's `system_config`. A game
 /// created through another contract has no readable creation call and is

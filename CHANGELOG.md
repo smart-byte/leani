@@ -321,6 +321,11 @@ record, and documented RPC contracts.
 
 ### Fixed
 
+- An op-stack L1 anchor reads its contracts' logs from calls to any
+  contract. It kept only the logs of transactions to the dispute game
+  factory, so the registry's anchor moves, logged in calls to a game or the
+  registry, and the SystemConfig's updates never arrived: op-stack blocks
+  never settled, and rotated signers were not followed.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
