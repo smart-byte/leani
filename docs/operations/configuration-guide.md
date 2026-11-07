@@ -643,7 +643,9 @@ A rollup's blocks become final on Ethereum twice, and the opt-in
 `[l1_anchor]` table reads both: verified Ethereum finality
 (`[l1_anchor.finality]`, `beacon_api` or `consensus_p2p`, as for an Ethereum
 node) names finalized L1 blocks, and execution P2P serves their bodies and
-receipts, checked against their roots.
+receipts, checked against their roots. On an op-stack chain the anchor
+checks games against the sequencer's gossip beside the P2P live lane, so
+`sources.live.kind` starts with `p2p` there.
 
 `finalized`: the Ethereum block that carries a rollup block's batch is
 finalized, so the block can no longer change, minutes after it was made

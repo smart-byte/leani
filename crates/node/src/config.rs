@@ -3397,6 +3397,16 @@ fn validate_settle_blocks(finality: &FinalityConfig, errors: &mut Vec<Validation
 
 fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec<ValidationError>) {
     match config.l1_anchor_contracts() {
+        // The lanes that follow over JSON-RPC first read Nitro assertions;
+        // games are checked against the gossip heads beside the P2P lane.
+        Ok(Some(leani_chain::L1Anchor::DisputeGames { .. }))
+            if config.sources.live.kind.primary() == LiveSourceKind::JsonRpc =>
+        {
+            errors.push(ValidationError::new(
+                "l1_anchor",
+                "an op-stack chain's anchor runs beside the P2P live lane: set sources.live.kind = [\"p2p\", \"json_rpc\"]",
+            ));
+        }
         Ok(Some(_)) => {}
         Ok(None) => errors.push(ValidationError::new(
             "l1_anchor",
@@ -5353,6 +5363,37 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
         config.finality.finalized_by = Some(FinalizedBy::Settlement);
         assert!(errors(&config).is_empty(), "{:?}", errors(&config));
         assert_eq!(config.batch_inbox(), Ok(None));
+    }
+
+    #[test]
+    fn an_op_stack_anchor_needs_the_p2p_live_lane_first() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.l1_anchor = Some(L1AnchorConfig {
+            finality: config.finality.clone(),
+            listener_port: 0,
+            discovery_port: 0,
+            discv5_port: 0,
+            nat: "none".to_owned(),
+            lookback_blocks: 600,
+            factory: None,
+            registry: None,
+            game_type: None,
+            claims: None,
+        });
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        let refused = |config: &Config| {
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "l1_anchor" && error.message.contains("p2p"))
+        };
+        config.sources.live.kind = LiveKinds(vec![LiveSourceKind::P2p, LiveSourceKind::JsonRpc]);
+        assert!(!refused(&config), "{:?}", config.validation_errors());
+        config.sources.live.kind = LiveSourceKind::JsonRpc.into();
+        assert!(refused(&config), "{:?}", config.validation_errors());
     }
 
     #[test]
