@@ -343,6 +343,9 @@ record, and documented RPC contracts.
 - Validation refuses an op-stack `[l1_anchor]` when `sources.live.kind`
   starts with `json_rpc`: such a node waited forever for a Nitro assertion
   before following.
+- On-demand backfills read a configured `json_rpc` history source. They left
+  it out, so a chain whose only history is JSON-RPC, such as Arbitrum Nova
+  or Robinhood Chain, had none, and Arbitrum One lost its fallback.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
