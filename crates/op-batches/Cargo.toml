@@ -1,0 +1,22 @@
+[package]
+name = "leani-op-batches"
+description = "OP Stack batcher data read as derivation reads it: blobs, frames, channels, batch headers"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+alloy-primitives.workspace = true
+brotli-decompressor.workspace = true
+c-kzg.workspace = true
+flate2.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+
