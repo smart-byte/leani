@@ -333,6 +333,9 @@ record, and documented RPC contracts.
   seconds is opened again, and a handshake response with a line over 8 KiB
   or more than 64 lines is refused: a feed server could hold the lane or
   grow its memory without bound.
+- AWS public history keeps an Isthmus block's header with the empty
+  requests hash it was verified with: the stored header lacked it and
+  hashed to another block.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
