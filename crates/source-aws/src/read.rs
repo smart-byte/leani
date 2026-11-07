@@ -344,6 +344,9 @@ pub(crate) struct RangeRequests {
     permits: tokio::sync::Semaphore,
     reads: AtomicU64,
     bytes: AtomicU64,
+    /// What the downloads would have reached with a range refused for
+    /// passing `input_bytes`.
+    refused: AtomicU64,
     input_bytes: u64,
 }
 
@@ -353,6 +356,7 @@ impl RangeRequests {
             permits: tokio::sync::Semaphore::new(limit.max(1)),
             reads: AtomicU64::new(0),
             bytes: AtomicU64::new(0),
+            refused: AtomicU64::new(0),
             input_bytes,
         }
     }
@@ -365,9 +369,13 @@ impl RangeRequests {
         )
     }
 
-    /// The budget error once the downloads passed `input_bytes`.
+    /// The budget error once the downloads passed `input_bytes`, or a range
+    /// was refused for passing it.
     fn over_budget(&self) -> Option<AwsError> {
-        let observed = self.bytes.load(Ordering::Relaxed);
+        let observed = self
+            .bytes
+            .load(Ordering::Relaxed)
+            .max(self.refused.load(Ordering::Relaxed));
         (observed > self.input_bytes).then_some(AwsError::Budget {
             resource: "input_bytes",
             observed,
@@ -403,8 +411,22 @@ impl StoreReader {
         }
     }
 
-    /// `range`, in parts of at most [`PART_BYTES`] fetched together.
+    /// `range`, in parts of at most [`PART_BYTES`] fetched together. A range
+    /// the budget has no room for is refused before any part is fetched:
+    /// the parts are requested at once, and a file names its own sizes.
     async fn fetch(&self, range: std::ops::Range<u64>) -> object_store::Result<Chunk> {
+        let reached = self
+            .requests
+            .bytes
+            .load(Ordering::Relaxed)
+            .saturating_add(range.end.saturating_sub(range.start));
+        if reached > self.requests.input_bytes {
+            self.requests.refused.fetch_max(reached, Ordering::Relaxed);
+            return Err(object_store::Error::Generic {
+                store: "aws-public",
+                source: "the chunk's input budget has no room for the range".into(),
+            });
+        }
         let step = usize::try_from(PART_BYTES).unwrap_or(usize::MAX);
         let parts = (range.start..range.end)
             .step_by(step)
@@ -1139,6 +1161,22 @@ mod tests {
         );
         let fetched = store.requested_bytes();
         assert!(fetched < size / 2, "fetched {fetched} of {size} bytes");
+    }
+
+    #[tokio::test]
+    async fn a_range_past_the_budget_is_refused_before_it_is_fetched() {
+        let (store, size) = stored(clustered_file(1_000, 10, EnabledStatistics::Page)).await;
+        let requests = Arc::new(RangeRequests::new(4, size / 4));
+        let mut reader = StoreReader::new(store.clone(), "file", size, Arc::clone(&requests), None);
+        assert!(reader.get_bytes(0..size / 2).await.is_err());
+        assert_eq!(store.requested_bytes(), 0);
+        assert!(matches!(
+            requests.over_budget(),
+            Some(AwsError::Budget {
+                resource: "input_bytes",
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

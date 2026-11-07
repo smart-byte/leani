@@ -336,6 +336,10 @@ record, and documented RPC contracts.
 - AWS public history keeps an Isthmus block's header with the empty
   requests hash it was verified with: the stored header lacked it and
   hashed to another block.
+- AWS public history refuses a range its download budget has no room for
+  before fetching it, and gives a block file's footer at most 16 MiB while
+  it finds a day's blocks: a file that named a huge footer was downloaded
+  whole.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
