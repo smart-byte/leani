@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use leani_chain::L1Anchor;
 use leani_l1_anchor::{
-    AnchorLane, FinalizedBlock, FinalizedBlocks, FinalizedTip, GameLedger, Observation,
+    AnchorLane, BatchInbox, BatchReader, Blobs, FinalizedBlocks, FinalizedTip, GameLedger,
+    HeldBlocks, Observation,
 };
 use leani_primitives::{
     Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
@@ -18,13 +19,13 @@ use leani_primitives::{
 };
 use leani_source_api::{
     ConsensusCheckpoint, DataRequest, FieldProjection, FilterSet, FinalitySource, HistorySource,
-    SourceBudget, SourceError, VerificationPolicy,
+    RollupBlock, RollupFinality, SourceBudget, SourceError, VerificationPolicy,
 };
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
-use crate::config::{Config, FinalitySourceKind, L1AnchorConfig, LiveSourceKind};
+use crate::config::{Config, FinalitySourceKind, FinalizedBy, L1AnchorConfig, LiveSourceKind};
 
 /// Most bytes one finalized L1 block may cost: its receipts and, for
 /// dispute games, its body.
@@ -99,6 +100,7 @@ const L1_RESTART_DELAY: Duration = Duration::from_secs(30);
 /// in L1 order across its own restarts, which resume where it stopped.
 pub(crate) fn spawn(
     config: &Config,
+    store: &leani_store_sqlite::SqliteStore,
     cancellation: &CancellationToken,
 ) -> Result<Option<(L1Anchor, mpsc::Receiver<Observation>)>> {
     if config.l1_anchor.is_none() {
@@ -110,10 +112,11 @@ pub(crate) fn spawn(
         .context("the chain entry names no settlement contracts")?;
     let (sender, observations) = mpsc::channel(256);
     let config = config.clone();
+    let store = store.clone();
     let cancellation = cancellation.child_token();
     tokio::spawn(async move {
         while !cancellation.is_cancelled() {
-            let outcome = match lane(&config, anchor).await {
+            let outcome = match lane(&config, anchor, store.clone()).await {
                 Ok(lane) => lane
                     .run(sender.clone(), cancellation.clone())
                     .await
@@ -132,7 +135,11 @@ pub(crate) fn spawn(
     Ok(Some((anchor, observations)))
 }
 
-async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinalizedBlocks>> {
+async fn lane(
+    config: &Config,
+    anchor: L1Anchor,
+    store: leani_store_sqlite::SqliteStore,
+) -> Result<AnchorLane<P2pFinalizedBlocks>> {
     let l1 = config
         .l1_anchor
         .as_ref()
@@ -156,16 +163,49 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
         .op_stack
         .as_ref()
         .map(|op_stack| op_stack.system_config);
-    let mut filters = FilterSet::default();
-    filters.scope.addresses = leani_l1_anchor::log_addresses(&anchor, system_config)
+    let inbox = config.batch_inbox().map_err(anyhow::Error::msg)?;
+    let mut addresses = leani_l1_anchor::log_addresses(&anchor, system_config);
+    let mut recipients: Vec<_> = leani_l1_anchor::calldata_recipient(&anchor)
         .into_iter()
-        .map(Address::from)
         .collect();
     let mut required = CapabilitySet::of(Capability::Logs);
-    if let Some(recipient) = leani_l1_anchor::calldata_recipient(&anchor) {
-        filters.recipients = vec![Address::from(recipient)];
+    match &inbox {
+        // Derivation reads a batcher transaction only when it succeeded,
+        // from the batcher, by its blobs or calldata.
+        Some(BatchInbox::OpStack { inbox, .. }) => {
+            recipients.push(*inbox);
+            required = required
+                .with(Capability::Senders)
+                .with(Capability::BlobFields)
+                .with(Capability::ReceiptOutcome);
+        }
+        // A recipient filter would keep only the logs of transactions to the
+        // inbox, and the rollup confirms assertions in others: the inbox's
+        // log names its post, and every transaction keeps its calldata.
+        Some(BatchInbox::Nitro {
+            sequencer_inbox, ..
+        }) => {
+            addresses.push(*sequencer_inbox);
+            required = required.with(Capability::Calldata);
+        }
+        None => {}
+    }
+    let mut filters = FilterSet::default();
+    filters.scope.addresses = addresses.into_iter().map(Address::from).collect();
+    if !recipients.is_empty() {
+        filters.recipients = recipients.into_iter().map(Address::from).collect();
         required = required.with(Capability::Calldata);
     }
+    let chain_id = ChainId(config.chain_entry()?.chain_id);
+    let batches = inbox.map(|inbox| {
+        let blobs = matches!(inbox, BatchInbox::OpStack { .. }).then(|| {
+            Arc::new(BeaconBlobs {
+                client: reqwest::Client::new(),
+                endpoints: l1.finality.endpoints.clone(),
+            }) as Arc<dyn Blobs>
+        });
+        BatchReader::new(inbox, Arc::new(StoreHeldBlocks { store, chain_id }), blobs)
+    });
     let request = DataRequest {
         chain_id: ChainId(1),
         range: BlockRange::new(BlockNumber(0), BlockNumber(0))?,
@@ -187,7 +227,126 @@ async fn lane(config: &Config, anchor: L1Anchor) -> Result<AnchorLane<P2pFinaliz
         chain_id: config.chain_entry()?.chain_id,
         system_config,
         follow_game_type: l1.game_type.is_none(),
+        batches,
     })
+}
+
+/// The rollup chain this node holds, read from its store.
+struct StoreHeldBlocks {
+    store: leani_store_sqlite::SqliteStore,
+    chain_id: ChainId,
+}
+
+#[async_trait::async_trait]
+impl HeldBlocks for StoreHeldBlocks {
+    async fn hash_at(&self, number: u64) -> Result<Option<alloy_primitives::B256>, SourceError> {
+        Ok(self
+            .store
+            .canonical_block(self.chain_id, BlockNumber(number))
+            .await
+            .map_err(store_error)?
+            .map(|(block, _)| alloy_primitives::B256::from(block.hash.0)))
+    }
+
+    async fn number_of(&self, hash: alloy_primitives::B256) -> Result<Option<u64>, SourceError> {
+        Ok(self
+            .store
+            .canonical_block_by_hash(self.chain_id, BlockHash::new(hash.0))
+            .await
+            .map_err(store_error)?
+            .map(|block| block.number.0))
+    }
+
+    async fn head(&self) -> Result<Option<(u64, u64)>, SourceError> {
+        Ok(self
+            .store
+            .canonical_tip(self.chain_id)
+            .await
+            .map_err(store_error)?
+            .map(|block| (block.number.0, block.timestamp)))
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Called as `map_err(store_error)`.
+fn store_error(error: leani_store_sqlite::StoreError) -> SourceError {
+    SourceError::Unavailable(format!("the node's store: {error}"))
+}
+
+/// Blobs from Beacon APIs, tried in turn. The batch reader checks each blob
+/// against the versioned hash that names it.
+struct BeaconBlobs {
+    client: reqwest::Client,
+    endpoints: Vec<url::Url>,
+}
+
+/// A blob is 131,072 bytes, hex-encoded in JSON.
+const BLOB_JSON_BYTES: usize = 2 * 131_072 + 64;
+
+#[derive(serde::Deserialize)]
+struct BlobsResponse {
+    data: Vec<String>,
+}
+
+#[async_trait::async_trait]
+impl Blobs for BeaconBlobs {
+    async fn blobs(
+        &self,
+        slot: u64,
+        hashes: &[alloy_primitives::B256],
+    ) -> Result<Vec<Vec<u8>>, SourceError> {
+        let query: Vec<String> = hashes
+            .iter()
+            .map(|hash| format!("versioned_hashes={hash}"))
+            .collect();
+        let path = format!("eth/v1/beacon/blobs/{slot}?{}", query.join("&"));
+        let mut failures = Vec::new();
+        for endpoint in &self.endpoints {
+            let endpoint = leani_finality_beacon_api::normalized_endpoint(endpoint);
+            let label = leani_finality_beacon_api::request_label(&endpoint, &path);
+            let fetched = async {
+                let url = leani_finality_beacon_api::request_url(&endpoint, &path)
+                    .map_err(|error| error.to_string())?;
+                let response = self
+                    .client
+                    .get(url)
+                    .header(reqwest::header::ACCEPT, "application/json")
+                    .timeout(Duration::from_secs(30))
+                    .send()
+                    .await
+                    .map_err(|error| error.without_url().to_string())?;
+                let body = leani_finality_beacon_api::read_response(
+                    response,
+                    &label,
+                    BLOB_JSON_BYTES * hashes.len().max(1) + 1_024,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+                let response: BlobsResponse =
+                    serde_json::from_slice(&body).map_err(|error| error.to_string())?;
+                response
+                    .data
+                    .iter()
+                    .map(|blob| {
+                        alloy_primitives::hex::decode(blob).map_err(|error| error.to_string())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            }
+            .await;
+            match fetched {
+                Ok(blobs) if blobs.len() >= hashes.len() => return Ok(blobs),
+                Ok(blobs) => failures.push(format!(
+                    "{label}: {} of {} blobs",
+                    blobs.len(),
+                    hashes.len()
+                )),
+                Err(error) => failures.push(format!("{label}: {error}")),
+            }
+        }
+        Err(SourceError::Unavailable(format!(
+            "no Beacon API served the blobs of slot {slot}: {}",
+            failures.join("; ")
+        )))
+    }
 }
 
 /// Where the L1 anchor lane keeps how far it read and what it learned.
@@ -195,12 +354,12 @@ fn anchor_cursor_path(config: &Config) -> std::path::PathBuf {
     config.data_dir.join("l1-anchor-cursor.json")
 }
 
-/// An op-stack chain's signed heads, and the blocks its L1 anchor
-/// finalizes. They outlive restarts of the lanes that follow them.
+/// An op-stack chain's signed heads, and the blocks its finality from
+/// Ethereum names. They outlive restarts of the lanes that follow them.
 #[derive(Clone, Debug)]
 pub(crate) struct OpHeads {
     pub(crate) heads: watch::Receiver<Option<leani_finality_op_gossip::SignedBlock>>,
-    pub(crate) finalized: Option<watch::Receiver<FinalizedBlock>>,
+    pub(crate) rollup: RollupFinality,
     /// The signed blocks' hashes, which check the blocks JSON-RPC endpoints
     /// serve when the live lane falls back to them.
     pub(crate) signed: Option<leani_source_rpc::feed::SignedHashes>,
@@ -214,6 +373,7 @@ pub(crate) struct OpHeads {
 /// attested head, and start the L1 anchor when the node configures one.
 pub(crate) async fn start_op_heads(
     config: &Config,
+    store: &leani_store_sqlite::SqliteStore,
     attested_heads: leani_source_api::AttestedHeadPublisher,
     cancellation: &CancellationToken,
 ) -> Result<OpHeads> {
@@ -243,7 +403,7 @@ pub(crate) async fn start_op_heads(
     if !config.finality.bootnodes.is_empty() {
         gossip.bootnodes.clone_from(&config.finality.bootnodes);
     }
-    let anchor = spawn(config, cancellation)?;
+    let anchor = spawn(config, store, cancellation)?;
     let (every_block, signed) = match anchor {
         Some((L1Anchor::DisputeGames { .. }, _)) => {
             let (sender, receiver) = mpsc::channel(4_096);
@@ -264,20 +424,23 @@ pub(crate) async fn start_op_heads(
         .kind
         .uses(LiveSourceKind::JsonRpc)
         .then(|| keep_signed_hashes(heads.clone(), cancellation.child_token()));
-    let finalized = match (anchor, signed) {
-        (Some((_, observations)), Some(signed)) => Some(follow_dispute_games(
+    let mut rollup = match (anchor, signed) {
+        (Some((_, observations)), Some(signed)) => follow_dispute_games(
             config,
             fastest_block_ms,
             signed,
             observations,
             rotations,
             cancellation.child_token(),
-        )?),
-        _ => None,
+        )?,
+        _ => RollupFinality::default(),
     };
+    if config.finalized_by() == Some(FinalizedBy::JsonRpc) {
+        rollup.finalized = Some(endpoint_finality(config, cancellation).await?);
+    }
     Ok(OpHeads {
         heads,
-        finalized,
+        rollup,
         signed: hashes,
         over_rpc: Arc::default(),
         returns: Arc::default(),
@@ -394,10 +557,11 @@ async fn l1_finality(
     Ok((source, checkpoint))
 }
 
-/// Finalize the op-stack blocks whose dispute game the registry anchors:
+/// Settle the op-stack blocks whose dispute game the registry anchors:
 /// each game's claim is checked against the output root of the block the
-/// sequencer signed, which `signed` delivers. A new signer the `SystemConfig`
-/// names goes to `rotations`, unless the configuration fixes one.
+/// sequencer signed, which `signed` delivers. The batches the lane reads
+/// finalize blocks before that. A new signer the `SystemConfig` names goes
+/// to `rotations`, unless the configuration fixes one.
 fn follow_dispute_games(
     config: &Config,
     fastest_block_ms: u64,
@@ -405,7 +569,7 @@ fn follow_dispute_games(
     mut observations: mpsc::Receiver<Observation>,
     rotations: watch::Sender<alloy_primitives::Address>,
     cancellation: CancellationToken,
-) -> Result<watch::Receiver<FinalizedBlock>> {
+) -> Result<RollupFinality> {
     let configured_signer = config
         .finality
         .sequencer_signer()
@@ -415,7 +579,8 @@ fn follow_dispute_games(
     let capacity = usize::try_from(4 * 3_600_000 / fastest_block_ms.max(1)).unwrap_or(usize::MAX);
     let mut ledger =
         GameLedger::load(Some(config.data_dir.join("l1-anchor-games.json")), capacity)?;
-    let (finalized, receiver) = watch::channel(None);
+    let (settled, settled_receiver) = watch::channel(None);
+    let (data_final, data_final_receiver) = watch::channel(None);
     tokio::spawn(async move {
         loop {
             tokio::select! {
@@ -442,10 +607,15 @@ fn follow_dispute_games(
                             }
                         }
                     }
+                    if let Observation::DataFinal { number, hash } = observation {
+                        debug!(block = number, "a finalized batch finalized a block");
+                        data_final.send_replace(Some((BlockNumber(number), BlockHash::new(hash.0))));
+                        continue;
+                    }
                     match ledger.observe(observation) {
                         Ok(Some((number, hash))) => {
-                            info!(block = number, "the L1 anchor finalized a block");
-                            finalized.send_replace(Some((BlockNumber(number), BlockHash::new(hash.0))));
+                            info!(block = number, "the L1 anchor settled a block");
+                            settled.send_replace(Some((BlockNumber(number), BlockHash::new(hash.0))));
                         }
                         Ok(None) => {}
                         Err(error) => warn!(%error, "could not record a dispute game"),
@@ -454,22 +624,99 @@ fn follow_dispute_games(
             }
         }
     });
+    Ok(rollup_finality(
+        config,
+        data_final_receiver,
+        settled_receiver,
+    ))
+}
+
+/// The blocks a node's L1 lane names: its batches' `finalized` blocks when
+/// it reads them, and the anchor's `settled` blocks.
+fn rollup_finality(
+    config: &Config,
+    data_final: watch::Receiver<RollupBlock>,
+    settled: watch::Receiver<RollupBlock>,
+) -> RollupFinality {
+    let batches = config.finalized_by() == Some(FinalizedBy::Batches);
+    RollupFinality {
+        finalized: batches.then_some(data_final),
+        settled: Some(settled),
+    }
+}
+
+/// The `finalized` block the chain's JSON-RPC endpoints agree on, as it
+/// moves. The runtime finalizes it only where this node holds that hash.
+pub(crate) async fn endpoint_finality(
+    config: &Config,
+    cancellation: &CancellationToken,
+) -> Result<watch::Receiver<RollupBlock>> {
+    // Gossip and the feed check the blocks the endpoints serve, not their
+    // `finalized` tag: unless the quorum is configured, two of the configured
+    // endpoints must agree on it, so one that is down pauses finality instead
+    // of leaving it to the other.
+    let mut quorum = config
+        .json_rpc_pool(Vec::new())
+        .map_err(anyhow::Error::msg)?;
+    if config.sources.json_rpc.quorum.is_none() {
+        quorum = quorum.at_least(2);
+    }
+    let source = leani_source_rpc::RpcFinalitySource::new(
+        "json-rpc-finality",
+        ChainId(config.chain.chain_id),
+        quorum,
+        Duration::from_millis(config.sources.json_rpc.finality_poll_interval_ms),
+    )?;
+    let checkpoint = ConsensusCheckpoint {
+        beacon_slot: 0,
+        beacon_block_root: [0; 32],
+        execution_block_hash: BlockHash::ZERO,
+        obtained_at_unix_seconds: 0,
+        source: "the endpoints' finalized tag".to_owned(),
+    };
+    let mut events = source
+        .subscribe(checkpoint, cancellation.child_token())
+        .await?;
+    let (sender, receiver) = watch::channel(None);
+    tokio::spawn(async move {
+        while let Some(event) = events.next().await {
+            match event {
+                Ok(leani_source_api::FinalityEvent::Finalized {
+                    block_number,
+                    block_hash,
+                    ..
+                }) => {
+                    sender.send_replace(Some((block_number, block_hash)));
+                }
+                Ok(_) => {}
+                // The closed watch ends the finality stream, and the lanes
+                // restart with a new poller.
+                Err(error) => {
+                    warn!(%error, "the endpoints' finalized tag is unavailable");
+                    return;
+                }
+            }
+        }
+    });
     Ok(receiver)
 }
 
-/// The blocks a Nitro chain's L1 anchor confirms: `confirmed` names the
-/// newest at once and across restarts, `finalized` once this node holds it.
+/// The blocks a Nitro chain's L1 lane names: `confirmed` names the newest
+/// assertion's block at once and across restarts; `rollup` names it
+/// settled once this node holds it, and the blocks its batches finalize.
 #[derive(Clone, Debug)]
 pub(crate) struct Assertions {
-    pub(crate) finalized: watch::Receiver<FinalizedBlock>,
+    pub(crate) rollup: RollupFinality,
     pub(crate) confirmed: watch::Receiver<Option<BlockHash>>,
 }
 
-/// Finalize the Nitro block each confirmed assertion names, once this node
-/// holds it: a block it never followed cannot be finalized. The newest
+/// Settle the Nitro block each confirmed assertion names, once this node
+/// holds it: a block it never followed cannot be settled. The newest
 /// confirmed hash is kept at `confirmed_path`, since the L1 lane resumes
-/// past the assertions it already read.
+/// past the assertions it already read. The batches the lane reads finalize
+/// blocks before that.
 pub(crate) fn follow_assertions(
+    config: &Config,
     store: leani_store_sqlite::SqliteStore,
     chain_id: ChainId,
     mut observations: mpsc::Receiver<Observation>,
@@ -480,7 +727,8 @@ pub(crate) fn follow_assertions(
         .ok()
         .and_then(|text| text.trim().parse::<alloy_primitives::B256>().ok())
         .map(|hash| BlockHash::new(hash.0));
-    let (finalized, finalized_receiver) = watch::channel(None);
+    let (settled, settled_receiver) = watch::channel(None);
+    let (data_final, data_final_receiver) = watch::channel(None);
     let (confirmed, confirmed_receiver) = watch::channel(kept);
     tokio::spawn(async move {
         let mut pending = kept;
@@ -497,6 +745,11 @@ pub(crate) fn follow_assertions(
                         confirmed.send_replace(Some(hash));
                         pending = Some(hash);
                     }
+                    Some(Observation::DataFinal { number, hash }) => {
+                        debug!(block = number, "a finalized batch finalized a block");
+                        data_final.send_replace(Some((BlockNumber(number), BlockHash::new(hash.0))));
+                        continue;
+                    }
                     Some(_) => continue,
                     None => return,
                 },
@@ -505,8 +758,8 @@ pub(crate) fn follow_assertions(
             let Some(hash) = pending else { continue };
             match store.canonical_block_by_hash(chain_id, hash).await {
                 Ok(Some(block)) => {
-                    info!(block = block.number.0, "the L1 anchor finalized a block");
-                    finalized.send_replace(Some((block.number, hash)));
+                    info!(block = block.number.0, "the L1 anchor settled a block");
+                    settled.send_replace(Some((block.number, hash)));
                     pending = None;
                 }
                 Ok(None) => {
@@ -517,7 +770,7 @@ pub(crate) fn follow_assertions(
         }
     });
     Assertions {
-        finalized: finalized_receiver,
+        rollup: rollup_finality(config, data_final_receiver, settled_receiver),
         confirmed: confirmed_receiver,
     }
 }

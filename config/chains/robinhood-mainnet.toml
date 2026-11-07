@@ -21,6 +21,8 @@ history_sources = ["json_rpc"]
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0x23A19d23e89166adedbDcB432518AB01e4272D94"
+# The rollup's sequencerInbox(): the batch poster's posts make blocks final.
+sequencer_inbox = "0xbd0d173eeb87d57a09521c24388a12789f33ba96"
 
 # The signer is a batch poster of SequencerInbox
 # 0xbd0d173eeb87d57a09521c24388a12789f33ba96.

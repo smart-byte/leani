@@ -295,8 +295,13 @@ pub enum Finality {
     /// the Ethereum sync committee attested. A reorg can still remove it.
     #[serde(rename = "Included")]
     Attested = 1,
-    /// Ethereum consensus has finalized the block.
+    /// The block can no longer change: Ethereum consensus finalized it, or,
+    /// on a rollup, the Ethereum block carrying its batch.
     Finalized = 2,
+    /// A rollup's settlement contracts on Ethereum accepted a claim covering
+    /// the block, so withdrawals from it can complete. Ethereum's own blocks
+    /// never reach it.
+    Settled = 3,
 }
 
 impl Finality {
@@ -312,6 +317,7 @@ impl Finality {
             Self::Unattested => "unattested",
             Self::Attested => "attested",
             Self::Finalized => "finalized",
+            Self::Settled => "settled",
         }
     }
 }
@@ -382,9 +388,17 @@ mod tests {
         assert!(Finality::Attested.satisfies(Finality::Unattested));
         assert!(!Finality::Unattested.satisfies(Finality::Attested));
         assert!(!Finality::Attested.satisfies(Finality::Finalized));
+        assert!(Finality::Settled.satisfies(Finality::Finalized));
+        assert!(!Finality::Finalized.satisfies(Finality::Settled));
         assert_eq!(Finality::Unattested.name(), "unattested");
         assert_eq!(Finality::Attested.name(), "attested");
         assert_eq!(Finality::Finalized.name(), "finalized");
+        assert_eq!(Finality::Settled.name(), "settled");
+        // Stored cursors encode a level by its number.
+        assert_eq!(
+            postcard::to_allocvec(&Finality::Settled).expect("encodes"),
+            [3]
+        );
     }
 
     #[test]

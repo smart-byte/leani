@@ -8,6 +8,29 @@ record, and documented RPC contracts.
 
 ### Added
 
+- A rollup's blocks rise to `settled` once its settlement contracts on
+  Ethereum accept a claim covering them: a dispute game the anchor state
+  registry anchored, or a confirmed BoLD assertion. Withdrawals through the
+  canonical bridge wait for it, about 5 days on Base and 7 on OP Mainnet.
+  `publish = "settled"` publishes only settled blocks on a rollup with an
+  `[l1_anchor]`; change streams carry a `settled` marker, coverage reports
+  `chainSettledHead`, `settledThrough`, and settled intervals, and
+  `leani subscribe --finality settled` waits for it. The store moves to
+  schema 28: two small tables, and the change log accepts settled changes;
+  no rows are rewritten.
+- The L1 anchor reads a rollup's batches from finalized Ethereum blocks
+  (`[finality] finalized_by = "batches"`, the default with an `[l1_anchor]`).
+  On an op-stack chain
+  it decodes the batcher's blobs, fetched from the anchor's Beacon APIs and
+  checked against their versioned hashes: a batch that names this node's
+  block as its parent finalizes that block and every block below it. On a
+  Nitro chain each SequencerInbox post numbers the batch's last block.
+  `finalized_by = "json_rpc"` takes the `finalized` block two endpoints
+  agree on instead and needs no `[l1_anchor]`, so a rollup node can finalize
+  blocks without following Ethereum; `"settlement"` waits for settlement.
+  Chain entries name
+  `[op_stack] batch_inbox` and `batcher`, and `[l1_anchor] sequencer_inbox`.
+
 - A chain is picked by name alone. `[chain] chain_id` may be left out: it
   comes from the chain entry, and a given one must still match it. A compact
   configuration's `network` takes every built-in chain or alias, and the
@@ -263,6 +286,13 @@ record, and documented RPC contracts.
   `publicip`, which ask ipinfo.io, icanhazip.com, or ifconfig.me at start and
   every five minutes, warns at startup. A node that takes inbound peers sets
   `nat = "extip:<public address>"`.
+- A rollup block is `finalized` once the Ethereum block carrying its batch is
+  finalized, as op-node and Nitro use the word: minutes after the block
+  instead of days. What `finalized` meant before is now `settled`.
+  Processors that publish `finalized` publish rollup blocks that much
+  sooner; set `publish = "settled"` to keep waiting for settlement. Rows
+  stored as finalized stay so, since a settled block was final; nothing is
+  re-indexed.
 - EraE backfills run about 1.5 to 2.5 times as fast:
   `budgets.history_material.maximum_buffered_frames_per_acquisition` defaults
   to 1,024 frames instead of 128, so chunks read ahead keep downloading while

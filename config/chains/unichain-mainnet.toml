@@ -27,6 +27,10 @@ rpc_endpoints = [
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0xfaaca0a10e4a23c5e01485de07767547d4d8056d"
+# Derivation reads batches from the batcher's transactions to the batch
+# inbox; SystemConfig.batcherHash() on Ethereum mainnet names the batcher.
+batch_inbox = "0xFf00000000000000000000000000000000000130"
+batcher = "0x9ef649e8746cc47a17708a5e86b2d66c7f6c00d1"
 # Consensus bootnodes op-stack clients ship (kona); discovery is shared
 # across the superchain, peers are filtered by their `opstack` entry.
 consensus_bootnodes = [

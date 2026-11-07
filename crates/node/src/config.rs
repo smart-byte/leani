@@ -83,6 +83,23 @@ pub struct L1AnchorConfig {
     pub claims: Option<leani_chain::GameClaims>,
 }
 
+/// Where a rollup node learns that a block's batch is in a finalized
+/// Ethereum block.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinalizedBy {
+    /// The batches themselves, which the L1 anchor reads from finalized
+    /// Ethereum blocks: an op-stack chain's blobs from
+    /// `l1_anchor.finality`'s Beacon APIs, a Nitro chain's `SequencerInbox`
+    /// calls.
+    Batches,
+    /// The `finalized` block the chain's JSON-RPC endpoints agree on, which
+    /// trusts them; the one that needs no L1 anchor.
+    JsonRpc,
+    /// Settlement: a block is finalized as it settles, days later.
+    Settlement,
+}
+
 const fn default_l1_anchor_lookback() -> u64 {
     // Two hours: Nitro rollups confirm an assertion about every hour.
     600
@@ -952,10 +969,15 @@ pub struct FinalityConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sequencer_signer: Option<String>,
     /// For `op_gossip`, and `json_rpc` with the L1 anchor: how far below the
-    /// tip recent frames are pruned while `finalized` waits for the anchor.
+    /// tip recent frames are pruned while blocks wait for `finalized`.
     /// Omitted, about one hour of op-stack blocks, or 3,600 Nitro blocks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub settle_blocks: Option<u64>,
+    /// On a rollup: what makes a block `finalized`. Omitted, `batches` under
+    /// an `[l1_anchor]`; without one nothing is `finalized` unless this is
+    /// `json_rpc`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finalized_by: Option<FinalizedBy>,
 }
 
 impl FinalityConfig {
@@ -1106,6 +1128,7 @@ impl ProcessorConfig {
             (DeliveryEmit::Changes, PublishMode::Unattested) => PublicationPolicy::Unattested,
             (DeliveryEmit::Changes, PublishMode::Attested) => PublicationPolicy::Attested,
             (DeliveryEmit::Changes, PublishMode::Finalized) => PublicationPolicy::Finalized,
+            (DeliveryEmit::Changes, PublishMode::Settled) => PublicationPolicy::Settled,
         }
     }
 }
@@ -1152,6 +1175,9 @@ pub enum PublishMode {
     Unattested,
     Attested,
     Finalized,
+    /// A rollup's settled blocks: finalized ones wait until its settlement
+    /// contracts on Ethereum accept them. Needs an L1 anchor.
+    Settled,
 }
 
 /// What a processor's delivery carries.
@@ -1836,6 +1862,58 @@ impl Config {
         });
     }
 
+    /// What finalizes the rollup's blocks: `finality.finalized_by`, else
+    /// `batches` under an `[l1_anchor]`; `None` when nothing does.
+    pub(crate) fn finalized_by(&self) -> Option<FinalizedBy> {
+        self.finality
+            .finalized_by
+            .or_else(|| self.l1_anchor.as_ref().map(|_| FinalizedBy::Batches))
+    }
+
+    /// Where the L1 anchor reads the rollup's batches: `None` unless it
+    /// finalizes blocks by their batches.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the chain's entry does not name where its
+    /// batches go.
+    pub(crate) fn batch_inbox(&self) -> Result<Option<leani_l1_anchor::BatchInbox>, String> {
+        if self.l1_anchor.is_none() || self.finalized_by() != Some(FinalizedBy::Batches) {
+            return Ok(None);
+        }
+        let chain = self.chain_entry().map_err(|error| error.to_string())?;
+        let hint = "or set finality.finalized_by to \"json_rpc\" or \"settlement\"";
+        if let Some(op_stack) = &chain.op_stack {
+            let (Some(inbox), Some(batcher)) = (op_stack.batch_inbox, op_stack.batcher) else {
+                return Err(format!(
+                    "{}'s entry names no batch_inbox and batcher in [op_stack]; add them, {hint}",
+                    chain.name
+                ));
+            };
+            return Ok(Some(leani_l1_anchor::BatchInbox::OpStack {
+                inbox,
+                batcher,
+                cadence: op_stack.cadence(),
+            }));
+        }
+        match chain.l1_anchor {
+            Some(leani_chain::L1Anchor::NitroRollup {
+                sequencer_inbox: Some(sequencer_inbox),
+                ..
+            }) => Ok(Some(leani_l1_anchor::BatchInbox::Nitro {
+                sequencer_inbox,
+                genesis: chain
+                    .sequencer_feed
+                    .as_ref()
+                    .map_or(0, |feed| feed.first_block),
+            })),
+            _ => Err(format!(
+                "{}'s entry names no sequencer_inbox in [l1_anchor]; add it, {hint}",
+                chain.name
+            )),
+        }
+    }
+
     /// The settlement contracts the L1 anchor reads: the chain entry's, with
     /// any configured dispute game settings in their place. `None` when
     /// neither names any.
@@ -2469,6 +2547,7 @@ impl Config {
         if let Some(anchor) = &self.l1_anchor {
             validate_l1_anchor(self, anchor, &mut errors);
         }
+        validate_finalized_by(self, &mut errors);
         let op_stack = self
             .chain_entry()
             .is_ok_and(|chain| chain.op_stack.is_some());
@@ -2523,6 +2602,12 @@ impl Config {
                 errors.push(ValidationError::new(
                     format!("processors[{index}].publish"),
                     "does not apply with delivery.emit = \"job_result\": a job result covers finalized history; remove publish",
+                ));
+            }
+            if processor.publish == Some(PublishMode::Settled) && self.l1_anchor.is_none() {
+                errors.push(ValidationError::new(
+                    format!("processors[{index}].publish"),
+                    "settled needs a rollup's [l1_anchor], which reads settlement on Ethereum; Ethereum's own blocks end at finalized",
                 ));
             }
             if processor.require_retained_input && !self.raw_history.enabled {
@@ -3193,6 +3278,7 @@ fn validate_artifact_storage(
 fn validate_finality(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
     validate_settle_blocks(finality, errors);
     validate_sequencer_signer(finality, errors);
+    validate_finalized_by_kind(finality, errors);
     if matches!(finality.kind, FinalitySourceKind::OpGossip) {
         validate_enr_bootnodes(&finality.bootnodes, errors);
         return;
@@ -3350,6 +3436,55 @@ fn validate_l1_anchor(config: &Config, anchor: &L1AnchorConfig, errors: &mut Vec
             "l1_anchor.lookback_blocks",
             format!("must be in 1..={MAX_L1_ANCHOR_LOOKBACK}"),
         ));
+    }
+}
+
+fn validate_finalized_by_kind(finality: &FinalityConfig, errors: &mut Vec<ValidationError>) {
+    if finality.finalized_by.is_some()
+        && !matches!(
+            finality.kind,
+            FinalitySourceKind::OpGossip
+                | FinalitySourceKind::JsonRpc
+                | FinalitySourceKind::SequencerFeed
+        )
+    {
+        errors.push(ValidationError::new(
+            "finality.finalized_by",
+            "names what finalizes a rollup's blocks under op_gossip, sequencer_feed, or json_rpc finality",
+        ));
+    }
+}
+
+fn validate_finalized_by(config: &Config, errors: &mut Vec<ValidationError>) {
+    let field = "finality.finalized_by";
+    match (config.finalized_by(), &config.l1_anchor) {
+        (Some(FinalizedBy::Batches | FinalizedBy::Settlement), None) => {
+            errors.push(ValidationError::new(
+                field,
+                "batches and settlement are read on Ethereum by an [l1_anchor]; without one, json_rpc takes the endpoints' finalized block",
+            ));
+        }
+        (Some(FinalizedBy::Batches), Some(anchor)) => match config.batch_inbox() {
+            Ok(Some(leani_l1_anchor::BatchInbox::OpStack { .. }))
+                if !matches!(anchor.finality.kind, FinalitySourceKind::BeaconApi) =>
+            {
+                errors.push(ValidationError::new(
+                    field,
+                    "batches reads op-stack blobs from l1_anchor.finality's Beacon APIs: use beacon_api there, or finalized_by \"json_rpc\" or \"settlement\"",
+                ));
+            }
+            Ok(_) => {}
+            Err(message) => errors.push(ValidationError::new(field, message)),
+        },
+        (Some(FinalizedBy::JsonRpc), _) => {
+            if let Err(message) = config.json_rpc_pool(Vec::new()) {
+                errors.push(ValidationError::new(
+                    field,
+                    format!("json_rpc needs the chain's JSON-RPC endpoints: {message}"),
+                ));
+            }
+        }
+        (Some(FinalizedBy::Settlement), Some(_)) | (None, _) => {}
     }
 }
 
@@ -5168,6 +5303,114 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
             2,
             "{:?}",
             anchor_errors(&config)
+        );
+    }
+
+    #[test]
+    fn finalized_by_names_what_the_node_can_read() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        let errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field == "finality.finalized_by")
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+        };
+        config.l1_anchor = Some(L1AnchorConfig {
+            finality: config.finality.clone(),
+            listener_port: 0,
+            discovery_port: 0,
+            discv5_port: 0,
+            nat: "none".to_owned(),
+            lookback_blocks: 600,
+            factory: None,
+            registry: None,
+            game_type: None,
+            claims: None,
+        });
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        assert_eq!(config.finalized_by(), Some(FinalizedBy::Batches));
+        assert!(errors(&config).is_empty(), "{:?}", errors(&config));
+        assert!(matches!(
+            config.batch_inbox(),
+            Ok(Some(leani_l1_anchor::BatchInbox::OpStack { .. }))
+        ));
+        // Blobs come from the anchor's Beacon APIs.
+        let anchor = config.l1_anchor.as_mut().expect("anchor");
+        anchor.finality.kind = FinalitySourceKind::ConsensusP2p;
+        assert!(
+            errors(&config)
+                .iter()
+                .any(|message| message.contains("Beacon APIs")),
+            "{:?}",
+            errors(&config)
+        );
+        // Settlement alone needs nothing more.
+        config.finality.finalized_by = Some(FinalizedBy::Settlement);
+        assert!(errors(&config).is_empty(), "{:?}", errors(&config));
+        assert_eq!(config.batch_inbox(), Ok(None));
+    }
+
+    #[test]
+    fn only_json_rpc_finalizes_a_rollup_without_an_l1_anchor() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        let errors = |config: &Config| {
+            config
+                .validation_errors()
+                .into_iter()
+                .filter(|error| error.field == "finality.finalized_by")
+                .map(|error| error.message)
+                .collect::<Vec<_>>()
+        };
+        // Ethereum's own blocks finalize by its beacon chain.
+        config.finality.finalized_by = Some(FinalizedBy::JsonRpc);
+        assert!(
+            errors(&config)
+                .iter()
+                .any(|message| message.contains("rollup")),
+            "{:?}",
+            errors(&config)
+        );
+        config.chain.name = "base".to_owned();
+        config.chain.chain_id = 8453;
+        config.finality.kind = FinalitySourceKind::OpGossip;
+        config.finality.checkpoint = String::new();
+        assert!(errors(&config).is_empty(), "{:?}", errors(&config));
+        assert_eq!(config.finalized_by(), Some(FinalizedBy::JsonRpc));
+        // Batches and settlement are read on Ethereum.
+        config.finality.finalized_by = Some(FinalizedBy::Settlement);
+        assert!(
+            errors(&config)
+                .iter()
+                .any(|message| message.contains("[l1_anchor]")),
+            "{:?}",
+            errors(&config)
+        );
+        config.finality.finalized_by = None;
+        assert!(errors(&config).is_empty(), "{:?}", errors(&config));
+        assert_eq!(config.finalized_by(), None);
+    }
+
+    #[test]
+    fn only_a_rollup_with_an_l1_anchor_publishes_settled_blocks() {
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("fixture parses");
+        config.processors[0].publish = Some(PublishMode::Settled);
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "processors[0].publish"
+                    && error.message.contains("l1_anchor")),
+            "{:?}",
+            config.validation_errors()
+        );
+        assert_eq!(
+            config.processors[0].publication_policy(),
+            PublicationPolicy::Settled
         );
     }
 

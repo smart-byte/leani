@@ -180,6 +180,10 @@ pub enum PublicationPolicy {
     /// Finalized blocks only; never an undo.
     #[serde(rename = "finalized_only")]
     Finalized,
+    /// A rollup's settled blocks only: finalized ones wait in the store
+    /// until its settlement contracts accept them.
+    #[serde(rename = "settled_only")]
+    Settled,
     /// The final aggregate of a bounded history job only.
     #[serde(rename = "terminal_only")]
     JobResult,
@@ -195,6 +199,7 @@ impl PublicationPolicy {
             Self::Unattested => Finality::Unattested,
             Self::Attested => Finality::Attested,
             Self::Finalized | Self::JobResult => Finality::Finalized,
+            Self::Settled => Finality::Settled,
         }
     }
 
@@ -872,6 +877,7 @@ mod tests {
         for (stored, policy) in [
             ("included_and_finalized", PublicationPolicy::Attested),
             ("finalized_only", PublicationPolicy::Finalized),
+            ("settled_only", PublicationPolicy::Settled),
             ("terminal_only", PublicationPolicy::JobResult),
         ] {
             let decoded: PublicationPolicy =

@@ -6790,17 +6790,17 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
         let lane_cancellation = cancellation.clone();
         let backfill_control = backfill_control.clone();
         background.spawn("json-rpc lane supervisor", async move {
-            let anchored = crate::l1_anchor::spawn(&lane_config, &lane_cancellation)?.map(
-                |(_, observations)| {
+            let anchored = crate::l1_anchor::spawn(&lane_config, &lane_store, &lane_cancellation)?
+                .map(|(_, observations)| {
                     crate::l1_anchor::follow_assertions(
+                        &lane_config,
                         lane_store.clone(),
                         leani_primitives::ChainId(lane_config.chain.chain_id),
                         observations,
                         lane_config.data_dir.join("l1-anchor-confirmed.txt"),
                         lane_cancellation.child_token(),
                     )
-                },
-            );
+                });
             let signed = follow_sequencer_feed(&lane_config, &lane_cancellation)?;
             supervise_rpc_lane_runs(lane_set, &lane_cancellation, |current, cancellation| {
                 let (store, readiness, rpc_readiness, backfill_control) = (
@@ -7773,27 +7773,29 @@ async fn run_rpc_lanes(
     };
     let quorum = qualified_json_rpc_pool(config, listed).await?;
     let rpc = &config.sources.json_rpc;
-    // With the L1 anchor, confirmed assertions finalize blocks, not the
-    // endpoints' `finalized` tag; with the sequencer feed, nothing else does.
+    // Under the L1 anchor or the sequencer feed, `finalized` can lag far
+    // behind the tip, or never come.
     let settle_blocks = (anchored.is_some() || signed.is_some())
         .then(|| config.finality.settle_blocks.unwrap_or(3_600));
-    let (_unanchored, never_finalized) = tokio::sync::watch::channel(None);
-    let finality: Arc<dyn leani_source_api::FinalitySource> = match (&anchored, &signed) {
-        (Some(assertions), _) => Arc::new(leani_l1_anchor::AnchoredFinality::new(
-            chain_id,
-            assertions.finalized.clone(),
-        )?),
-        (None, Some(_)) => Arc::new(leani_l1_anchor::AnchoredFinality::new(
-            chain_id,
-            never_finalized,
-        )?),
-        (None, None) => Arc::new(leani_source_rpc::RpcFinalitySource::new(
-            "json-rpc-finality",
-            chain_id,
-            quorum.clone(),
-            Duration::from_millis(rpc.finality_poll_interval_ms),
-        )?),
-    };
+    let finality: Arc<dyn leani_source_api::FinalitySource> =
+        if anchored.is_none() && signed.is_none() {
+            Arc::new(leani_source_rpc::RpcFinalitySource::new(
+                "json-rpc-finality",
+                chain_id,
+                quorum.clone(),
+                Duration::from_millis(rpc.finality_poll_interval_ms),
+            )?)
+        } else {
+            let mut rollup = anchored
+                .as_ref()
+                .map(|assertions| assertions.rollup.clone())
+                .unwrap_or_default();
+            if config.finalized_by() == Some(crate::config::FinalizedBy::JsonRpc) {
+                rollup.finalized =
+                    Some(crate::l1_anchor::endpoint_finality(config, cancellation).await?);
+            }
+            Arc::new(leani_l1_anchor::AnchoredFinality::new(chain_id, rollup)?)
+        };
     let mut live = leani_source_rpc::RpcLiveSource::new(
         "json-rpc-live",
         chain_id,
@@ -8235,9 +8237,10 @@ fn catch_up_start(config: &Config, first_block: u64, head: u64) -> Option<u64> {
 }
 
 /// Follow an op-stack chain: every block the sequencer signs on its gossip
-/// becomes the attested head the execution P2P live lane follows. Nothing is
-/// finalized without an L1 anchor, so recent frames are pruned a settle depth
-/// below the tip instead.
+/// becomes the attested head the execution P2P live lane follows. Without an
+/// L1 anchor only the endpoints' `finalized` block finalizes blocks, and only
+/// when configured, so recent frames are pruned a settle depth below the tip
+/// instead.
 ///
 /// A run that no execution peer served hands the next one to the JSON-RPC
 /// endpoints, when the live kinds fall back to them: their blocks must have
@@ -8312,7 +8315,7 @@ async fn run_op_lanes(
     let finality = Arc::new(leani_finality_op_gossip::OpGossipFinality::new(
         chain_id,
         heads.clone(),
-        op_heads.finalized.clone(),
+        op_heads.rollup.clone(),
     )?);
     let live_config = SharedLiveRuntimeConfig {
         max_reorg_depth: usize::try_from(128_000 / block_ms).unwrap_or(usize::MAX),
@@ -8626,6 +8629,7 @@ async fn supervise_network_lanes(
     ) {
         match crate::l1_anchor::start_op_heads(
             &config,
+            &store,
             handles.attested_heads.clone(),
             &handles.cancellation,
         )

@@ -495,8 +495,9 @@ sequencer's signed block gossip and needs no checkpoint. Every block the
 sequencer's key signed becomes the attested head the P2P live lane follows:
 the chain entry's key, a newer one the L1 anchor read, or
 `finality.sequencer_signer` when that is set, so blocks reach `attested`
-about as fast as `unattested`. Nothing
-finalizes a block without an L1 anchor, so recent frames are pruned
+about as fast as `unattested`. Without an L1 anchor nothing finalizes a
+block unless `finality.finalized_by = "json_rpc"` takes the endpoints'
+`finalized` block, so recent frames are pruned
 `finality.settle_blocks` below the newest signed head instead, about one hour
 of blocks when omitted, or sooner when that hour outgrows
 `budgets.recent_raw_soft_bytes`, as Base's large blocks do; settled blocks
@@ -519,7 +520,7 @@ links down from the signed head, and the lane catches up along the head's
 chain, so caught-up blocks are `attested` like the ones that follow. A restart
 resumes from the store's tip. A processor's status shows the catch-up's
 progress in `processedThrough`. Blocks are not `finalized` until the L1
-anchor finalizes them.
+anchor reads the batches that carry them.
 
 Few execution peers take a node they cannot dial back, so a fresh op-stack
 node behind NAT may find none. `sources.live.kind` then takes an ordered
@@ -550,7 +551,8 @@ quorum defaults to 1). The lanes start at a signed block the endpoints
 serve. A feed connection silent for 30 seconds is reopened. Feed relays
 replay only the last few minutes, so after a longer outage blocks become
 `attested` once the lane reaches the feed's blocks again. Without
-`[l1_anchor]` nothing is `finalized`, and recent frames settle
+`[l1_anchor]` nothing is `finalized` unless
+`finality.finalized_by = "json_rpc"`, and recent frames settle
 `finality.settle_blocks` (default 3,600) below the tip.
 
 A fresh store under the feed catches up from the lowest `start_block` among
@@ -637,22 +639,56 @@ endpoints of your own for long backfills.
 
 ### L1 anchor
 
-A rollup's own rules decide when its blocks are final, and they run on
-Ethereum. The opt-in `[l1_anchor]` table reads them: verified Ethereum
-finality (`[l1_anchor.finality]`, `beacon_api` or `consensus_p2p`, as for an
-Ethereum node) names finalized L1 blocks, execution P2P serves their receipts
-checked against their roots, and the settlement contracts in the chain
-entry's `[l1_anchor]` say which rollup block is final. Nothing is fetched from
-an RPC endpoint.
+A rollup's blocks become final on Ethereum twice, and the opt-in
+`[l1_anchor]` table reads both: verified Ethereum finality
+(`[l1_anchor.finality]`, `beacon_api` or `consensus_p2p`, as for an Ethereum
+node) names finalized L1 blocks, and execution P2P serves their bodies and
+receipts, checked against their roots.
+
+`finalized`: the Ethereum block that carries a rollup block's batch is
+finalized, so the block can no longer change, minutes after it was made
+(about two hours on Zora and Soneium, whose batchers post less often).
+`finality.finalized_by` says how the node learns it:
+
+- `batches` (the default under `[l1_anchor]`) reads the batches from the
+  finalized L1 blocks.
+  On an op-stack chain these are the successful transactions from the
+  batcher to the batch inbox, both named in the chain entry's `[op_stack]`
+  (`batch_inbox`, `batcher`; the SystemConfig names later batchers). Their
+  blobs come from the `l1_anchor.finality` Beacon APIs, each checked against
+  the versioned hash its transaction names, so `finality.kind` must be
+  `beacon_api`. A batch names the block it builds on; when that is this
+  node's block and the batch follows the ones before it, that block and
+  every block below it are `finalized`, about one batch after their own.
+  The blobs cost about 2.2 GB a day on Base and 0.8 GB on OP Mainnet. On a
+  Nitro chain each call to the SequencerInbox the entry's `sequencer_inbox`
+  names counts the chain's messages, and message n is block
+  `sequencer_feed.first_block` + n; the block this node holds at the last
+  one is `finalized`. Batch reading starts where the node starts following;
+  history keeps the trust of its source.
+- `json_rpc` takes the `finalized` block the chain's JSON-RPC endpoints
+  agree on, which trusts them: two of them must agree where there are two,
+  or `sources.json_rpc.quorum` when that is set. It is the one that needs
+  no `[l1_anchor]`; without the anchor the node follows no Ethereum blocks,
+  and no block is `settled`.
+- `settlement` finalizes a block only when it settles.
+
+Batches prove that a block's transactions and order are fixed on Ethereum,
+not its execution: until it settles, its state root is the one the
+sequencer signed.
+
+`settled`: the settlement contracts in the chain entry's `[l1_anchor]`
+accepted a claim covering the block, days later. A settled block is also
+finalized. Nothing is fetched from an RPC endpoint.
 
 - Nitro chains (Arbitrum One and Nova, Robinhood Chain): a confirmed BoLD
-  assertion names its block hash; that block is `finalized` once this node
-  holds it. Confirmation takes about 6.4 days. The endpoints' `finalized`
-  tag no longer finalizes anything, and recent frames are pruned
-  `finality.settle_blocks` (default 3,600) below the tip.
+  assertion names its block hash; that block is `settled` once this node
+  holds it. Confirmation takes about 6.4 days. Recent frames are pruned
+  `finality.settle_blocks` (default 3,600) below the tip while blocks wait
+  for finality.
 - Op-stack chains: a game of the respected type is checked when it is
   created against the output root of the block the sequencer signed, and
-  that block is `finalized` once the anchor state registry moves to the
+  that block is `settled` once the anchor state registry moves to the
   game, about 3.5 days later on Soneium, five on Base, and seven on the
   others. OP Mainnet's, Unichain's, Ink's, and Soneium's games claim super
   roots (`claims = "super_roots"`): the creation call carries the super
@@ -664,8 +700,9 @@ an RPC endpoint.
 
 The lane reads the receipts of the finalized L1 blocks whose logs bloom may
 hold the contracts' logs, at most about 1 GB a day. Op-stack game creations
-also need their call data, so on op-stack chains it reads every block's
-receipts and body, about 2 GB a day. Where
+and batches also need call data, so on op-stack chains, and on Nitro chains
+that read batches, it reads every block's receipts and body, about 2 GB a
+day. Where
 it stopped survives restarts (`l1-anchor-cursor.json`); a cold start reads
 `lookback_blocks` (600 by default) below the first finalized block. Its
 execution P2P uses its own ports, `listener_port`, `discovery_port`, and
@@ -679,7 +716,7 @@ anchor reads that type's games. What the lane learned stays in
 `l1-anchor-cursor.json` across restarts. A rotation from before the node
 first ran reaches it only through the chain entry or the configuration.
 The claim format stays the entry's: after a move between output-root and
-super-root games, the anchor finalizes nothing until `l1_anchor.claims`
+super-root games, the anchor settles nothing until `l1_anchor.claims`
 names the new one. `finality.sequencer_signer` fixes the signer, and
 `l1_anchor.factory`, `registry`, `game_type`, and `claims` replace the
 entry's contracts; a configured `game_type` stays when the registry
@@ -719,6 +756,9 @@ Publication values are:
 - `finalized`: publish only finalized `apply` records. Unfinalized changes
   wait in the store for verified finality, count against the delivery budget
   meanwhile, and undo is never published.
+- `settled`: on a rollup with an `[l1_anchor]`, publish only `apply` records
+  of settled blocks. Finalized changes wait in the store for settlement,
+  days, and count against the delivery budget meanwhile.
 
 `[processors.delivery] emit = "job_result"` replaces `publish` for a bounded
 backfill: it publishes its terminal aggregate and then becomes

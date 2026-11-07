@@ -17,6 +17,7 @@ alloy-primitives.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 leani-chain = { path = "../chain" }
+leani-op-batches = { path = "../op-batches" }
 leani-primitives = { path = "../primitives" }
 leani-source-api = { path = "../source-api" }
 serde.workspace = true

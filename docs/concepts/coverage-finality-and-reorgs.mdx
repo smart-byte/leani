@@ -19,7 +19,8 @@ are related but deliberately not collapsed into one boolean.
 ## Finality levels and publish modes
 
 Every record carries one level. A block only ever rises: unattested,
-attested, finalized. It is never published twice; each rise is a marker.
+attested, finalized, and on a rollup settled. It is never published twice;
+each rise is a marker.
 
 | Level | Evidence | Typical delay after the slot starts | Can be undone |
 |---|---|---|---|
@@ -27,13 +28,31 @@ attested, finalized. It is never published twice; each rise is a marker.
 | `attested` | At least 342 of 512 sync-committee members signed it (or a descendant), verified locally from a light-client update. After Glamsterdam the committee signs the next beacon block, which builds on this payload | ~15 s today; ~25–29 s after Glamsterdam | Yes, by a reorg |
 | `finalized` | Casper FFG finality, verified from a light-client finality update | ~13–19 min | No |
 
+On a rollup, `attested` is the sequencer's signature on the block, and the
+last two levels come from Ethereum:
+
+| Level | Evidence | Typical delay after the block | Can be undone |
+|---|---|---|---|
+| `finalized` | The Ethereum block carrying the block's batch is finalized, so the block can no longer change and anyone can derive it from Ethereum; on Arbitrum Nova, an AnyTrust chain, from Ethereum and the data its committee keeps. Op-node and Nitro call this finalized too | ~15–30 min; ~2 h on Zora and Soneium, whose batchers post less often | No |
+| `settled` | The rollup's settlement contracts on Ethereum accepted a claim covering the block, so withdrawals from it can complete: a dispute game the anchor state registry anchored, or a confirmed BoLD assertion | ~5 days on Base, ~7 on OP Mainnet, ~6.4 on Arbitrum One | No |
+
+`finality.finalized_by` sets where `finalized` comes from: the batches
+themselves, which the L1 anchor reads from finalized Ethereum blocks (the
+default), the `finalized` block the chain's JSON-RPC endpoints agree on,
+which needs no L1 anchor, or settlement alone. Batches prove that a block's
+transactions and their order are fixed on Ethereum and that the batcher
+built on the block this node holds; they do not re-execute it, so the state
+root is the one the sequencer signed until the block settles. Ethereum's own
+blocks end at `finalized`.
+
 `publish` sets the first level a processor's consumers see:
 
 | `publish` | First level | Markers | Query-then-follow |
 |---|---|---|---|
 | `unattested` (default) | `unattested` | `attested`, then `finalized` | Yes |
 | `attested` | `attested` | `finalized` | No: its state holds unpublished unattested blocks |
-| `finalized` | `finalized` | none | No |
+| `finalized` | `finalized` | `settled`, on a rollup | No |
+| `settled` | `settled`, on a rollup with an L1 anchor | none | No |
 
 An Ethereum RPC's `latest` corresponds to `unattested`; Leani's JSON-RPC
 `latest` is the delivered tip at any level, and `safe` and `finalized` name

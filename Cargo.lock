@@ -4497,6 +4497,7 @@ dependencies = [
  "async-trait",
  "futures",
  "leani-chain",
+ "leani-op-batches",
  "leani-primitives",
  "leani-source-api",
  "serde",

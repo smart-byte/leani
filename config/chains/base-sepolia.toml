@@ -28,6 +28,10 @@ rpc_endpoints = [
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum Sepolia.
 sequencer_signer = "0xb830b99c95ea32300039624cb567d324d4b1d83c"
+# Derivation reads batches from the batcher's transactions to the batch
+# inbox; SystemConfig.batcherHash() on Ethereum Sepolia names the batcher.
+batch_inbox = "0xff00000000000000000000000000000000084532"
+batcher = "0xfc56e7272eebbba5bc6c544e159483c4a38f8ba3"
 # Base's own client's consensus bootnodes for Sepolia.
 consensus_bootnodes = [
   "enr:-J64QFa3qMsONLGphfjEkeYyF6Jkil_jCuJmm7_a42ckZeUQGLVzrzstZNb1dgBp1GGx9bzImq5VxJLP-BaptZThGiWGAYrTytOvgmlkgnY0gmlwhGsV-zeHb3BzdGFja4S0lAUAiXNlY3AyNTZrMaEDahfSECTIS_cXyZ8IyNf4leANlZnrsMEWTkEYxf4GMCmDdGNwgiQGg3VkcIIkBg",

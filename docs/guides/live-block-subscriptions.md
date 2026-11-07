@@ -42,7 +42,9 @@ leani subscribe blocks --format json |
 
 Rows say `unattested`, `attested` or `finalized`, and JSON reports the same
 `finality`; see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes). Use `--finality attested` or
-`--finality finalized` when the first result must have that level. Attached
+`--finality finalized` when the first result must have that level, and on a
+rollup with an L1 anchor `--finality settled` for blocks its settlement
+contracts accepted. Attached
 output follows the node's configured source trust; a dataset's finality label
 does not become a cryptographic proof simply by subscribing to it. Against a
 node that publishes unattested blocks, an attached `--finality attested` or

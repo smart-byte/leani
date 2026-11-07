@@ -77,9 +77,11 @@ than guessing, because flags change between releases. If
    `--yes` only after they approve it.
 4. **Respect the finality label.** Rows say `unattested` (peers agree and it
    passes Leani's header rules; it can be undone), `attested` (signed by the
-   sync committee; a reorg can still remove it), or `finalized`. Do not
-   present `unattested` or `attested` data as final; pass `--finality
-   finalized` when correctness matters more than latency. `--once` returns
+   sync committee; a reorg can still remove it), or `finalized`; a rollup's
+   blocks reach `settled` too, days later, once its settlement contracts on
+   Ethereum accept them, which withdrawals wait for. Do not present
+   `unattested` or `attested` data as final; pass `--finality finalized`
+   when correctness matters more than latency. `--once` returns
    the first row that meets `--finality` (default `unattested`).
 5. **Dispatch JSON rows on `schema`.** A stream mixes
    `leani.block-summary.v1` or `leani.market-price.v2` rows with

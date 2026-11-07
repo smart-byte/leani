@@ -7469,6 +7469,9 @@ impl FinalityRuntime {
                             .map_or(through, |old| old.max(through)),
                     );
                 }
+                // Settlement needs the chain's canonical blocks, which only
+                // the shared runtime keeps.
+                FinalityEvent::Settled { .. } => {}
                 FinalityEvent::Disagreement {
                     first,
                     second,
@@ -7527,6 +7530,12 @@ pub struct SharedFinalityReport {
     /// Recent frames are pruned through here without finality.
     #[serde(default)]
     pub settled_through: Option<BlockNumber>,
+    /// Settlement events applied.
+    #[serde(default)]
+    pub settlement_events: u64,
+    /// The newest block settlement reached, among blocks this node holds.
+    #[serde(default)]
+    pub settlement_through: Option<BlockNumber>,
 }
 
 impl SharedFinalityReport {
@@ -7698,6 +7707,7 @@ impl SharedFinalityRuntime {
     /// blocks that do not link to it, is a [`RuntimeError::FinalityReorg`]
     /// when those blocks are unfinalized, and a
     /// [`RuntimeError::FinalityContradiction`] when they are finalized.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(
         &self,
         checkpoint: ConsensusCheckpoint,
@@ -7709,6 +7719,7 @@ impl SharedFinalityRuntime {
             .await?;
         let mut report = SharedFinalityReport::default();
         let mut pending_finalized = None;
+        let mut pending_settlement = None;
         let mut last_applied = None;
         let mut retries = FinalityRetries::new();
         let mut retry = tokio::time::interval(FINALITY_ANCHOR_RETRY_INTERVAL);
@@ -7725,13 +7736,17 @@ impl SharedFinalityRuntime {
                     self.settle(&mut report).await?;
                     continue;
                 }
-                _ = retry.tick(), if pending_finalized.is_some() => {
-                    let Some(finalized) = pending_finalized else {
-                        continue;
-                    };
-                    if self.apply_finalized(finalized, &mut report).await? {
+                _ = retry.tick(), if pending_finalized.is_some() || pending_settlement.is_some() => {
+                    if let Some(finalized) = pending_finalized
+                        && self.apply_finalized(finalized, &mut report).await?
+                    {
                         pending_finalized = None;
                         last_applied = Some(finalized);
+                    }
+                    if let Some(settled) = pending_settlement
+                        && self.apply_settlement(settled, &mut report).await?
+                    {
+                        pending_settlement = None;
                     }
                     continue;
                 }
@@ -7769,6 +7784,16 @@ impl SharedFinalityRuntime {
                     if self.apply_finalized(finalized, &mut report).await? {
                         pending_finalized = None;
                         last_applied = Some(finalized);
+                    }
+                }
+                FinalityEvent::Settled {
+                    block_number,
+                    block_hash,
+                } => {
+                    let settled = (block_number, block_hash);
+                    pending_settlement = Some(settled);
+                    if self.apply_settlement(settled, &mut report).await? {
+                        pending_settlement = None;
                     }
                 }
                 FinalityEvent::Disagreement {
@@ -7811,6 +7836,7 @@ impl SharedFinalityRuntime {
     ) -> Result<SharedFinalityReport, RuntimeError> {
         let mut report = SharedFinalityReport::default();
         let mut pending_finalized = None;
+        let mut pending_settlement = None;
         let mut last_applied = None;
         let mut retries = FinalityRetries::new();
         let mut reconnect_attempt = 0_u32;
@@ -7870,19 +7896,25 @@ impl SharedFinalityRuntime {
                             .inspect_err(|_| signal_readiness(Some(&readiness), false))?;
                         continue;
                     }
-                    _ = retry.tick(), if pending_finalized.is_some() => {
-                        let Some(finalized) = pending_finalized else {
-                            continue;
-                        };
+                    _ = retry.tick(), if pending_finalized.is_some() || pending_settlement.is_some() => {
                         // A contradiction halts the lane: readiness drops
                         // with the error.
-                        if self
-                            .apply_finalized(finalized, &mut report)
-                            .await
-                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?
+                        if let Some(finalized) = pending_finalized
+                            && self
+                                .apply_finalized(finalized, &mut report)
+                                .await
+                                .inspect_err(|_| signal_readiness(Some(&readiness), false))?
                         {
                             pending_finalized = None;
                             last_applied = Some(finalized);
+                        }
+                        if let Some(settled) = pending_settlement
+                            && self
+                                .apply_settlement(settled, &mut report)
+                                .await
+                                .inspect_err(|_| signal_readiness(Some(&readiness), false))?
+                        {
+                            pending_settlement = None;
                         }
                         continue;
                     }
@@ -7921,6 +7953,20 @@ impl SharedFinalityRuntime {
                         {
                             pending_finalized = None;
                             last_applied = Some(finalized);
+                        }
+                    }
+                    Some(Ok(FinalityEvent::Settled {
+                        block_number,
+                        block_hash,
+                    })) => {
+                        let settled = (block_number, block_hash);
+                        pending_settlement = Some(settled);
+                        if self
+                            .apply_settlement(settled, &mut report)
+                            .await
+                            .inspect_err(|_| signal_readiness(Some(&readiness), false))?
+                        {
+                            pending_settlement = None;
                         }
                     }
                     Some(Ok(FinalityEvent::Disagreement {
@@ -7975,6 +8021,61 @@ impl SharedFinalityRuntime {
         }
         signal_readiness(Some(&readiness), false);
         Ok(report)
+    }
+
+    /// Apply the settlement of `settled`, a rollup block: finalize through it
+    /// first, since settlement implies its data is final, then record the
+    /// chain's settled head and tell each processor's consumers. Returns
+    /// `false` while this node does not hold the block finalized.
+    async fn apply_settlement(
+        &self,
+        (number, hash): (BlockNumber, BlockHash),
+        report: &mut SharedFinalityReport,
+    ) -> Result<bool, RuntimeError> {
+        let chain_id = self.source.descriptor().chain_id;
+        let finalized = self.store.finalized_canonical_head(chain_id).await?;
+        if finalized.is_none_or(|head| head.number < number) {
+            let block = FinalizedBlock {
+                number,
+                hash,
+                beacon_slot: number.0,
+                beacon_block_root: [0; 32],
+            };
+            if !self.apply_finalized(block, report).await? {
+                return Ok(false);
+            }
+        }
+        if !self
+            .store
+            .mark_chain_settled(chain_id, number, hash)
+            .await?
+        {
+            debug!(block = number.0, %hash, "settlement waits for this node to hold its block finalized");
+            return Ok(false);
+        }
+        self.settle_processors().await;
+        report.settlement_events = report.settlement_events.saturating_add(1);
+        report.settlement_through = Some(
+            report
+                .settlement_through
+                .map_or(number, |old| old.max(number)),
+        );
+        Ok(true)
+    }
+
+    /// Tell each processor's consumers how far its finalized blocks are
+    /// settled. One processor's failure does not hold back the others; the
+    /// next finality advance retries it.
+    async fn settle_processors(&self) {
+        for processor in &self.processors {
+            if let Err(error) = self.store.mark_settled(processor.descriptor()).await {
+                error!(
+                    processor = %processor.descriptor().id,
+                    %error,
+                    "could not mark a processor's blocks settled; the next finality advance retries"
+                );
+            }
+        }
     }
 
     async fn settle(&self, report: &mut SharedFinalityReport) -> Result<(), RuntimeError> {
@@ -8054,6 +8155,9 @@ impl SharedFinalityRuntime {
             }
             report.record_processor(id, block_hash, &finality);
         }
+        // A processor that finalized past the settled head after it moved
+        // hears of settlement now.
+        self.settle_processors().await;
         let pruned = self
             .store
             .prune_recent_frames(
@@ -22589,6 +22693,67 @@ mod tests {
                 .reorg_recent_frames(ChainId(1), &[frame.block], &[])
                 .await
                 .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_finalizes_its_block_first_and_settles_the_chain() {
+        let range = BlockRange::new(BlockNumber(7), BlockNumber(8)).expect("range");
+        let first = live_fixture(7, BlockHash::new([0x06; 32]));
+        let second = live_fixture(8, first.block.hash);
+        let checkpoint = ConsensusCheckpoint {
+            beacon_slot: 1,
+            beacon_block_root: [1; 32],
+            execution_block_hash: BlockHash::ZERO,
+            obtained_at_unix_seconds: 1,
+            source: "fixture".to_owned(),
+        };
+        // The rollup settles block 8 while only block 7 is finalized.
+        let source = Arc::new(ScriptedFinalitySource::new(
+            fixture_source_descriptor("settling-rollup", range),
+            checkpoint.clone(),
+            vec![
+                FinalityStep::Event(FinalityEvent::Finalized {
+                    block_number: first.block.number,
+                    block_hash: first.block.hash,
+                    beacon_slot: 7,
+                    beacon_block_root: [0; 32],
+                }),
+                FinalityStep::Event(FinalityEvent::Settled {
+                    block_number: second.block.number,
+                    block_hash: second.block.hash,
+                }),
+            ],
+        ));
+        let processor = Arc::new(BlockLocalCounter::default());
+        let (_directory, store) = store().await;
+        for (sequence, frame) in [(1, &first), (2, &second)] {
+            store
+                .store_recent_frame(frame)
+                .await
+                .expect("execution lane frame");
+            apply_live_frame(&store, processor.as_ref(), frame, sequence).await;
+        }
+        let report = SharedFinalityRuntime::new(
+            store.clone(),
+            source,
+            vec![processor],
+            SharedFinalityRuntimeConfig {
+                minimum_recent_blocks: 1,
+                recent_soft_bytes: 1_000_000,
+                recent_hard_bytes: 2_000_000,
+            },
+        )
+        .expect("shared finality runtime")
+        .run(checkpoint, CancellationToken::new())
+        .await
+        .expect("finality run");
+        assert_eq!(report.finalized_through, Some(BlockNumber(8)));
+        assert_eq!(report.settlement_through, Some(BlockNumber(8)));
+        assert_eq!(report.settlement_events, 1);
+        assert_eq!(
+            store.settled_head(ChainId(1)).await.expect("settled head"),
+            Some((BlockNumber(8), second.block.hash))
         );
     }
 
