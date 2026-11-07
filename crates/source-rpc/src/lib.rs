@@ -114,9 +114,9 @@ fn unix_now() -> u64 {
 pub enum FetchMode {
     /// The header, checked against its hash.
     Header,
-    /// The header and receipts, checked against the receipts root.
-    Receipts,
-    /// Header, transactions, and receipts, checked against both roots.
+    /// Header, transactions, and receipts, checked against both roots. A
+    /// receipt or log names its transaction only through the transaction
+    /// at its index, so receipts come with the transactions.
     Full,
 }
 
@@ -129,13 +129,13 @@ impl FetchMode {
             Capability::Transactions,
             Capability::Calldata,
             Capability::Senders,
+            Capability::Receipts,
+            Capability::Logs,
         ]
         .into_iter()
         .any(|capability| required.contains(capability))
         {
             Self::Full
-        } else if required.contains(Capability::Receipts) || required.contains(Capability::Logs) {
-            Self::Receipts
         } else {
             Self::Header
         }
@@ -144,15 +144,15 @@ impl FetchMode {
     pub(crate) const fn byte(self) -> u8 {
         match self {
             Self::Header => 0,
-            Self::Receipts => 1,
             Self::Full => 2,
         }
     }
 
+    /// A planned chunk's mode; any byte but a header-only one fetches whole
+    /// blocks, as receipts need their transactions.
     pub(crate) const fn from_byte(byte: u8) -> Self {
         match byte {
             0 => Self::Header,
-            1 => Self::Receipts,
             _ => Self::Full,
         }
     }
@@ -2071,14 +2071,17 @@ mod tests {
             )
         };
         assert_eq!(mode(&[]), FetchMode::Header);
-        assert_eq!(mode(&[Capability::Logs]), FetchMode::Receipts);
+        // A log names its transaction only through the one at its index.
+        assert_eq!(mode(&[Capability::Logs]), FetchMode::Full);
         assert_eq!(
             mode(&[Capability::Logs, Capability::Transactions]),
             FetchMode::Full
         );
         assert_eq!(
-            FetchMode::from_byte(FetchMode::Receipts.byte()),
-            FetchMode::Receipts
+            FetchMode::from_byte(FetchMode::Header.byte()),
+            FetchMode::Header
         );
+        // A chunk planned to read receipts alone.
+        assert_eq!(FetchMode::from_byte(1), FetchMode::Full);
     }
 }

@@ -354,6 +354,13 @@ record, and documented RPC contracts.
 - A JSON-RPC lane whose stored newest block was replaced while the node was
   down reverts it, up to 64 blocks deep, instead of refusing to start again
   and again.
+- JSON-RPC sources check every transaction against the transactions root,
+  Arbitrum's retryable tickets, redeems, and unsigned and contract
+  transactions included; a block with a transaction they cannot check is
+  refused, where it was taken unchecked. Transaction hashes, and the
+  transaction a receipt or log belongs to, come from the checked bytes
+  instead of the endpoint's JSON, so receipts and logs are fetched with
+  their transactions.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of

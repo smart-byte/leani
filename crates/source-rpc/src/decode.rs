@@ -116,6 +116,7 @@ fn typed_rlp(ty: u8, fields: &[&dyn Encodable]) -> Vec<u8> {
 
 /// The EIP-2718 bytes of a rollup's system transaction, which no Ethereum
 /// type covers. `None` for a type this release does not re-encode.
+#[allow(clippy::too_many_lines)]
 fn rollup_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
     Ok(match ty {
         // ArbitrumInternalTx: rlp([chain id, data]).
@@ -123,6 +124,103 @@ fn rollup_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
             let chain_id = quantity(tx, "chainId")?;
             let input: Bytes = parsed(tx, "input")?;
             Some(typed_rlp(ty, &[&chain_id, &input]))
+        }
+        // ArbitrumUnsignedTx: rlp([chain id, from, nonce, max fee, gas, to,
+        // value, data]), `to` empty for a creation.
+        0x65 => {
+            let fields = (
+                quantity(tx, "chainId")?,
+                parsed::<Address>(tx, "from")?,
+                quantity(tx, "nonce")?,
+                quantity(tx, "maxFeePerGas")?,
+                quantity(tx, "gas")?,
+                call_target(tx, "to")?,
+                quantity(tx, "value")?,
+                parsed::<Bytes>(tx, "input")?,
+            );
+            Some(typed_rlp(
+                ty,
+                &[
+                    &fields.0, &fields.1, &fields.2, &fields.3, &fields.4, &fields.5, &fields.6,
+                    &fields.7,
+                ],
+            ))
+        }
+        // ArbitrumContractTx: rlp([chain id, request id, from, max fee, gas,
+        // to, value, data]).
+        0x66 => {
+            let fields = (
+                quantity(tx, "chainId")?,
+                parsed::<B256>(tx, "requestId")?,
+                parsed::<Address>(tx, "from")?,
+                quantity(tx, "maxFeePerGas")?,
+                quantity(tx, "gas")?,
+                call_target(tx, "to")?,
+                quantity(tx, "value")?,
+                parsed::<Bytes>(tx, "input")?,
+            );
+            Some(typed_rlp(
+                ty,
+                &[
+                    &fields.0, &fields.1, &fields.2, &fields.3, &fields.4, &fields.5, &fields.6,
+                    &fields.7,
+                ],
+            ))
+        }
+        // ArbitrumRetryTx: rlp([chain id, nonce, from, max fee, gas, to,
+        // value, data, ticket id, refund to, max refund, submission fee
+        // refund]).
+        0x68 => {
+            let fields = (
+                quantity(tx, "chainId")?,
+                quantity(tx, "nonce")?,
+                parsed::<Address>(tx, "from")?,
+                quantity(tx, "maxFeePerGas")?,
+                quantity(tx, "gas")?,
+                call_target(tx, "to")?,
+                quantity(tx, "value")?,
+                parsed::<Bytes>(tx, "input")?,
+                parsed::<B256>(tx, "ticketId")?,
+                parsed::<Address>(tx, "refundTo")?,
+                quantity(tx, "maxRefund")?,
+                quantity(tx, "submissionFeeRefund")?,
+            );
+            Some(typed_rlp(
+                ty,
+                &[
+                    &fields.0, &fields.1, &fields.2, &fields.3, &fields.4, &fields.5, &fields.6,
+                    &fields.7, &fields.8, &fields.9, &fields.10, &fields.11,
+                ],
+            ))
+        }
+        // ArbitrumSubmitRetryableTx: rlp([chain id, request id, from, L1
+        // base fee, deposit value, max fee, gas, retry to, retry value,
+        // beneficiary, max submission fee, fee refund address, retry data]).
+        // The JSON's own `to`, `value`, and `input` are the call the ticket
+        // makes to the ArbRetryableTx precompile.
+        0x69 => {
+            let fields = (
+                quantity(tx, "chainId")?,
+                parsed::<B256>(tx, "requestId")?,
+                parsed::<Address>(tx, "from")?,
+                quantity(tx, "l1BaseFee")?,
+                quantity(tx, "depositValue")?,
+                quantity(tx, "maxFeePerGas")?,
+                quantity(tx, "gas")?,
+                call_target(tx, "retryTo")?,
+                quantity(tx, "retryValue")?,
+                parsed::<Address>(tx, "beneficiary")?,
+                quantity(tx, "maxSubmissionFee")?,
+                parsed::<Address>(tx, "refundTo")?,
+                parsed::<Bytes>(tx, "retryData")?,
+            );
+            Some(typed_rlp(
+                ty,
+                &[
+                    &fields.0, &fields.1, &fields.2, &fields.3, &fields.4, &fields.5, &fields.6,
+                    &fields.7, &fields.8, &fields.9, &fields.10, &fields.11, &fields.12,
+                ],
+            ))
         }
         // ArbitrumDepositTx: rlp([chain id, L1 request id, from, to, value]).
         0x64 => {
@@ -139,11 +237,7 @@ fn rollup_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
         0x7e => {
             let source_hash: B256 = parsed(tx, "sourceHash")?;
             let from: Address = parsed(tx, "from")?;
-            let to = if tx["to"].is_null() {
-                TxKind::Create
-            } else {
-                TxKind::Call(parsed(tx, "to")?)
-            };
+            let to = call_target(tx, "to")?;
             let mint = optional_quantity(tx, "mint")?.unwrap_or_default();
             let value = quantity(tx, "value")?;
             let gas = quantity(tx, "gas")?;
@@ -164,6 +258,15 @@ fn rollup_transaction(ty: u8, tx: &Value) -> Result<Option<Vec<u8>>, RpcError> {
             ))
         }
         _ => None,
+    })
+}
+
+/// The address `field` names, or a creation where it is null or absent.
+fn call_target(tx: &Value, field: &str) -> Result<TxKind, RpcError> {
+    Ok(if tx[field].is_null() {
+        TxKind::Create
+    } else {
+        TxKind::Call(parsed(tx, field)?)
     })
 }
 
@@ -190,7 +293,6 @@ pub fn decode_block(block: &Value, receipts: &Value) -> Result<DecodedBlock, Rpc
         .ok_or_else(|| RpcError::Malformed("block has no transaction list".to_owned()))?;
     let (transactions, transactions_root) = if served.iter().all(Value::is_object) {
         let mut transactions = Vec::with_capacity(served.len());
-        let mut unchecked = None;
         for tx in served {
             let ty = transaction_type(tx)?;
             let encoded = match rollup_transaction(ty, tx)? {
@@ -199,22 +301,23 @@ pub fn decode_block(block: &Value, receipts: &Value) -> Result<DecodedBlock, Rpc
                     .ok()
                     .map(|transaction| transaction.inner.into_inner().encoded_2718()),
             };
-            if encoded.is_none() && unchecked.is_none() {
-                unchecked = Some(format!("transaction type {ty:#04x}"));
+            // A transaction that cannot be encoded cannot be checked, and
+            // then nothing the block serves is.
+            if encoded.is_none() {
+                return Err(RpcError::Unverified(format!(
+                    "transaction type {ty:#04x} cannot be checked against the transactions root"
+                )));
             }
             transactions.push((tx.clone(), encoded));
         }
-        let root = match unchecked {
-            Some(reason) => Check::Unchecked(reason),
-            None => check(
-                alloy_trie::root::ordered_trie_root_with_encoder(
-                    &transactions,
-                    |(_, bytes): &(Value, Option<Vec<u8>>), out| {
-                        out.extend_from_slice(bytes.as_deref().unwrap_or_default());
-                    },
-                ) == header.transactions_root,
-            ),
-        };
+        let root = check(
+            alloy_trie::root::ordered_trie_root_with_encoder(
+                &transactions,
+                |(_, bytes): &(Value, Option<Vec<u8>>), out| {
+                    out.extend_from_slice(bytes.as_deref().unwrap_or_default());
+                },
+            ) == header.transactions_root,
+        );
         (Some(transactions), root)
     } else {
         (
@@ -393,12 +496,31 @@ pub fn frame(
     {
         return Err(RpcError::Unverified(format!("{:?}", decoded.check)));
     }
+    // A receipt names its transaction only in the endpoint's JSON: it binds
+    // to the checked transaction at its index.
+    if decoded.receipts.is_some() && decoded.transactions.is_none() {
+        return Err(RpcError::Unverified(
+            "receipts came without the transactions they belong to".to_owned(),
+        ));
+    }
     let header = &decoded.header;
     let mut transactions = Vec::new();
+    let mut hashes = Vec::new();
     for (index, (tx, encoded)) in decoded.transactions.iter().flatten().enumerate() {
         let index = u32::try_from(index)
             .map_err(|_| RpcError::Malformed("transaction index overflows u32".to_owned()))?;
-        let hash: B256 = parsed(tx, "hash")?;
+        let hash = encoded
+            .as_deref()
+            .map(alloy_primitives::keccak256)
+            .ok_or_else(|| {
+                RpcError::Unverified(format!("transaction {index} has no checked bytes"))
+            })?;
+        if parsed::<B256>(tx, "hash")? != hash {
+            return Err(RpcError::Unverified(format!(
+                "transaction {index} is served with another hash than its bytes have"
+            )));
+        }
+        hashes.push(hash);
         let max_fee = match optional_quantity(tx, "maxFeePerGas")? {
             Some(fee) => Some(fee),
             None => optional_quantity(tx, "gasPrice")?,
@@ -448,7 +570,15 @@ pub fn frame(
     for (index, (receipt, receipt_json, encoded)) in decoded.receipts.iter().flatten().enumerate() {
         let index = u32::try_from(index)
             .map_err(|_| RpcError::Malformed("receipt index overflows u32".to_owned()))?;
-        let hash: B256 = parsed(receipt_json, "transactionHash")?;
+        let hash = hashes
+            .get(usize::try_from(index).unwrap_or(usize::MAX))
+            .copied()
+            .ok_or_else(|| RpcError::Unverified(format!("receipt {index} has no transaction")))?;
+        if parsed::<B256>(receipt_json, "transactionHash")? != hash {
+            return Err(RpcError::Unverified(format!(
+                "receipt {index} names another transaction than the one at its index"
+            )));
+        }
         let hash = TransactionHash::new(hash.0);
         let cumulative = receipt.inner.receipt.cumulative_gas_used;
         let mut receipt_logs = Vec::with_capacity(receipt.inner.receipt.logs.len());
@@ -597,6 +727,62 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn retryable_tickets_and_their_redeems_check_against_the_root() {
+        // Arbitrum One block 522,204,106: an L1 submission of a retryable
+        // ticket and its redeem, besides the internal transaction.
+        let sample: Value =
+            serde_json::from_str(include_str!("fixtures/arbitrum-one-retryable-block.json"))
+                .unwrap();
+        let decoded = decode_block(&sample["block"], &sample["receipts"]).unwrap();
+        assert!(decoded.check.verified(), "{:?}", decoded.check);
+        let mut changed = sample.clone();
+        changed["block"]["transactions"][1]["maxSubmissionFee"] = Value::from("0x1");
+        let decoded = decode_block(&changed["block"], &changed["receipts"]).unwrap();
+        assert_eq!(decoded.check.transactions_root, Check::Mismatch);
+    }
+
+    #[test]
+    fn a_transaction_that_cannot_be_checked_refuses_the_block() {
+        let mut sample = sample();
+        sample["block"]["transactions"][0]["type"] = Value::from("0x6f");
+        assert!(decode_block(&sample["block"], &sample["receipts"]).is_err());
+    }
+
+    #[test]
+    fn transaction_hashes_come_from_the_checked_bytes() {
+        let source = SourceId::new("json-rpc").unwrap();
+        let framed = |sample: &Value| {
+            let decoded = decode_block(&sample["block"], &sample["receipts"]).unwrap();
+            frame(
+                &decoded,
+                ChainId(4663),
+                &source,
+                Finality::Unattested,
+                0,
+                None,
+            )
+        };
+        let mut hash = sample();
+        hash["block"]["transactions"][0]["hash"] =
+            Value::from(format!("{:#x}", B256::repeat_byte(7)));
+        assert!(framed(&hash).is_err());
+        let mut receipt = sample();
+        receipt["receipts"][0]["transactionHash"] =
+            Value::from(format!("{:#x}", B256::repeat_byte(7)));
+        assert!(framed(&receipt).is_err());
+        // Receipts bind to the transactions at their index.
+        let mut bare = sample();
+        let hashes = bare["block"]["transactions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tx| tx["hash"].clone())
+            .collect::<Vec<_>>();
+        bare["block"]["transactions"] = Value::from(hashes);
+        assert!(framed(&bare).is_err());
     }
 
     #[test]
