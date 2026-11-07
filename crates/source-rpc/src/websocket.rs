@@ -5,14 +5,14 @@
 use std::{
     fmt::Write as _,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use flate2::{Decompress, FlushDecompress};
 use rustls::pki_types::ServerName;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufRead, AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
 };
 use tokio_rustls::{TlsConnector, client::TlsStream};
@@ -20,11 +20,48 @@ use url::Url;
 
 /// The largest message a feed sends, compressed or not.
 const MAX_MESSAGE_BYTES: usize = 16 * 1024 * 1024;
+/// How long connecting, TLS, and the HTTP upgrade may take together.
+const HANDSHAKE_WITHIN: Duration = Duration::from_secs(30);
+/// The longest line of a handshake response, and the most lines it has.
+const MAX_HANDSHAKE_LINE_BYTES: u64 = 8 * 1024;
+const MAX_HANDSHAKE_LINES: usize = 64;
 
 pub(crate) struct Socket {
     stream: BufReader<TlsStream<TcpStream>>,
     /// The server's compression context, kept across messages.
     inflate: Option<Decompress>,
+}
+
+/// The lines of a handshake response up to the empty one that ends it,
+/// refused past [`MAX_HANDSHAKE_LINES`] lines or a line longer than
+/// [`MAX_HANDSHAKE_LINE_BYTES`].
+async fn response_head<R: AsyncBufRead + Unpin>(stream: &mut R) -> Result<Vec<String>, String> {
+    let mut head = Vec::new();
+    loop {
+        let mut line = String::new();
+        let read = (&mut *stream)
+            .take(MAX_HANDSHAKE_LINE_BYTES)
+            .read_line(&mut line)
+            .await
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("the server closed during the handshake".to_owned());
+        }
+        if !line.ends_with('\n') {
+            return Err(format!(
+                "a handshake line exceeds {MAX_HANDSHAKE_LINE_BYTES} bytes"
+            ));
+        }
+        if line == "\r\n" {
+            return Ok(head);
+        }
+        if head.len() == MAX_HANDSHAKE_LINES {
+            return Err(format!(
+                "the handshake response exceeds {MAX_HANDSHAKE_LINES} lines"
+            ));
+        }
+        head.push(line.trim_end().to_owned());
+    }
 }
 
 /// Inflate one permessage-deflate message in the server's `context`.
@@ -64,8 +101,20 @@ fn unpredictable() -> [u8; 16] {
 
 impl Socket {
     /// Open the `wss` URL with the extra `headers`, offering
-    /// permessage-deflate.
+    /// permessage-deflate, within [`HANDSHAKE_WITHIN`].
     pub(crate) async fn connect(
+        url: &Url,
+        headers: &[(&str, String)],
+        tls: Arc<rustls::ClientConfig>,
+    ) -> Result<Self, String> {
+        tokio::time::timeout(HANDSHAKE_WITHIN, Self::open(url, headers, tls))
+            .await
+            .map_err(|_| {
+                format!("the feed did not complete its handshake within {HANDSHAKE_WITHIN:?}")
+            })?
+    }
+
+    async fn open(
         url: &Url,
         headers: &[(&str, String)],
         tls: Arc<rustls::ClientConfig>,
@@ -99,22 +148,7 @@ impl Socket {
             .await
             .map_err(|error| error.to_string())?;
         let mut stream = BufReader::new(stream);
-        let mut head = Vec::new();
-        loop {
-            let mut line = String::new();
-            if stream
-                .read_line(&mut line)
-                .await
-                .map_err(|error| error.to_string())?
-                == 0
-            {
-                return Err("the server closed during the handshake".to_owned());
-            }
-            if line == "\r\n" {
-                break;
-            }
-            head.push(line.trim_end().to_owned());
-        }
+        let head = response_head(&mut stream).await?;
         let status = head.first().map_or("", String::as_str);
         if status.split(' ').nth(1) != Some("101") {
             // A refusal explains itself in its body.
@@ -242,6 +276,55 @@ mod tests {
         assert!(wire.ends_with(&[0, 0, 0xff, 0xff]));
         wire.truncate(wire.len() - 4);
         wire
+    }
+
+    #[tokio::test]
+    async fn a_handshake_response_is_read_within_its_bounds() {
+        let read =
+            |text: Vec<u8>| async move { response_head(&mut BufReader::new(&text[..])).await };
+        let accepted =
+            read(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n".to_vec())
+                .await
+                .expect("head");
+        assert_eq!(
+            accepted,
+            ["HTTP/1.1 101 Switching Protocols", "Upgrade: websocket"]
+        );
+        let mut long = b"HTTP/1.1 101 Switching Protocols\r\nX: ".to_vec();
+        long.extend(std::iter::repeat_n(b'a', 64 * 1024));
+        assert!(read(long).await.expect_err("long").contains("line exceeds"));
+        let many = std::iter::once("HTTP/1.1 101 Switching Protocols\r\n".to_owned())
+            .chain((0..1_000).map(|index| format!("X-{index}: a\r\n")))
+            .collect::<String>();
+        assert!(
+            read(many.into_bytes())
+                .await
+                .expect_err("many")
+                .contains("lines")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_server_that_never_answers_ends_the_handshake() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let _held = listener.accept().await;
+            std::future::pending::<()>().await;
+        });
+        let url: Url = format!("wss://127.0.0.1:{port}/feed").parse().unwrap();
+        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(rustls::RootCertStore::empty())
+        .with_no_client_auth();
+        let error = Socket::connect(&url, &[], Arc::new(tls))
+            .await
+            .err()
+            .expect("deadline");
+        assert!(error.contains("within"), "{error}");
     }
 
     #[test]
