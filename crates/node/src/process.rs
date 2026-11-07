@@ -3059,7 +3059,8 @@ mod raw_history_control_tests {
         let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("config");
         config.processors[0].instance = processor.descriptor().instance.to_string();
         let (sources, _, excluded) =
-            super::configured_history_candidates(&config, &processor, None).expect("candidates");
+            super::configured_history_candidates(&config, &processor, None, true)
+                .expect("candidates");
         // Xatu advertises the transaction and receipt bundles, not the groups
         assert!(
             sources
@@ -3068,6 +3069,49 @@ mod raw_history_control_tests {
                     == leani_primitives::SourceKind::PublicDataset),
             "{excluded:?}"
         );
+    }
+
+    #[test]
+    fn on_demand_history_reads_a_chain_whose_only_history_is_json_rpc() {
+        use leani_processor_api::Processor as _;
+
+        let blobs = leani_processor_blobs::BlobsProcessor::default();
+        let mut descriptor = blobs.descriptor().clone();
+        descriptor.requirements[0].capabilities = [Capability::Header, Capability::Transactions]
+            .into_iter()
+            .collect();
+        let processor = RequirementsOnly { descriptor };
+        let mut config: Config = toml::from_str(VALID_CONFIG_TOML).expect("config");
+        config.processors[0].instance = processor.descriptor().instance.to_string();
+        config.chain.name = "arbitrum-nova".to_owned();
+        config.chain.chain_id = 42_170;
+        config.sources.history = vec![crate::config::HistorySourceConfig {
+            id: "json-rpc".to_owned(),
+            kind: crate::config::HistorySourceKind::JsonRpc,
+            priority: 10,
+            trust: crate::config::HistoryTrust::TrustedDataset,
+            chunk_blocks: None,
+            blobs_chunk_blocks: None,
+            batch_rows: None,
+            manifest: None,
+            endpoint: None,
+            allow_insecure_http: false,
+        }];
+        let json_rpc = |sources: &super::HistorySources| {
+            sources
+                .iter()
+                .any(|source| source.descriptor().kind == leani_primitives::SourceKind::JsonRpc)
+        };
+        let (sources, policy, excluded) =
+            super::configured_history_candidates(&config, &processor, None, true)
+                .expect("candidates");
+        assert!(json_rpc(&sources), "{excluded:?}");
+        assert_eq!(policy, leani_source_api::VerificationPolicy::TrustedDataset);
+        // The JSON-RPC lanes add their own, anchored where they can be.
+        let (sources, _, _) =
+            super::configured_history_candidates(&config, &processor, None, false)
+                .expect("candidates");
+        assert!(!json_rpc(&sources));
     }
 
     #[test]
@@ -4479,7 +4523,8 @@ pub(crate) fn configured_history_sources(
     Vec<Arc<dyn leani_source_api::HistorySource>>,
     leani_source_api::VerificationPolicy,
 )> {
-    let (sources, policy, _) = configured_history_candidates(config, processor, raw_history_store)?;
+    let (sources, policy, _) =
+        configured_history_candidates(config, processor, raw_history_store, true)?;
     require_history_sources(&sources, processor)?;
     Ok((sources, policy))
 }
@@ -4513,7 +4558,7 @@ fn history_sources_with_bridge(
     static REPORTED: std::sync::Mutex<std::collections::BTreeSet<String>> =
         std::sync::Mutex::new(std::collections::BTreeSet::new());
     let (mut sources, policy, excluded) =
-        configured_history_candidates(config, processor, raw_history_store)?;
+        configured_history_candidates(config, processor, raw_history_store, true)?;
     for reason in excluded {
         let reason = format!("{}: {reason}", processor.descriptor().instance);
         if REPORTED
@@ -4579,12 +4624,14 @@ fn bridge_wait(
 type HistorySources = Vec<Arc<dyn leani_source_api::HistorySource>>;
 
 /// Also returns why each configured source it left out cannot serve the
-/// processor.
+/// processor. `json_rpc` includes the configured JSON-RPC source, which the
+/// JSON-RPC lanes add themselves, anchored where they can be.
 #[allow(clippy::too_many_lines)]
 fn configured_history_candidates(
     config: &Config,
     processor: &dyn leani_processor_api::Processor,
     raw_history_store: Option<&leani_store_history::HistoryStore>,
+    json_rpc: bool,
 ) -> Result<(
     HistorySources,
     leani_source_api::VerificationPolicy,
@@ -4620,14 +4667,13 @@ fn configured_history_candidates(
         .sources
         .history
         .iter()
-        .filter(|source| {
-            matches!(
-                source.kind,
-                crate::config::HistorySourceKind::Xatu
-                    | crate::config::HistorySourceKind::EraE
-                    | crate::config::HistorySourceKind::Archive
-                    | crate::config::HistorySourceKind::AwsPublic
-            )
+        .filter(|source| match source.kind {
+            crate::config::HistorySourceKind::Xatu
+            | crate::config::HistorySourceKind::EraE
+            | crate::config::HistorySourceKind::Archive
+            | crate::config::HistorySourceKind::AwsPublic => true,
+            crate::config::HistorySourceKind::JsonRpc => json_rpc,
+            crate::config::HistorySourceKind::Parquet => false,
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|source| source.priority);
@@ -8131,7 +8177,8 @@ fn rpc_cold_sources(
     processor: &dyn leani_processor_api::Processor,
     rpc: Option<&Arc<dyn leani_source_api::HistorySource>>,
 ) -> Result<ColdSources> {
-    let (mut sources, mut policy, _) = configured_history_candidates(config, processor, None)?;
+    let (mut sources, mut policy, _) =
+        configured_history_candidates(config, processor, None, false)?;
     if let Some(rpc) = rpc {
         let priority = rpc.descriptor().priority;
         let at = sources
