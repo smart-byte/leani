@@ -105,6 +105,14 @@ pub fn verify_block(
     version: u8,
     data: &[u8],
 ) -> Result<SignedBlock, OpGossipError> {
+    // The decoders allocate the length a message claims before reading it.
+    let claimed = snap::raw::decompress_len(data)
+        .map_err(|error| OpGossipError::Decode(error.to_string()))?;
+    if claimed > MAX_GOSSIP_BYTES {
+        return Err(OpGossipError::Decode(format!(
+            "a message decompresses to {claimed} bytes, over {MAX_GOSSIP_BYTES}"
+        )));
+    }
     let decoded = match version {
         0 => OpNetworkPayloadEnvelope::decode_v1(data),
         1 => OpNetworkPayloadEnvelope::decode_v2(data),
@@ -769,6 +777,17 @@ fn unix_now_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_claiming_more_than_the_limit_is_refused_before_it_is_decompressed() {
+        // A snappy length of 4 GiB - 1, then a few bytes of nothing.
+        let message = [0xff, 0xff, 0xff, 0xff, 0x0f, 0, 0, 0];
+        for version in 0..4 {
+            let error =
+                verify_block(8453, Address::ZERO, version, &message).expect_err("oversized");
+            assert!(error.to_string().contains("decompresses to"), "{error}");
+        }
+    }
 
     #[test]
     fn op_stack_records_name_their_chain() {
