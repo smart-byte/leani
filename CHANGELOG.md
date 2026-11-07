@@ -326,6 +326,9 @@ record, and documented RPC contracts.
   factory, so the registry's anchor moves, logged in calls to a game or the
   registry, and the SystemConfig's updates never arrived: op-stack blocks
   never settled, and rotated signers were not followed.
+- Op-stack block gossip refuses a message that claims to decompress past
+  10 MiB before decompressing it: such a message could make the node
+  allocate gigabytes before its signature was checked.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
