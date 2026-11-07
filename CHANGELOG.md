@@ -340,6 +340,9 @@ record, and documented RPC contracts.
   before fetching it, and gives a block file's footer at most 16 MiB while
   it finds a day's blocks: a file that named a huge footer was downloaded
   whole.
+- Validation refuses an op-stack `[l1_anchor]` when `sources.live.kind`
+  starts with `json_rpc`: such a node waited forever for a Nitro assertion
+  before following.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
