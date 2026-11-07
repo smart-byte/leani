@@ -539,9 +539,10 @@ fn assemble(
     }
     let mut frames = Vec::with_capacity(blocks.len());
     let mut parent = expected_parent.map(|hash| B256::from(hash.0));
-    for block in blocks {
+    for mut block in blocks {
+        let number = block.number;
         let mismatch = |detail: String| AwsError::Mismatch {
-            block: block.number,
+            block: number,
             detail,
         };
         if let Some(parent) = parent
@@ -550,7 +551,7 @@ fn assemble(
             return Err(mismatch("does not link to the block before it".to_owned()));
         }
         parent = Some(block.hash);
-        let rebuilt = match verify::header_hash_matches(&block) {
+        let rebuilt = match verify::check_header(&mut block) {
             Some(false) => {
                 return Err(mismatch(
                     "header fields do not hash to the block hash".to_owned(),

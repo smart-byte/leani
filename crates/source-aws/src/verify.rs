@@ -14,20 +14,24 @@ const EMPTY_REQUESTS_HASH: B256 =
 const OP_DEPOSIT: u8 = 0x7e;
 
 /// Whether the rebuilt header hashes to the row's block hash, or `None`
-/// when the layout cannot rebuild it.
-pub(crate) fn header_hash_matches(block: &BlockRow) -> Option<bool> {
-    let header = block.header.as_ref()?;
+/// when the layout cannot rebuild it. A header that matches only with the
+/// empty requests hash keeps it, so it encodes as the block it is.
+pub(crate) fn check_header(block: &mut BlockRow) -> Option<bool> {
+    let header = block.header.as_mut()?;
     // Fork-specific fields absent from the row are absent from the header;
     // only the requests hash has no column to tell.
-    let without = header.hash_slow() == block.hash;
-    Some(
-        without
-            || (header.withdrawals_root.is_some() && {
-                let mut prague = header.clone();
-                prague.requests_hash = Some(EMPTY_REQUESTS_HASH);
-                prague.hash_slow() == block.hash
-            }),
-    )
+    if header.hash_slow() == block.hash {
+        return Some(true);
+    }
+    if header.withdrawals_root.is_some() {
+        let mut prague = header.clone();
+        prague.requests_hash = Some(EMPTY_REQUESTS_HASH);
+        if prague.hash_slow() == block.hash {
+            *header = prague;
+            return Some(true);
+        }
+    }
+    Some(false)
 }
 
 /// The consensus encoding of a receipt and the bloom of its logs.
@@ -105,6 +109,43 @@ mod tests {
             deposit_nonce: Some(7),
             deposit_version: Some(1),
         }
+    }
+
+    #[test]
+    fn a_prague_header_keeps_the_requests_hash_it_was_verified_with() {
+        let header = alloy_consensus::Header {
+            number: 30_000_000,
+            withdrawals_root: Some(B256::repeat_byte(3)),
+            requests_hash: Some(EMPTY_REQUESTS_HASH),
+            ..alloy_consensus::Header::default()
+        };
+        // The exports carry no requests hash.
+        let mut row = BlockRow {
+            number: header.number,
+            hash: header.hash_slow(),
+            parent_hash: header.parent_hash,
+            timestamp: header.timestamp,
+            receipts_root: header.receipts_root,
+            transactions_root: header.transactions_root,
+            bloom: header.logs_bloom,
+            gas_limit: header.gas_limit,
+            gas_used: header.gas_used,
+            base_fee: header.base_fee_per_gas,
+            transaction_count: None,
+            size: None,
+            blob_gas_used: None,
+            excess_blob_gas: None,
+            withdrawals_root: header.withdrawals_root,
+            header: Some(alloy_consensus::Header {
+                requests_hash: None,
+                ..header.clone()
+            }),
+        };
+        assert_eq!(check_header(&mut row), Some(true));
+        assert_eq!(
+            row.header.as_ref().map(alloy_consensus::Header::hash_slow),
+            Some(row.hash)
+        );
     }
 
     #[test]
