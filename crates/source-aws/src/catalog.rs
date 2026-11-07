@@ -21,6 +21,9 @@ use crate::{
 const DATES_TTL: Duration = Duration::from_hours(1);
 /// S3 pages hold up to 1,000 keys, far below this.
 const MAX_PAGE_BYTES: usize = 8 * 1_024 * 1_024;
+/// The most a block file's footer may download while the catalog finds its
+/// span: a file names its footer's size itself.
+const MAX_FOOTER_BYTES: u64 = 16 * 1_024 * 1_024;
 /// A dataset's days fit in a few pages.
 const MAX_PAGES: usize = 64;
 
@@ -299,7 +302,7 @@ impl Catalog {
                 Arc::clone(&self.store),
                 &key,
                 size,
-                Arc::new(crate::read::RangeRequests::new(1, u64::MAX)),
+                Arc::new(crate::read::RangeRequests::new(1, MAX_FOOTER_BYTES)),
                 None,
             );
             let builder = ParquetRecordBatchStreamBuilder::new(reader)
