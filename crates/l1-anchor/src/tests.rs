@@ -451,23 +451,113 @@ impl FinalizedBlocks for Chain {
         range: BlockRange,
         _tip: FinalizedTip,
         _cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
+    ) -> Result<FrameChunks, SourceError> {
         self.requested
             .lock()
             .unwrap()
             .push((range.start().0, range.end().0));
-        let confirmed = |number: u64| {
-            log(
-                address!("0x23A19d23e89166adedbDcB432518AB01e4272D94"),
-                vec![ASSERTION_CONFIRMED, B256::ZERO],
-                [B256::repeat_byte(byte(number)).0, [0; 32]].concat(),
-                0,
-            )
-        };
-        Ok((range.start().0..=range.end().0)
-            .map(|number| frame(number, vec![confirmed(number)], Vec::new()))
-            .collect())
+        Ok(one_chunk(
+            (range.start().0..=range.end().0)
+                .map(|number| frame(number, vec![confirmed(number)], Vec::new()))
+                .collect(),
+        ))
     }
+}
+
+/// Robinhood Chain's rollup confirming an assertion whose hash names the
+/// block it was read in.
+fn confirmed(number: u64) -> Log {
+    log(
+        address!("0x23A19d23e89166adedbDcB432518AB01e4272D94"),
+        vec![ASSERTION_CONFIRMED, B256::ZERO],
+        [B256::repeat_byte(byte(number)).0, [0; 32]].concat(),
+        0,
+    )
+}
+
+fn one_chunk(frames: Vec<BlockFrame>) -> FrameChunks {
+    futures::stream::iter([Ok(frames)]).boxed()
+}
+
+/// Blocks in chunks of two, each holding a confirmation; the chunk that
+/// starts at `failing` cannot be read.
+struct Chunked {
+    failing: u64,
+}
+
+#[async_trait::async_trait]
+impl FinalizedBlocks for Chunked {
+    async fn frames(
+        &self,
+        range: BlockRange,
+        _tip: FinalizedTip,
+        _cancellation: &CancellationToken,
+    ) -> Result<FrameChunks, SourceError> {
+        let end = range.end().0;
+        let chunks = (range.start().0..=end)
+            .step_by(2)
+            .map(|start| {
+                if start == self.failing {
+                    return Err(SourceError::Unavailable("no peer serves it".to_owned()));
+                }
+                Ok((start..=(start + 1).min(end))
+                    .map(|number| frame(number, vec![confirmed(number)], Vec::new()))
+                    .collect())
+            })
+            .collect::<Vec<_>>();
+        Ok(futures::stream::iter(chunks).boxed())
+    }
+}
+
+#[tokio::test]
+async fn a_range_is_handed_on_chunk_by_chunk_and_its_last_chunk_again_after_a_restart() {
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let cursor_path = directory.path().join("cursor.json");
+    let run = |failing: u64| {
+        let lane = AnchorLane {
+            anchor: ROBINHOOD,
+            finality: Arc::new(Scripted {
+                events: vec![finalized(13)],
+            }),
+            checkpoint: ConsensusCheckpoint {
+                beacon_slot: 0,
+                beacon_block_root: [0; 32],
+                execution_block_hash: BlockHash::ZERO,
+                obtained_at_unix_seconds: 0,
+                source: "fixture".to_owned(),
+            },
+            blocks: Chunked { failing },
+            cursor_path: cursor_path.clone(),
+            lookback: 4,
+            chain_id: 4663,
+            system_config: None,
+            follow_game_type: true,
+            batches: None,
+        };
+        async move {
+            let (sender, mut received) = mpsc::channel(64);
+            let outcome = lane.run(sender, CancellationToken::new()).await;
+            let mut hashes = Vec::new();
+            while let Ok(Observation::AssertionConfirmed { block_hash }) = received.try_recv() {
+                hashes.push(block_hash.0[0]);
+            }
+            (outcome, hashes)
+        }
+    };
+    // Blocks 9 to 13 in chunks starting at 9, 11 and 13; the second fails.
+    let (outcome, hashes) = run(11).await;
+    assert!(matches!(outcome, Err(SourceError::Unavailable(_))));
+    assert_eq!(hashes, [9, 10]);
+    assert_eq!(
+        read_cursor(&cursor_path)
+            .expect("cursor")
+            .map(|cursor| cursor.number),
+        Some(10)
+    );
+    // The restart hands on the chunk read last again: a crash may have lost
+    // what its observers had not kept yet.
+    let (_, hashes) = run(u64::MAX).await;
+    assert_eq!(hashes, [9, 10, 11, 12, 13]);
 }
 
 fn finalized(number: u64) -> FinalityEvent {
@@ -480,7 +570,7 @@ fn finalized(number: u64) -> FinalityEvent {
 }
 
 #[tokio::test]
-async fn the_lane_reads_each_finalized_range_once_and_resumes_after_it() {
+async fn the_lane_reads_each_finalized_range_and_resumes_at_the_last_one() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let cursor_path = directory.path().join("cursor.json");
     let checkpoint = ConsensusCheckpoint {
@@ -520,8 +610,9 @@ async fn the_lane_reads_each_finalized_range_once_and_resumes_after_it() {
     assert!(matches!(outcome, Err(SourceError::Disconnected(_))));
     assert_eq!(requested, [(8, 10), (11, 13)]);
     assert_eq!(hashes, [8, 9, 10, 11, 12, 13]);
-    let (_, requested, _) = run(vec![finalized(15)]).await;
-    assert_eq!(requested, [(14, 15)]);
+    let (_, requested, hashes) = run(vec![finalized(15)]).await;
+    assert_eq!(requested, [(11, 15)]);
+    assert_eq!(hashes, [11, 12, 13, 14, 15]);
 }
 
 struct ChainRef(Arc<Chain>);
@@ -533,7 +624,7 @@ impl FinalizedBlocks for ChainRef {
         range: BlockRange,
         tip: FinalizedTip,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
+    ) -> Result<FrameChunks, SourceError> {
         self.0.frames(range, tip, cancellation).await
     }
 }
@@ -551,13 +642,15 @@ impl FinalizedBlocks for Frames {
         range: BlockRange,
         _tip: FinalizedTip,
         _cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
-        Ok((range.start().0..=range.end().0)
-            .map(|number| {
-                let (logs, inputs) = self.0.get(&number).cloned().unwrap_or_default();
-                frame(number, logs, inputs)
-            })
-            .collect())
+    ) -> Result<FrameChunks, SourceError> {
+        Ok(one_chunk(
+            (range.start().0..=range.end().0)
+                .map(|number| {
+                    let (logs, inputs) = self.0.get(&number).cloned().unwrap_or_default();
+                    frame(number, logs, inputs)
+                })
+                .collect(),
+        ))
     }
 }
 
@@ -580,6 +673,7 @@ fn super_game(game: Address, game_type: u64) -> (Log, (u32, Vec<u8>)) {
 }
 
 #[tokio::test]
+#[allow(clippy::too_many_lines)]
 async fn the_lane_follows_a_new_respected_game_type_and_keeps_what_it_learned() {
     let directory = tempfile::tempdir().expect("temporary directory");
     let cursor_path = directory.path().join("cursor.json");
@@ -669,15 +763,34 @@ async fn the_lane_follows_a_new_respected_game_type_and_keeps_what_it_learned() 
             batcher: None,
         }
     );
-    // A restart keeps the learned type; a configured type stays fixed.
+    // A restart keeps the learned type, and hands on the range it read last
+    // again under it: the old type's game a1 stays out. A configured type
+    // stays fixed.
     std::fs::write(
         directory.path().join("kept.json"),
         std::fs::read(&cursor_path).unwrap(),
     )
     .unwrap();
-    assert_eq!(run(11, true).await, ["game a4".to_owned()]);
+    assert_eq!(
+        run(11, true).await,
+        [
+            "GameTypeChanged { game_type: 1 }".to_owned(),
+            format!("SignerChanged {{ signer: {signer} }}"),
+            "game a3".to_owned(),
+            "game a4".to_owned(),
+        ]
+    );
     std::fs::copy(directory.path().join("kept.json"), &cursor_path).unwrap();
-    assert_eq!(run(11, false).await, ["game a2".to_owned()]);
+    assert_eq!(
+        run(11, false).await,
+        [
+            "game a1".to_owned(),
+            "GameTypeChanged { game_type: 1 }".to_owned(),
+            format!("SignerChanged {{ signer: {signer} }}"),
+            "game a2".to_owned(),
+            "game a2".to_owned(),
+        ]
+    );
 }
 
 struct FramesRef(Arc<Frames>);
@@ -689,7 +802,7 @@ impl FinalizedBlocks for FramesRef {
         range: BlockRange,
         tip: FinalizedTip,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
+    ) -> Result<FrameChunks, SourceError> {
         self.0.frames(range, tip, cancellation).await
     }
 }

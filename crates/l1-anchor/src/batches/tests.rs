@@ -449,15 +449,17 @@ impl crate::FinalizedBlocks for Posts {
         range: leani_primitives::BlockRange,
         _tip: crate::FinalizedTip,
         _cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
-        Ok((range.start().0..=range.end().0)
+    ) -> Result<crate::FrameChunks, SourceError> {
+        use futures::StreamExt;
+        let frames = (range.start().0..=range.end().0)
             .map(|number| {
                 self.0
                     .get(&number)
                     .cloned()
                     .unwrap_or_else(|| l1_block(number, Vec::new(), Vec::new()))
             })
-            .collect())
+            .collect::<Vec<_>>();
+        Ok(futures::stream::iter([Ok(frames)]).boxed())
     }
 }
 
@@ -542,7 +544,7 @@ impl crate::FinalizedBlocks for PostsRef {
         range: leani_primitives::BlockRange,
         tip: crate::FinalizedTip,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
+    ) -> Result<crate::FrameChunks, SourceError> {
         self.0.frames(range, tip, cancellation).await
     }
 }
