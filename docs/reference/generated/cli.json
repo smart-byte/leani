@@ -663,7 +663,8 @@
             "possibleValues": [
               "unattested",
               "attested",
-              "finalized"
+              "finalized",
+              "settled"
             ]
           },
           {
@@ -1007,7 +1008,8 @@
                 "possibleValues": [
                   "unattested",
                   "attested",
-                  "finalized"
+                  "finalized",
+                  "settled"
                 ]
               },
               {

@@ -30,6 +30,8 @@ chunk_blocks = 100000
 [l1_anchor]
 kind = "nitro_rollup"
 rollup = "0x4DCeB440657f21083db8aDd07665f8ddBe1DCfc0"
+# The rollup's sequencerInbox(): the batch poster's posts make blocks final.
+sequencer_inbox = "0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6"
 
 # The signer is a batch poster of SequencerInbox
 # 0x1c479675ad559dc151f6ec7ed3fbf8cee79582b6.

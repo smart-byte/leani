@@ -1890,7 +1890,7 @@ components:
       description: Store-, chain-, and processor-bound opaque value.
     Finality:
       type: string
-      enum: [unattested, attested, finalized]
+      enum: [unattested, attested, finalized, settled]
       description: |
         Chain-confidence level of the block a record belongs to.
         `unattested`: at least two execution peers served the block, it passed
@@ -1900,10 +1900,14 @@ components:
         execution block at least two thirds of the sync committee attested; a
         reorg can still remove it. `finalized`: Ethereum consensus has
         finalized the block, as verified by this node's configured finality
-        source. When a source serves finalized material under dataset trust
-        (Xatu, EraE), the label reflects that source's trust model, not an
-        independent proof. A record's `data.finality`, when present, always
-        equals the envelope `finality`.
+        source; on a rollup, the Ethereum block carrying its batch is
+        finalized, so the block can no longer change. `settled`: a rollup's
+        settlement contracts on Ethereum accepted a claim covering the block,
+        so withdrawals from it can complete; Ethereum's own blocks end at
+        `finalized`. When a source serves finalized material under dataset
+        trust (Xatu, EraE), the label reflects that source's trust model, not
+        an independent proof. A record's `data.finality`, when present,
+        always equals the envelope `finality`.
     AddProcessorRequest:
       type: object
       additionalProperties: false
@@ -2093,11 +2097,19 @@ components:
       type: object
       additionalProperties: false
       required:
-        [chainId, chainFinalizedHead, available, configuredStartBlock, processedThrough, finalizedThrough, complete, state]
+        [chainId, chainFinalizedHead, chainSettledHead, available, configuredStartBlock, processedThrough, finalizedThrough, settledThrough, complete, state]
       properties:
         chainId:
           $ref: "#/components/schemas/SafeInteger"
         chainFinalizedHead:
+          oneOf:
+            - $ref: "#/components/schemas/ChainFinalizedHead"
+            - type: "null"
+        chainSettledHead:
+          description: >-
+            A rollup's settled head: its settlement contracts on Ethereum
+            accepted a claim covering this block. `null` on Ethereum and
+            before the node could check any settlement.
           oneOf:
             - $ref: "#/components/schemas/ChainFinalizedHead"
             - type: "null"
@@ -2124,6 +2136,13 @@ components:
             contiguous-coverage guarantee; lower gaps or non-finalized blocks
             can exist. Inspect available intervals for exact finalized
             coverage.
+          oneOf:
+            - $ref: "#/components/schemas/SafeInteger"
+            - type: "null"
+        settledThrough:
+          description: >-
+            The lower of `finalizedThrough` and `chainSettledHead`: on a
+            rollup, finalized blocks through here are settled.
           oneOf:
             - $ref: "#/components/schemas/SafeInteger"
             - type: "null"
@@ -2881,7 +2900,7 @@ components:
           $ref: "#/components/schemas/Cursor"
         operation:
           type: string
-          enum: [apply, undo, attested, finalized, reset_required]
+          enum: [apply, undo, attested, finalized, settled, reset_required]
         originKind:
           type: string
           enum: [live, live_recovery, historical_backfill, recompute]

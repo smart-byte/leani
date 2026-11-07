@@ -2644,16 +2644,51 @@ fn labeled_coverage_intervals(
     intervals
 }
 
+/// `intervals` with their finalized blocks at or below `settled`, a
+/// rollup's settled head, labelled settled.
+fn settled_intervals(
+    intervals: Vec<CoverageInterval>,
+    settled: Option<u64>,
+) -> Vec<CoverageInterval> {
+    let Some(settled) = settled else {
+        return intervals;
+    };
+    let finalized = Finality::Finalized.name();
+    let mut labelled = Vec::with_capacity(intervals.len() + 1);
+    for interval in intervals {
+        if interval.finality != finalized || interval.from_block > settled {
+            labelled.push(interval);
+            continue;
+        }
+        labelled.push(CoverageInterval {
+            from_block: interval.from_block,
+            to_block: interval.to_block.min(settled),
+            finality: Finality::Settled.name(),
+        });
+        if interval.to_block > settled {
+            labelled.push(CoverageInterval {
+                from_block: settled + 1,
+                to_block: interval.to_block,
+                finality: finalized,
+            });
+        }
+    }
+    labelled
+}
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CoverageResponse {
     chain_id: u64,
     chain_finalized_head: Option<ChainFinalizedHead>,
+    /// A rollup's settled head; `None` on Ethereum and before settlement.
+    chain_settled_head: Option<ChainFinalizedHead>,
     requested: Option<RequestedRange>,
     available: Vec<CoverageInterval>,
     configured_start_block: u64,
     processed_through: Option<u64>,
     finalized_through: Option<u64>,
+    settled_through: Option<u64>,
     complete: bool,
     state: &'static str,
 }
@@ -2718,6 +2753,16 @@ async fn coverage(
             number: head.number.0,
             hash: head.hash.to_string(),
         });
+    let chain_settled_head =
+        state
+            .store
+            .settled_head(state.config.chain_id)
+            .await?
+            .map(|(number, hash)| ChainFinalizedHead {
+                number: number.0,
+                hash: hash.to_string(),
+            });
+    let settled = chain_settled_head.as_ref().map(|head| head.number);
     let run_state = state
         .store
         .processor_runtime_state(descriptor)
@@ -2739,9 +2784,16 @@ async fn coverage(
             from_block: range.start().0,
             to_block: range.end().0,
         }),
-        available: labeled_coverage_intervals(&ranges, &finalized_ranges, &unattested_ranges),
+        available: settled_intervals(
+            labeled_coverage_intervals(&ranges, &finalized_ranges, &unattested_ranges),
+            settled,
+        ),
         configured_start_block: configured_start,
         finalized_through: finalized_through.map(|block| block.0),
+        settled_through: finalized_through
+            .zip(settled)
+            .map(|(finalized, settled)| finalized.0.min(settled)),
+        chain_settled_head,
         processed_through,
         complete,
         state: if run_state == Some(ProcessorRunState::Paused) {
@@ -15374,6 +15426,37 @@ mod tests {
     }
 
     #[test]
+    fn a_rollups_finalized_coverage_is_settled_through_its_settled_head() {
+        let range = |from: u64, to: u64| {
+            BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
+        };
+        let labels = |settled: Option<u64>| {
+            settled_intervals(
+                labeled_coverage_intervals(&[range(1, 10)], &[range(1, 6)], &[range(9, 10)]),
+                settled,
+            )
+            .iter()
+            .map(|interval| (interval.from_block, interval.to_block, interval.finality))
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            labels(Some(3)),
+            vec![
+                (1, 3, "settled"),
+                (4, 6, "finalized"),
+                (7, 8, "attested"),
+                (9, 10, "unattested")
+            ]
+        );
+        // Settlement past the finalized coverage settles all of it, no more.
+        assert_eq!(
+            labels(Some(8))[..2],
+            [(1, 6, "settled"), (7, 8, "attested")]
+        );
+        assert_eq!(labels(None)[0], (1, 6, "finalized"));
+    }
+
+    #[test]
     fn labeled_coverage_intervals_split_around_finalized_holes() {
         let range = |from: u64, to: u64| {
             BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
@@ -15429,6 +15512,7 @@ mod tests {
                 number: 100,
                 hash: BlockHash::new([1; 32]).to_string(),
             }),
+            chain_settled_head: None,
             requested: None,
             available: vec![
                 CoverageInterval {
@@ -15445,6 +15529,7 @@ mod tests {
             configured_start_block: 0,
             processed_through: Some(100),
             finalized_through: Some(90),
+            settled_through: None,
             complete: false,
             state: "backfilling",
         };

@@ -19,7 +19,7 @@ pub(crate) fn processor_contract(
     start_block: u64,
     publish: PublishMode,
 ) -> ProcessorConfig {
-    let finalized_only = publish == PublishMode::Finalized;
+    let finalized_only = matches!(publish, PublishMode::Finalized | PublishMode::Settled);
     ProcessorConfig {
         id: id.to_owned(),
         instance: instance.to_owned(),

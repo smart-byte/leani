@@ -21,7 +21,7 @@ use leani_primitives::{
 };
 use leani_source_api::{
     AttestedHead, AttestedHeadPublisher, ConsensusCheckpoint, FinalityEvent, FinalityEventStream,
-    FinalityModel, FinalitySource, Partitioning, SourceDescriptor, SourceError,
+    FinalityModel, FinalitySource, Partitioning, RollupFinality, SourceDescriptor, SourceError,
 };
 use libp2p::{
     Multiaddr, PeerId, SwarmBuilder,
@@ -677,12 +677,13 @@ pub async fn publish_heads(
 }
 
 /// Sequencer-signed heads as the finality lane of an op-stack chain. Heads
-/// are optimistic; only the L1 anchor's blocks, when it runs, are finalized.
+/// are optimistic; only the blocks the chain's finality from Ethereum names,
+/// when it runs, are finalized or settled.
 #[derive(Debug)]
 pub struct OpGossipFinality {
     descriptor: SourceDescriptor,
     heads: watch::Receiver<Option<SignedBlock>>,
-    finalized: Option<watch::Receiver<Option<(BlockNumber, BlockHash)>>>,
+    rollup: RollupFinality,
 }
 
 impl OpGossipFinality {
@@ -692,7 +693,7 @@ impl OpGossipFinality {
     pub fn new(
         chain_id: ChainId,
         heads: watch::Receiver<Option<SignedBlock>>,
-        finalized: Option<watch::Receiver<Option<(BlockNumber, BlockHash)>>>,
+        rollup: RollupFinality,
     ) -> Result<Self, SourceError> {
         Ok(Self {
             descriptor: SourceDescriptor {
@@ -711,7 +712,7 @@ impl OpGossipFinality {
                 priority: 0,
             },
             heads,
-            finalized,
+            rollup,
         })
     }
 }
@@ -728,20 +729,11 @@ impl FinalitySource for OpGossipFinality {
         cancellation: CancellationToken,
     ) -> Result<FinalityEventStream, SourceError> {
         let heads = self.heads.clone();
-        let finalized = self.finalized.clone().map(|mut finalized| {
-            finalized.mark_changed();
-            finalized
-        });
+        let rollup = self.rollup.subscribe();
         Ok(futures::stream::unfold(
-            (heads, finalized, cancellation),
-            |(mut heads, mut finalized, cancellation)| async move {
+            (heads, rollup, cancellation),
+            |(mut heads, mut rollup, cancellation)| async move {
                 loop {
-                    let anchored = async {
-                        match finalized.as_mut() {
-                            Some(finalized) => finalized.changed().await.is_ok(),
-                            None => std::future::pending().await,
-                        }
-                    };
                     tokio::select! {
                         () = cancellation.cancelled() => return None,
                         changed = heads.changed() => {
@@ -751,25 +743,12 @@ impl FinalitySource for OpGossipFinality {
                                 block_hash: BlockHash::new(block.hash.0),
                                 beacon_slot: block.number,
                             };
-                            return Some((Ok(event), (heads, finalized, cancellation)));
+                            return Some((Ok(event), (heads, rollup, cancellation)));
                         }
-                        open = anchored => {
-                            if !open {
-                                return Some((
-                                    Err(SourceError::Disconnected("the L1 anchor ended".to_owned())),
-                                    (heads, None, cancellation),
-                                ));
-                            }
-                            let latest = finalized.as_mut().and_then(|finalized| *finalized.borrow_and_update());
-                            if let Some((number, hash)) = latest {
-                                let event = FinalityEvent::Finalized {
-                                    block_number: number,
-                                    block_hash: hash,
-                                    beacon_slot: number.0,
-                                    beacon_block_root: [0; 32],
-                                };
-                                return Some((Ok(event), (heads, finalized, cancellation)));
-                            }
+                        event = rollup.next() => {
+                            // A lane that ended is reported once; heads go on.
+                            let rollup = if event.is_ok() { rollup } else { RollupFinality::default() };
+                            return Some((event, (heads, rollup, cancellation)));
                         }
                     }
                 }

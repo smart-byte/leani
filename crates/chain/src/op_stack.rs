@@ -32,6 +32,12 @@ pub struct OpStackNetwork {
     /// The rollup's `SystemConfig` on Ethereum, which names a new signer when
     /// the key rotates.
     pub system_config: Address,
+    /// Where derivation reads batches: transactions from `batcher` to this
+    /// inbox. `None` for an entry that names neither.
+    pub batch_inbox: Option<Address>,
+    /// The batcher when the entry was written; the `SystemConfig` names its
+    /// successors.
+    pub batcher: Option<Address>,
     /// Discv5 records of consensus peers that carry block gossip.
     pub consensus_bootnodes: Vec<String>,
 }
@@ -39,6 +45,10 @@ pub struct OpStackNetwork {
 #[derive(Deserialize)]
 pub(crate) struct OpStackEntry {
     sequencer_signer: Address,
+    #[serde(default)]
+    batch_inbox: Option<Address>,
+    #[serde(default)]
+    batcher: Option<Address>,
     #[serde(default)]
     consensus_bootnodes: Vec<String>,
     #[serde(default)]
@@ -124,6 +134,11 @@ impl OpStackNetwork {
         if registry.genesis.l2.hash.is_zero() {
             return Err(invalid("genesis l2 hash is zero".to_owned()));
         }
+        if entry.batch_inbox.is_some() != entry.batcher.is_some() {
+            return Err(invalid(
+                "batch_inbox and batcher name where batches come from together".to_owned(),
+            ));
+        }
         Ok(Self {
             block_time: registry.block_time,
             first_block: registry.genesis.l2.number,
@@ -132,6 +147,8 @@ impl OpStackNetwork {
             block_forks,
             sequencer_signer: entry.sequencer_signer,
             system_config: registry.addresses.system_config,
+            batch_inbox: entry.batch_inbox,
+            batcher: entry.batcher,
             consensus_bootnodes: entry.consensus_bootnodes,
         })
     }

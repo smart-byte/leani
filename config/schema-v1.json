@@ -462,12 +462,16 @@
           "maximum": 65535
         },
         "settle_blocks": {
-          "description": "op_gossip only: recent frames are pruned this many blocks below the tip while finalized waits for an L1 anchor; omitted, about one hour of blocks.",
+          "description": "op_gossip only: recent frames are pruned this many blocks below the tip while blocks wait for finalized; omitted, about one hour of blocks.",
           "$ref": "#/$defs/positiveInteger"
         },
         "sequencer_signer": {
           "description": "op_gossip only: the key the sequencer signs blocks with, in place of the chain entry's and any new one the L1 anchor reads.",
           "$ref": "#/$defs/address"
+        },
+        "finalized_by": {
+          "description": "Rollups only: what makes a block finalized, its batch in a finalized Ethereum block. batches (the default under an l1_anchor) has the anchor read the batches from finalized Ethereum blocks (op-stack blobs from l1_anchor.finality's Beacon APIs, Nitro SequencerInbox calls); json_rpc takes the finalized block the chain's JSON-RPC endpoints agree on, trusting them, and needs no l1_anchor; settlement finalizes blocks only as they settle. Omitted without an l1_anchor, nothing is finalized.",
+          "enum": ["batches", "json_rpc", "settlement"]
         }
       }
     },
@@ -674,9 +678,9 @@
         "require_retained_input": { "type": "boolean" },
         "start_block": { "$ref": "#/$defs/nonNegativeInteger" },
         "publish": {
-          "enum": ["unattested", "attested", "finalized"],
+          "enum": ["unattested", "attested", "finalized", "settled"],
           "default": "unattested",
-          "description": "First chain-confidence level the processor's consumers see."
+          "description": "First chain-confidence level the processor's consumers see. settled needs a rollup's l1_anchor."
         },
         "state": { "$ref": "#/$defs/statePolicy" },
         "artifacts": { "$ref": "#/$defs/artifactPolicy" },

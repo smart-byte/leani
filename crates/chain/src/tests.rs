@@ -386,3 +386,33 @@ fn rollups_name_their_l1_anchor() {
         .replace("family = \"arbitrum\"", "family = \"ethereum\"");
     assert!(Chain::from_entry(&misplaced, None).is_err());
 }
+
+#[test]
+fn bundled_rollups_name_where_their_batches_come_from() {
+    for chain in ChainRegistry::standard().iter() {
+        if let Some(op_stack) = &chain.op_stack {
+            assert!(
+                op_stack.batch_inbox.is_some() && op_stack.batcher.is_some(),
+                "{}",
+                chain.name
+            );
+        }
+        if let Some(L1Anchor::NitroRollup {
+            sequencer_inbox, ..
+        }) = chain.l1_anchor
+        {
+            assert!(sequencer_inbox.is_some(), "{}", chain.name);
+        }
+    }
+    let half = include_str!("../../../config/chains/base-mainnet.toml").replace(
+        "batcher = \"0x5050f69a9786f081509234f1a7f4684b5e5b76c9\"\n",
+        "",
+    );
+    assert!(
+        Chain::from_entry(
+            &half,
+            Some(include_str!("../../../config/chains/op/base.toml"))
+        )
+        .is_err()
+    );
+}

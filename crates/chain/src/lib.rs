@@ -230,7 +230,13 @@ pub enum L1Anchor {
         claims: GameClaims,
     },
     /// A Nitro rollup whose confirmed assertions name an L2 block hash.
-    NitroRollup { rollup: Address },
+    NitroRollup {
+        rollup: Address,
+        /// The `SequencerInbox` the batch poster posts to, whose batches
+        /// make blocks final before their assertion settles them.
+        #[serde(default)]
+        sequencer_inbox: Option<Address>,
+    },
 }
 
 /// What a chain's dispute games claim.

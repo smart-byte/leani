@@ -1629,13 +1629,17 @@ export interface components {
          *     execution block at least two thirds of the sync committee attested; a
          *     reorg can still remove it. `finalized`: Ethereum consensus has
          *     finalized the block, as verified by this node's configured finality
-         *     source. When a source serves finalized material under dataset trust
-         *     (Xatu, EraE), the label reflects that source's trust model, not an
-         *     independent proof. A record's `data.finality`, when present, always
-         *     equals the envelope `finality`.
+         *     source; on a rollup, the Ethereum block carrying its batch is
+         *     finalized, so the block can no longer change. `settled`: a rollup's
+         *     settlement contracts on Ethereum accepted a claim covering the block,
+         *     so withdrawals from it can complete; Ethereum's own blocks end at
+         *     `finalized`. When a source serves finalized material under dataset
+         *     trust (Xatu, EraE), the label reflects that source's trust model, not
+         *     an independent proof. A record's `data.finality`, when present,
+         *     always equals the envelope `finality`.
          * @enum {string}
          */
-        Finality: "unattested" | "attested" | "finalized";
+        Finality: "unattested" | "attested" | "finalized" | "settled";
         AddProcessorRequest: {
             /** @description One `[[processors]]` configuration entry, with the configuration's field names. */
             processor: {
@@ -1729,6 +1733,8 @@ export interface components {
         ProcessorCoverage: {
             chainId: components["schemas"]["SafeInteger"];
             chainFinalizedHead: components["schemas"]["ChainFinalizedHead"] | null;
+            /** @description A rollup's settled head: its settlement contracts on Ethereum accepted a claim covering this block. `null` on Ethereum and before the node could check any settlement. */
+            chainSettledHead: components["schemas"]["ChainFinalizedHead"] | null;
             requested?: components["schemas"]["RequestedRange"] | null;
             /** @description Exact processor coverage split at gaps and finality boundaries. Use these intervals when selecting finalized coverage. */
             available: components["schemas"]["CoverageInterval"][];
@@ -1736,6 +1742,8 @@ export interface components {
             processedThrough: components["schemas"]["SafeInteger"] | null;
             /** @description Highest covered block recorded as finalized. This is not a contiguous-coverage guarantee; lower gaps or non-finalized blocks can exist. Inspect available intervals for exact finalized coverage. */
             finalizedThrough: components["schemas"]["SafeInteger"] | null;
+            /** @description The lower of `finalizedThrough` and `chainSettledHead`: on a rollup, finalized blocks through here are settled. */
+            settledThrough: components["schemas"]["SafeInteger"] | null;
             complete: boolean;
             /**
              * @description `paused` and `failed` report the processor's live lane;
@@ -2090,7 +2098,7 @@ export interface components {
             sequence: components["schemas"]["DecimalQuantity"];
             cursor: components["schemas"]["Cursor"];
             /** @enum {string} */
-            operation: "apply" | "undo" | "attested" | "finalized" | "reset_required";
+            operation: "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required";
             /**
              * @description Processing lane that produced this publication.
              * @enum {string}

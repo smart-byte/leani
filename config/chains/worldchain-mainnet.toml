@@ -21,6 +21,10 @@ bootnodes = [
 [op_stack]
 # SystemConfig.unsafeBlockSigner() on Ethereum mainnet.
 sequencer_signer = "0x2270d6ec8e760daa317dd978cfb98c8f144b1f3a"
+# Derivation reads batches from the batcher's transactions to the batch
+# inbox; SystemConfig.batcherHash() on Ethereum mainnet names the batcher.
+batch_inbox = "0xff00000000000000000000000000000000000480"
+batcher = "0xdbbe3d8c2d2b22a2611c5a94a9a12c2fcd49eb29"
 # Consensus bootnodes op-stack clients ship (kona); discovery is shared
 # across the superchain, peers are filtered by their `opstack` entry.
 consensus_bootnodes = [

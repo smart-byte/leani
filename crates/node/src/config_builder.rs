@@ -759,7 +759,7 @@ fn follow_rollup(
         }
         None if requirements.follow == Follow::Finalized => {
             return Err(format!(
-                "only an L1 anchor finalizes {}'s blocks, and it needs a verified Ethereum checkpoint{}",
+                "only an L1 anchor verifies that {}'s blocks are finalized, and it needs a verified Ethereum checkpoint{}",
                 chain.name,
                 if chain.l1_anchor.is_some() {
                     ""

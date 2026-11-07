@@ -55,6 +55,8 @@ const LOCALLY_VERIFIED_CHECKPOINT_MAX_AGE: Duration = Duration::from_hours(13 * 
 const MAINNET_SLOT_SECONDS: u64 = 12;
 const ATTESTED_UPDATE_MAX_AGE: Duration = Duration::from_secs(90);
 const FINALIZED_UPDATE_MAX_AGE: Duration = Duration::from_mins(30);
+/// Rollups settle about a week after their blocks.
+const SETTLED_UPDATE_MAX_AGE: Duration = Duration::from_hours(8 * 24);
 const PRICE_PRECISION: usize = 8;
 const STARTUP_UPDATE_SCAN_LIMIT: usize = 10_000;
 /// The only chain built-in subscriptions follow.
@@ -480,6 +482,7 @@ fn level_named(name: &str) -> Option<Finality> {
         Finality::Unattested,
         Finality::Attested,
         Finality::Finalized,
+        Finality::Settled,
     ]
     .into_iter()
     .find(|level| level.name() == name)
@@ -966,8 +969,8 @@ fn explain_subscription_refusal(
     }
     let mut command = vec!["leani reset subscription uniswap-v3".to_owned()];
     command.extend(markets.iter().map(|market| market.symbol.to_owned()));
-    if options.finality == SubscribeFinality::Finalized {
-        command.push("--finality finalized".to_owned());
+    if options.finality.final_only() {
+        command.push(format!("--finality {}", options.finality.level().name()));
     }
     let paths = [
         ("--data-dir", options.data_dir.as_deref()),
@@ -1145,8 +1148,8 @@ async fn subscribe_embedded(
             let now = unix_seconds();
             for record in &startup_records {
                 if !update_is_fresh(options.finality, record.block.timestamp, now)
-                    || (options.finality == SubscribeFinality::Finalized
-                        && record.finality != Finality::Finalized)
+                    || (options.finality.final_only()
+                        && record.finality < options.finality.level())
                 {
                     continue;
                 }
@@ -1439,6 +1442,7 @@ fn subscription_data_dir_for(
         // embedded state directories reopen.
         SubscribeFinality::Attested => b"included",
         SubscribeFinality::Finalized => b"finalized",
+        SubscribeFinality::Settled => b"settled",
     });
     Ok(root.join(&hasher.finalize().to_hex()[..16]))
 }
@@ -2107,7 +2111,7 @@ fn latest_fresh_items(
         }
         // Store deferral already withholds unfinalized records for processors
         // that publish `finalized`; this keeps the flag honest if that ever regresses.
-        if finality == SubscribeFinality::Finalized && record.finality != Finality::Finalized {
+        if finality.final_only() && record.finality < finality.level() {
             continue;
         }
         if record.direction == ChangeDirection::Undo {
@@ -2179,7 +2183,7 @@ fn render_durable_change(
     };
     // A recompute republishes covered blocks. A finalized block is never
     // undone, so one this run printed prints once.
-    if options.finality == SubscribeFinality::Finalized
+    if options.finality.final_only()
         && output
             .seen
             .get(&record.change.key)
@@ -2526,6 +2530,7 @@ fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> boo
     let maximum_age = match finality {
         SubscribeFinality::Unattested | SubscribeFinality::Attested => ATTESTED_UPDATE_MAX_AGE,
         SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
+        SubscribeFinality::Settled => SETTLED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
 }
@@ -2800,7 +2805,7 @@ async fn attached_start_cursor(
     markets: &[Market],
     endpoint: &Url,
 ) -> Result<(Option<String>, Vec<AttachedItem>)> {
-    if options.finality == SubscribeFinality::Finalized {
+    if options.finality.final_only() {
         // A block included before now is finalized later, so replay the
         // retained log. The hello's finalized block ends what was already
         // final and is not printed.
@@ -2959,7 +2964,7 @@ fn render_attached_sse_events(
         if envelope.cursor.is_empty()
             || !matches!(
                 envelope.operation.as_str(),
-                "apply" | "undo" | "attested" | "finalized" | "reset_required"
+                "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required"
             )
         {
             bail!("node sent an invalid SSE change envelope");
@@ -3398,7 +3403,7 @@ fn render_attached(
     };
     // A node recompute republishes covered blocks. A finalized block is
     // never undone, so one this run printed prints once.
-    if options.finality == SubscribeFinality::Finalized
+    if options.finality.final_only()
         && let Some(key) = &envelope.key
         && changes
             .printed

@@ -19,6 +19,7 @@ const OP_MAINNET: L1Anchor = L1Anchor::DisputeGames {
 };
 const ROBINHOOD: L1Anchor = L1Anchor::NitroRollup {
     rollup: address!("0x23A19d23e89166adedbDcB432518AB01e4272D94"),
+    sequencer_inbox: None,
 };
 /// A Base game created in L1 tx 0x1fb4c09b…, claiming L2 block 53,042,760.
 const GAME: Address = address!("0xd286d94c1950ab8fe746b21d0c8e4b79e08461b4");
@@ -503,6 +504,7 @@ async fn the_lane_reads_each_finalized_range_once_and_resumes_after_it() {
             chain_id: 4663,
             system_config: None,
             follow_game_type: true,
+            batches: None,
         };
         async move {
             let (sender, mut received) = mpsc::channel(64);
@@ -635,6 +637,7 @@ async fn the_lane_follows_a_new_respected_game_type_and_keeps_what_it_learned() 
             chain_id: 10,
             system_config: Some(SYSTEM_CONFIG),
             follow_game_type,
+            batches: None,
         };
         async move {
             let (sender, mut received) = mpsc::channel(64);
@@ -663,6 +666,7 @@ async fn the_lane_follows_a_new_respected_game_type_and_keeps_what_it_learned() 
         Learned {
             signer: Some(signer),
             game_type: Some(1),
+            batcher: None,
         }
     );
     // A restart keeps the learned type; a configured type stays fixed.

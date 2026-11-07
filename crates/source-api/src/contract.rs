@@ -105,8 +105,10 @@ impl FinalityModel {
     pub const fn supports(self, required: Finality) -> bool {
         match self {
             Self::None => false,
-            Self::Attested => !matches!(required, Finality::Finalized),
-            Self::Finalized => true,
+            Self::Attested => matches!(required, Finality::Unattested | Finality::Attested),
+            // Settlement is a rollup's finality event, never a block's
+            // delivered level.
+            Self::Finalized => !matches!(required, Finality::Settled),
         }
     }
 }
@@ -388,6 +390,13 @@ pub enum FinalityEvent {
         block_hash: BlockHash,
         beacon_slot: u64,
         beacon_block_root: [u8; 32],
+    },
+    /// A rollup's settlement contracts accepted a claim covering this
+    /// block, which the node holds: it and its ancestors are settled. Only
+    /// rollup finality sources send it.
+    Settled {
+        block_number: BlockNumber,
+        block_hash: BlockHash,
     },
     Reset(ConsensusCheckpoint),
     Disagreement {

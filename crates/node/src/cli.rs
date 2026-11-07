@@ -571,8 +571,12 @@ pub enum SubscribeFinality {
     /// Print blocks once the sync committee attested them; a reorg can still
     /// remove them.
     Attested,
-    /// Print blocks only after Ethereum consensus has finalized them.
+    /// Print blocks only after Ethereum consensus has finalized them, or,
+    /// on a rollup, the Ethereum block carrying their batch.
     Finalized,
+    /// Print a rollup's blocks only after its settlement contracts on
+    /// Ethereum accepted them, days later. Needs a node with an L1 anchor.
+    Settled,
 }
 
 impl SubscribeFinality {
@@ -583,7 +587,14 @@ impl SubscribeFinality {
             Self::Unattested => leani_primitives::Finality::Unattested,
             Self::Attested => leani_primitives::Finality::Attested,
             Self::Finalized => leani_primitives::Finality::Finalized,
+            Self::Settled => leani_primitives::Finality::Settled,
         }
+    }
+
+    /// Whether printed rows are never undone, so each prints once.
+    #[must_use]
+    pub const fn final_only(self) -> bool {
+        matches!(self, Self::Finalized | Self::Settled)
     }
 
     /// The publish mode of the embedded processor for this level.
@@ -593,6 +604,7 @@ impl SubscribeFinality {
             Self::Unattested => crate::config::PublishMode::Unattested,
             Self::Attested => crate::config::PublishMode::Attested,
             Self::Finalized => crate::config::PublishMode::Finalized,
+            Self::Settled => crate::config::PublishMode::Settled,
         }
     }
 }

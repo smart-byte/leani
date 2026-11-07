@@ -873,6 +873,14 @@ impl RpcQuorum {
         self.quorum
     }
 
+    /// The same endpoints, of which at least `quorum` must agree, or all of
+    /// them when there are fewer.
+    #[must_use]
+    pub fn at_least(mut self, quorum: usize) -> Self {
+        self.quorum = self.quorum.max(quorum.min(self.clients.len()));
+        self
+    }
+
     #[must_use]
     pub fn endpoints(&self) -> Vec<&Url> {
         self.clients.iter().map(RpcClient::endpoint).collect()
@@ -1373,6 +1381,22 @@ mod tests {
             Err(RpcError::Disagreement(_))
         ));
         assert!(quorum.agreed_tag("latest").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_raised_quorum_keeps_one_endpoint_from_moving_a_tag() {
+        let (a, b) = (B256::repeat_byte(0xa), B256::repeat_byte(0xb));
+        let eager = endpoint(vec![(10, a), (11, b)]).await;
+        let behind = endpoint(vec![(10, a)]).await;
+        let pool = RpcQuorum::new(vec![eager, behind.clone()], 1, 1_000).unwrap();
+        assert_eq!(pool.agreed_tag("latest").await.unwrap(), (11, b));
+        assert_eq!(
+            pool.at_least(2).agreed_tag("latest").await.unwrap(),
+            (10, a)
+        );
+        // A lone endpoint is all there is to agree.
+        let alone = RpcQuorum::new(vec![behind], 1, 1_000).unwrap();
+        assert_eq!(alone.at_least(2).quorum(), 1);
     }
 
     #[tokio::test]

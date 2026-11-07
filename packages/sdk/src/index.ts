@@ -31,12 +31,13 @@ export type {
 import type { components } from "./openapi.generated.ts";
 
 export type Hex = `0x${string}`;
-export type Finality = "unattested" | "attested" | "finalized";
+export type Finality = "unattested" | "attested" | "finalized" | "settled";
 export type ChangeOperation =
   | "apply"
   | "undo"
   | "attested"
   | "finalized"
+  | "settled"
   | "reset_required";
 
 export interface LeaniClientOptions {
@@ -136,6 +137,11 @@ export interface ProcessorCoverage {
     number: number;
     hash: string;
   } | null;
+  /** A rollup's settled head; `null` on Ethereum and before settlement. */
+  chainSettledHead?: {
+    number: number;
+    hash: string;
+  } | null;
   requested?: {
     fromBlock: number;
     toBlock: number;
@@ -144,6 +150,8 @@ export interface ProcessorCoverage {
   configuredStartBlock: number;
   processedThrough: number | null;
   finalizedThrough: number | null;
+  /** On a rollup, finalized blocks through here are settled. */
+  settledThrough?: number | null;
   complete: boolean;
   state:
     | "starting"
@@ -475,6 +483,7 @@ export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
   | { operation: "attested"; data: { throughBlock: number } }
   | { operation: "finalized"; data: { throughBlock: number } }
   | { operation: "finalized"; data: LiveGapChangeData }
+  | { operation: "settled"; data: { throughBlock: number } }
   | { operation: "reset_required"; data: {
       earliestAvailableSequence: string;
       latestAvailableSequence: string;
@@ -1781,7 +1790,7 @@ function validateChangeEnvelope(value: ChangeEnvelope): void {
     !/^\d+$/.test(value.sequence) ||
     typeof value.cursor !== "string" ||
     value.cursor.length === 0 ||
-    !["apply", "undo", "attested", "finalized", "reset_required"].includes(value.operation) ||
+    !["apply", "undo", "attested", "finalized", "settled", "reset_required"].includes(value.operation) ||
     typeof value.schema !== "string" ||
     value.schema.length === 0
   ) {

@@ -3,6 +3,7 @@
 mod conformance;
 mod contract;
 mod planner;
+mod rollup;
 mod stored;
 mod telemetry;
 
@@ -19,6 +20,7 @@ pub use contract::{
     SourceChunk, SourceDescriptor, SourceError, SourcePlan, VerificationPolicy,
 };
 pub use planner::{PlanError, SelectionPolicy, coverage_gaps, select_source};
+pub use rollup::{RollupBlock, RollupFinality};
 pub use stored::stop_at_unfilled_groups;
 pub use telemetry::{
     NetworkDisconnectReason, NetworkDisconnectSnapshot, NetworkLane, NetworkLiveLevelsSnapshot,

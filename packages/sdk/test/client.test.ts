@@ -139,11 +139,13 @@ describe("createLeaniClient", () => {
     const coverage: ProcessorCoverage = {
       chainId: 1,
       chainFinalizedHead: null,
+      chainSettledHead: null,
       requested: null,
       available: [],
       configuredStartBlock: 19_426_589,
       processedThrough: null,
       finalizedThrough: null,
+      settledThrough: null,
       complete: false,
       state: "starting",
     };
@@ -847,7 +849,7 @@ test("typed blobs subscription consumes the production serializer fixture", asyn
 });
 
 test("finality vocabulary matches the OpenAPI enum", () => {
-  const values: Finality[] = ["unattested", "attested", "finalized"];
+  const values: Finality[] = ["unattested", "attested", "finalized", "settled"];
   const wire: OpenApiComponents["schemas"]["Finality"][] = values;
-  expect(wire).toEqual(["unattested", "attested", "finalized"]);
+  expect(wire).toEqual(["unattested", "attested", "finalized", "settled"]);
 });

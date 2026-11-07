@@ -244,9 +244,16 @@ impl NetworkTelemetry {
     /// Count a block the live lane delivered at `level`, `delay` after its
     /// slot started.
     pub fn record_live_block(&self, level: Finality, delay: Duration) {
+        // The live lane delivers blocks up to finalized; settlement comes later.
         let index = usize::from(level as u8);
-        self.inner.live_blocks[index].fetch_add(1, Ordering::Relaxed);
-        self.inner.live_delay_ms[index].fetch_add(
+        let (Some(blocks), Some(delays)) = (
+            self.inner.live_blocks.get(index),
+            self.inner.live_delay_ms.get(index),
+        ) else {
+            return;
+        };
+        blocks.fetch_add(1, Ordering::Relaxed);
+        delays.fetch_add(
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );

@@ -71,10 +71,13 @@ const SCHEMA_V24: &str = include_str!("../migrations/0024_processor_identity_ali
 const SCHEMA_V25: &str = include_str!("../migrations/0025_output_block_index.sql");
 const SCHEMA_V26: &str = include_str!("../migrations/0026_unattested_indexes.sql");
 const SCHEMA_V27: &str = include_str!("../migrations/0027_maintenance_indexes.sql");
+const SCHEMA_V28: &str = include_str!("../migrations/0028_settled_level.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 27;
+pub const CURRENT_SCHEMA_VERSION: u32 = 28;
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
+/// The first schema whose change log holds settled changes.
+const SETTLED_SCHEMA_VERSION: u32 = 28;
 /// Name of the one [`NodeSecret`] row in `node_secrets`.
 const NODE_SECRET_NAME: &str = "node";
 /// Key-derivation context of consumer credential hashes.
@@ -574,22 +577,19 @@ pub enum ChangeDirection {
     ResetRequired,
 }
 
-/// The public operation of a change. The attested watermark is stored with
-/// direction `finalized` and level attested (see `mark_attested`), and is
-/// published as `attested`.
+/// The public operation of a change. The attested and settled watermarks
+/// are stored with direction `finalized` at their level (see `mark_attested`
+/// and `mark_settled`), and are published as `attested` and `settled`.
 #[must_use]
 pub fn change_operation(
     direction: ChangeDirection,
     finality: Finality,
     kind: &str,
 ) -> &'static str {
-    match direction {
-        ChangeDirection::Finalized
-            if finality == Finality::Attested && kind == "system.finality" =>
-        {
-            "attested"
-        }
-        direction => direction.as_str(),
+    match (direction, finality) {
+        (ChangeDirection::Finalized, Finality::Attested) if kind == "system.finality" => "attested",
+        (ChangeDirection::Finalized, Finality::Settled) if kind == "system.finality" => "settled",
+        (direction, _) => direction.as_str(),
     }
 }
 
@@ -2094,11 +2094,15 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         (25, SCHEMA_V25),
         (26, SCHEMA_V26),
         (27, SCHEMA_V27),
+        (28, SCHEMA_V28),
     ];
     for (target, migration) in migrations {
         if target > version {
             sqlx::raw_sql(migration).execute(&mut *transaction).await?;
         }
+    }
+    if version < SETTLED_SCHEMA_VERSION {
+        widen_change_finality(&mut transaction).await?;
     }
     if version < NODE_SECRET_SCHEMA_VERSION {
         install_node_secret(&mut transaction).await?;
@@ -2106,6 +2110,54 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     transaction.commit().await?;
     if version <= 2 {
         rebuild_recent_transaction_locators(pool).await?;
+    }
+    Ok(())
+}
+
+/// Let `change_log` hold settled changes. Rebuilding the table would delete
+/// the sink outbox that cascades from it, so the CHECK constraint is edited
+/// in place, as SQLite documents for constraint changes: the stored rows all
+/// satisfy the wider constraint.
+async fn widen_change_finality(
+    transaction: &mut Transaction<'_, Sqlite>,
+) -> Result<(), StoreError> {
+    let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
+        .fetch_one(&mut **transaction)
+        .await?;
+    sqlx::query("PRAGMA writable_schema = ON")
+        .execute(&mut **transaction)
+        .await?;
+    let edited = sqlx::query(
+        "UPDATE sqlite_schema
+         SET sql = replace(sql, 'CHECK (finality BETWEEN 0 AND 2)', 'CHECK (finality BETWEEN 0 AND 3)')
+         WHERE type = 'table' AND name = 'change_log'
+           AND instr(sql, 'CHECK (finality BETWEEN 0 AND 2)') > 0",
+    )
+    .execute(&mut **transaction)
+    .await?
+    .rows_affected();
+    // An integer the database just returned: nothing to inject.
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "PRAGMA schema_version = {}",
+        schema_version + 1
+    )))
+    .execute(&mut **transaction)
+    .await?;
+    sqlx::query("PRAGMA writable_schema = OFF")
+        .execute(&mut **transaction)
+        .await?;
+    if edited == 0 {
+        let widened: bool = sqlx::query_scalar(
+            "SELECT instr(sql, 'CHECK (finality BETWEEN 0 AND 3)') > 0
+             FROM sqlite_schema WHERE type = 'table' AND name = 'change_log'",
+        )
+        .fetch_one(&mut **transaction)
+        .await?;
+        if !widened {
+            return Err(StoreError::Invariant(
+                "change_log has no finality constraint to widen".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -3341,9 +3393,21 @@ impl SqliteStore {
         // bytes are admitted against the delivery budget here, so backpressure
         // behaves like any other processor's; the flush never re-checks
         // capacity.
-        let defer_publication = cursor.finality < descriptor.publication.first_level()
-            && delivery_enabled
-            && publish_changes;
+        // The level its consumers see: a finalized block at or below the
+        // settled head is settled, which settled-only instances wait for.
+        let level = if descriptor.publication == PublicationPolicy::Settled
+            && cursor.finality == Finality::Finalized
+            && self
+                .settled_head(cursor.chain_id)
+                .await?
+                .is_some_and(|(head, _)| head >= cursor.block_number)
+        {
+            Finality::Settled
+        } else {
+            cursor.finality
+        };
+        let defer_publication =
+            level < descriptor.publication.first_level() && delivery_enabled && publish_changes;
         let admitted_changes = if delivery_enabled && publish_changes {
             batch.changes.as_slice()
         } else {
@@ -3592,16 +3656,10 @@ impl SqliteStore {
             && descriptor.delivery_ordering == DeliveryOrdering::Canonical
             && delivery_enabled
             && publish_changes
-            && cursor.finality >= first_level
+            && level >= first_level
             && let Some(below) = cursor.block_number.0.checked_sub(1)
         {
-            release_deferred_changes(
-                &mut transaction,
-                &instance,
-                BlockNumber(below),
-                cursor.finality,
-            )
-            .await?
+            release_deferred_changes(&mut transaction, &instance, BlockNumber(below), level).await?
         } else {
             false
         };
@@ -3613,7 +3671,7 @@ impl SqliteStore {
                 &delivery_origin,
                 cursor.chain_id,
                 delta.block,
-                cursor.finality,
+                level,
                 ChangeDirection::Apply,
                 published_changes,
                 sink_ids,
@@ -5362,8 +5420,12 @@ impl SqliteStore {
             .bind(u64_i64(through.0, "block_number")?)
             .execute(&mut *transaction)
             .await?;
-        let flushed_deferred = if descriptor.publication.first_level() > Finality::Unattested
-            && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
+        // Settled-only changes wait for mark_settled.
+        let flushed_deferred = if matches!(
+            descriptor.publication.first_level(),
+            Finality::Attested | Finality::Finalized
+        ) && descriptor.lifecycle.delivery.mode
+            != DeliveryPolicyMode::None
         {
             release_deferred_changes(&mut transaction, &instance, through, Finality::Finalized)
                 .await?
@@ -8115,6 +8177,155 @@ impl SqliteStore {
             })
         })
         .transpose()
+    }
+
+    /// The rollup's settled head: its settlement contracts accepted a claim
+    /// covering this block, so it and every finalized block below it are
+    /// settled. `None` before any settlement this node could check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt stored material or a failed read.
+    pub async fn settled_head(
+        &self,
+        chain_id: ChainId,
+    ) -> Result<Option<(BlockNumber, BlockHash)>, StoreError> {
+        let row: Option<(i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT block_number, block_hash FROM chain_settlement WHERE chain_id = ?",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        row.map(|(number, hash)| {
+            Ok((
+                BlockNumber(i64_u64(number, "settled block number")?),
+                decode_hash(hash)?,
+            ))
+        })
+        .transpose()
+    }
+
+    /// Record that the finalized canonical block `through`, hashed `hash`, is
+    /// settled. Returns `false`, changing nothing, while this node holds no
+    /// finalized block `hash` at that height; a lower head than the stored
+    /// one changes nothing either.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the height exceeds `SQLite`'s range or the
+    /// write fails.
+    pub async fn mark_chain_settled(
+        &self,
+        chain_id: ChainId,
+        through: BlockNumber,
+        hash: BlockHash,
+    ) -> Result<bool, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let held = self
+            .canonical_block(chain_id, through)
+            .await?
+            .is_some_and(|(block, finality)| block.hash == hash && finality == Finality::Finalized);
+        if !held {
+            return Ok(false);
+        }
+        sqlx::query(
+            "INSERT INTO chain_settlement(chain_id, block_number, block_hash) VALUES (?, ?, ?)
+             ON CONFLICT(chain_id) DO UPDATE SET
+                 block_number = excluded.block_number,
+                 block_hash = excluded.block_hash
+             WHERE excluded.block_number > chain_settlement.block_number",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(through.0, "block_number")?)
+        .bind(hash.0.as_slice())
+        .execute(&self.inner.pool)
+        .await?;
+        Ok(true)
+    }
+
+    /// Tell `descriptor`'s consumers that its blocks are settled through the
+    /// chain's settled head, as far as the processor finalized them: a
+    /// `settled` marker, and a settled-only instance's waiting changes.
+    /// Returns the block it settled through, `None` when nothing moved.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for corrupt stored material or a failed write.
+    pub async fn mark_settled(
+        &self,
+        descriptor: &ProcessorDescriptor,
+    ) -> Result<Option<BlockNumber>, StoreError> {
+        let instance = processor_instance(descriptor);
+        let _guard = self.inner.writer.lock().await;
+        let Some(cursor) = self.processor_cursor_by_instance(&instance).await? else {
+            return Ok(None);
+        };
+        let Some((head, _)) = self.settled_head(cursor.chain_id).await? else {
+            return Ok(None);
+        };
+        let through: Option<i64> = sqlx::query_scalar(
+            "SELECT MAX(block_number) FROM processor_coverage
+             WHERE instance = ? AND finality = ? AND block_number <= ?",
+        )
+        .bind(&instance)
+        .bind(finality_i64(Finality::Finalized))
+        .bind(u64_i64(head.0, "block_number")?)
+        .fetch_one(&self.inner.pool)
+        .await?;
+        let Some(through) = through else {
+            return Ok(None);
+        };
+        let marked: Option<i64> =
+            sqlx::query_scalar("SELECT block_number FROM processor_settlement WHERE instance = ?")
+                .bind(&instance)
+                .fetch_optional(&self.inner.pool)
+                .await?;
+        if marked.is_some_and(|marked| marked >= through) {
+            return Ok(None);
+        }
+        let through = BlockNumber(i64_u64(through, "settled block number")?);
+        let Some((block, _)) = self.canonical_block(cursor.chain_id, through).await? else {
+            return Ok(None);
+        };
+        let delivering = descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None;
+        let mut transaction = self.inner.pool.begin().await?;
+        if delivering {
+            if descriptor.publication == PublicationPolicy::Settled {
+                release_deferred_changes(&mut transaction, &instance, through, Finality::Settled)
+                    .await?;
+            }
+            append_changes(
+                &mut transaction,
+                &instance,
+                &default_delivery_stream_id(descriptor),
+                &DeliveryOrigin::live(&instance),
+                cursor.chain_id,
+                block,
+                Finality::Settled,
+                ChangeDirection::Finalized,
+                &[DomainChange {
+                    kind: "system.finality".to_owned(),
+                    key: through.0.to_be_bytes().to_vec(),
+                    operation: ChangeOperation::Upsert,
+                    payload: through.0.to_be_bytes().to_vec(),
+                }],
+                &[],
+            )
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO processor_settlement(instance, block_number) VALUES (?, ?)
+             ON CONFLICT(instance) DO UPDATE SET block_number = excluded.block_number",
+        )
+        .bind(&instance)
+        .bind(u64_i64(through.0, "block_number")?)
+        .execute(&mut *transaction)
+        .await?;
+        transaction.commit().await?;
+        if delivering {
+            self.inner.delivery_changes_available.notify_waiters();
+        }
+        Ok(Some(through))
     }
 
     /// Mark the retained canonical blocks through `through` attested. Returns
@@ -19602,6 +19813,7 @@ fn finality_i64(finality: Finality) -> i64 {
         Finality::Unattested => 0,
         Finality::Attested => 1,
         Finality::Finalized => 2,
+        Finality::Settled => 3,
     }
 }
 
@@ -19610,6 +19822,7 @@ fn decode_finality(value: i64) -> Result<Finality, StoreError> {
         0 => Ok(Finality::Unattested),
         1 => Ok(Finality::Attested),
         2 => Ok(Finality::Finalized),
+        3 => Ok(Finality::Settled),
         _ => Err(StoreError::Invariant(format!(
             "invalid finality value {value}"
         ))),
@@ -22168,6 +22381,204 @@ mod tests {
             sequences, sorted,
             "flushed records must be appended in block order"
         );
+    }
+
+    /// Finalized blocks 1 to `through`, held as canonical and applied by
+    /// `processor`.
+    async fn apply_finalized_blocks(
+        store: &SqliteStore,
+        processor: &FixtureProcessor,
+        through: u64,
+    ) -> Vec<BlockFrame> {
+        let mut parent = BlockHash::ZERO;
+        let mut blocks = Vec::new();
+        for number in 1..=through {
+            let mut block = frame(number, parent);
+            block.finality = Finality::Finalized;
+            store
+                .store_canonical_anchor(block.chain_id, block.block, Finality::Finalized)
+                .await
+                .expect("canonical block");
+            let delta = processor.map(&block).await.expect("map");
+            store
+                .apply(processor, cursor(processor, &block, number), &delta, &[])
+                .await
+                .expect("apply finalized block");
+            parent = block.block.hash;
+            blocks.push(block);
+        }
+        blocks
+    }
+
+    fn levels(changes: &[ChangeRecord]) -> Vec<(u64, Finality, &'static str)> {
+        changes
+            .iter()
+            .map(|change| {
+                (
+                    change.block.number.0,
+                    change.finality,
+                    change_operation(change.direction, change.finality, &change.change.kind),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn settlement_moves_only_to_a_finalized_block_this_node_holds() {
+        let (_directory, store) = store().await;
+        let first = frame(1, BlockHash::ZERO);
+        let second = frame(2, first.block.hash);
+        store
+            .store_canonical_anchor(ChainId(1), first.block, Finality::Finalized)
+            .await
+            .expect("finalized block");
+        store
+            .store_canonical_anchor(ChainId(1), second.block, Finality::Attested)
+            .await
+            .expect("attested block");
+        let settle = |number: u64, hash: BlockHash| {
+            let store = store.clone();
+            async move {
+                store
+                    .mark_chain_settled(ChainId(1), BlockNumber(number), hash)
+                    .await
+                    .expect("settle")
+            }
+        };
+        assert!(!settle(2, second.block.hash).await, "not finalized yet");
+        assert!(!settle(1, second.block.hash).await, "another block");
+        assert!(!settle(3, BlockHash::new([3; 32])).await, "not held");
+        assert_eq!(store.settled_head(ChainId(1)).await.expect("head"), None);
+        assert!(settle(1, first.block.hash).await);
+        assert_eq!(
+            store.settled_head(ChainId(1)).await.expect("head"),
+            Some((BlockNumber(1), first.block.hash))
+        );
+    }
+
+    #[tokio::test]
+    async fn consumers_hear_once_that_their_finalized_blocks_settled() {
+        let (_directory, store) = store().await;
+        let processor = finalized_only_processor();
+        let blocks = apply_finalized_blocks(&store, &processor, 3).await;
+        assert!(
+            store
+                .mark_chain_settled(ChainId(1), BlockNumber(2), blocks[1].block.hash)
+                .await
+                .expect("settle")
+        );
+        assert_eq!(
+            store
+                .mark_settled(&processor.descriptor)
+                .await
+                .expect("mark"),
+            Some(BlockNumber(2))
+        );
+        assert_eq!(
+            store
+                .mark_settled(&processor.descriptor)
+                .await
+                .expect("again"),
+            None
+        );
+        let changes = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(
+            levels(&changes),
+            vec![
+                (1, Finality::Finalized, "apply"),
+                (2, Finality::Finalized, "apply"),
+                (3, Finality::Finalized, "apply"),
+                (2, Finality::Settled, "settled"),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn settled_only_changes_wait_for_their_block_to_settle() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Settled);
+        let blocks = apply_finalized_blocks(&store, &processor, 2).await;
+        assert_eq!(deferred_rows(&store, &processor).await, 2);
+        assert!(
+            store
+                .changes(&processor.descriptor, ChainId(1), 0, 100)
+                .await
+                .expect("changes")
+                .is_empty()
+        );
+        store
+            .mark_chain_settled(ChainId(1), BlockNumber(1), blocks[0].block.hash)
+            .await
+            .expect("settle");
+        store
+            .mark_settled(&processor.descriptor)
+            .await
+            .expect("mark");
+        let changes = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(
+            levels(&changes),
+            vec![
+                (1, Finality::Settled, "apply"),
+                (1, Finality::Settled, "settled")
+            ]
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+    }
+
+    #[tokio::test]
+    async fn a_settled_only_instance_publishes_a_block_already_settled_at_once() {
+        let (_directory, store) = store().await;
+        let follower = finalized_only_processor();
+        let blocks = apply_finalized_blocks(&store, &follower, 2).await;
+        store
+            .mark_chain_settled(ChainId(1), BlockNumber(2), blocks[1].block.hash)
+            .await
+            .expect("settle");
+        let mut processor = processor_publishing(PublicationPolicy::Settled);
+        processor.descriptor.id = ProcessorId::new("settled").expect("id");
+        processor.descriptor.instance = ProcessorInstanceId::legacy(
+            &processor.descriptor.id,
+            &processor.descriptor.version,
+            processor.descriptor.config_hash,
+        )
+        .expect("legacy instance");
+        let delta = processor.map(&blocks[0]).await.expect("map");
+        store
+            .apply(&processor, cursor(&processor, &blocks[0], 1), &delta, &[])
+            .await
+            .expect("apply settled block");
+        let changes = store
+            .changes(&processor.descriptor, ChainId(1), 0, 100)
+            .await
+            .expect("changes");
+        assert_eq!(levels(&changes), vec![(1, Finality::Settled, "apply")]);
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+    }
+
+    #[tokio::test]
+    async fn the_change_log_holds_settled_changes() {
+        let (_directory, store) = store().await;
+        let table: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'change_log'",
+        )
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("schema");
+        assert!(
+            table.contains("CHECK (finality BETWEEN 0 AND 3)"),
+            "{table}"
+        );
+        let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
+            .fetch_one(&store.inner.pool)
+            .await
+            .expect("integrity check");
+        assert_eq!(integrity, "ok");
     }
 
     /// `frame` truncates the block number to one byte for its hash; wide
@@ -29568,6 +29979,8 @@ mod tests {
              DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
              DROP TABLE IF EXISTS node_secrets;
              DROP TABLE IF EXISTS processor_identity_aliases;
+             DROP TABLE IF EXISTS chain_settlement;
+             DROP TABLE IF EXISTS processor_settlement;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -29579,7 +29992,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -29669,6 +30082,8 @@ mod tests {
              DROP INDEX IF EXISTS finalized_coverage_segments_by_hash;
              DROP TABLE IF EXISTS node_secrets;
              DROP TABLE IF EXISTS processor_identity_aliases;
+             DROP TABLE IF EXISTS chain_settlement;
+             DROP TABLE IF EXISTS processor_settlement;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -29793,10 +30208,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001c' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001d' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 28");
+            .expect("schema 29");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -29806,7 +30221,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 28);
+        assert_eq!(schema_on_disk(&newer).await, 29);
     }
 
     #[tokio::test]
@@ -29873,6 +30288,8 @@ mod tests {
         sqlx::raw_sql(
             "DROP TABLE IF EXISTS node_secrets;
              DROP TABLE IF EXISTS processor_identity_aliases;
+             DROP TABLE IF EXISTS chain_settlement;
+             DROP TABLE IF EXISTS processor_settlement;
              UPDATE durable_consumers SET delivered_sequence = acknowledged_sequence;
              UPDATE node_meta SET value = X'00000016' WHERE key = 'schema_version';",
         )
@@ -29903,7 +30320,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 27);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 28);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION

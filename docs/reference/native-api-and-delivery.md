@@ -296,11 +296,15 @@ export interface ProcessorCoverage {
   available: Array<{
     fromBlock: number;
     toBlock: number;
-    finality: "unattested" | "attested" | "finalized";
+    finality: "unattested" | "attested" | "finalized" | "settled";
   }>;
   configuredStartBlock: number;
   processedThrough: number | null;
   finalizedThrough: number | null;
+  /** A rollup's settled head; `null` on Ethereum and before settlement. */
+  chainSettledHead: { number: number; hash: `0x${string}` } | null;
+  /** On a rollup, finalized blocks through here are settled. */
+  settledThrough: number | null;
   complete: boolean;
   state:
     | "starting"
@@ -640,7 +644,7 @@ export interface ChangeEnvelope<T = unknown> {
   apiVersion: "1";
   sequence: string;
   cursor: string;
-  operation: "apply" | "undo" | "attested" | "finalized" | "reset_required";
+  operation: "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required";
   originKind: "live" | "live_recovery" | "historical_backfill" | "recompute";
   originId: string;
   publicationRevision: string;
@@ -651,7 +655,7 @@ export interface ChangeEnvelope<T = unknown> {
     parentHash: `0x${string}`;
     timestamp: number;
   } | null;
-  finality: "unattested" | "attested" | "finalized";
+  finality: "unattested" | "attested" | "finalized" | "settled";
   kind: string;
   schema: string;
   key: string | null;

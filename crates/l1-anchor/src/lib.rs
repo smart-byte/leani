@@ -22,10 +22,10 @@ use leani_primitives::{
 };
 use leani_source_api::{
     ConsensusCheckpoint, FinalityEvent, FinalityEventStream, FinalityModel, FinalitySource,
-    Partitioning, SourceDescriptor, SourceError,
+    Partitioning, RollupFinality, SourceDescriptor, SourceError,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -42,6 +42,8 @@ const ASSERTION_CONFIRMED: B256 =
 /// emits it.
 const CONFIG_UPDATE: B256 =
     b256!("0x1d2b0bda21d56b8bd12d4f94ebacffdfb35f5e226f84b461103bb8beab6353be");
+/// `SystemConfig`'s `UpdateType.BATCHER`.
+const BATCHER: u64 = 0;
 /// `SystemConfig`'s `UpdateType.UNSAFE_BLOCK_SIGNER`.
 const UNSAFE_BLOCK_SIGNER: u64 = 3;
 /// `RespectedGameTypeSet(uint32)`, as an anchor state registry emits it.
@@ -78,6 +80,12 @@ pub enum Observation {
     AssertionConfirmed { block_hash: B256 },
     /// The `SystemConfig` names a new key to sign the sequencer's blocks.
     SignerChanged { signer: Address },
+    /// The `SystemConfig` names a new batcher, whose transactions to the
+    /// batch inbox derivation reads from this L1 block on.
+    BatcherChanged { batcher: Address },
+    /// The batches read so far carry the rollup block `number`, which the
+    /// node holds as `hash`: its data is final on Ethereum.
+    DataFinal { number: u64, hash: B256 },
     /// The registry respects games of `game_type` from this block on.
     GameTypeChanged { game_type: u32 },
 }
@@ -93,7 +101,7 @@ pub fn log_addresses(anchor: &L1Anchor, system_config: Option<Address>) -> Vec<A
             .into_iter()
             .chain(system_config)
             .collect(),
-        L1Anchor::NitroRollup { rollup } => vec![rollup],
+        L1Anchor::NitroRollup { rollup, .. } => vec![rollup],
     }
 }
 
@@ -179,25 +187,30 @@ pub fn observe(
                         continue;
                     };
                     Observation::GameTypeChanged { game_type }
-                } else if Some(address) == system_config
-                    && topic(0) == Some(CONFIG_UPDATE)
-                    && topic(2)
-                        == Some(B256::from(alloy_primitives::U256::from(
-                            UNSAFE_BLOCK_SIGNER,
-                        )))
-                {
+                } else if Some(address) == system_config && topic(0) == Some(CONFIG_UPDATE) {
                     // `abi.encode(bytes)` of one address: offset, length, word.
-                    let Some(signer) = log.data.get(64..96) else {
+                    let Some(updated) = log
+                        .data
+                        .get(64..96)
+                        .map(|word| Address::from_word(B256::from_slice(word)))
+                    else {
                         continue;
                     };
-                    Observation::SignerChanged {
-                        signer: Address::from_word(B256::from_slice(signer)),
+                    let update = |kind: u64| {
+                        topic(2) == Some(B256::from(alloy_primitives::U256::from(kind)))
+                    };
+                    if update(UNSAFE_BLOCK_SIGNER) {
+                        Observation::SignerChanged { signer: updated }
+                    } else if update(BATCHER) {
+                        Observation::BatcherChanged { batcher: updated }
+                    } else {
+                        continue;
                     }
                 } else {
                     continue;
                 }
             }
-            L1Anchor::NitroRollup { rollup } => {
+            L1Anchor::NitroRollup { rollup, .. } => {
                 if address != rollup || topic(0) != Some(ASSERTION_CONFIRMED) || log.data.len() < 32
                 {
                     continue;
@@ -370,7 +383,9 @@ impl GameLedger {
             }
             Observation::AssertionConfirmed { .. }
             | Observation::SignerChanged { .. }
-            | Observation::GameTypeChanged { .. } => Ok(None),
+            | Observation::BatcherChanged { .. }
+            | Observation::GameTypeChanged { .. }
+            | Observation::DataFinal { .. } => Ok(None),
         }
     }
 
@@ -422,6 +437,8 @@ struct Cursor {
     hash: B256,
     #[serde(default, flatten)]
     learned: Learned,
+    #[serde(default)]
+    batches: BatchCursor,
 }
 
 /// What the lane learned from the rollup's contracts up to where it stopped.
@@ -433,6 +450,9 @@ pub struct Learned {
     /// The newest game type the registry respects; `None` before any change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub game_type: Option<u32>,
+    /// The newest batcher the `SystemConfig` named; `None` before any update.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batcher: Option<Address>,
 }
 
 /// What the lane whose cursor is at `cursor_path` learned, read before it
@@ -463,6 +483,9 @@ pub struct AnchorLane<B> {
     /// Whether a game type the registry comes to respect replaces the
     /// anchor's; `false` keeps a configured one.
     pub follow_game_type: bool,
+    /// Reads the rollup's batches for data finality; `None` leaves finality
+    /// to settlement.
+    pub batches: Option<BatchReader>,
 }
 
 impl<B: FinalizedBlocks> AnchorLane<B> {
@@ -472,6 +495,7 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
     ///
     /// Returns an error when L1 finality ends or fails, a range cannot be
     /// read, or finalized L1 blocks fail to link to the last range read.
+    #[allow(clippy::too_many_lines)]
     pub async fn run(
         mut self,
         observations: mpsc::Sender<Observation>,
@@ -484,6 +508,10 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
         if let Some(game_type) = learned.game_type {
             self.respect(game_type);
         }
+        if let (Some(reader), Some(cursor)) = (&mut self.batches, &cursor) {
+            reader.resume(cursor.batches);
+        }
+        let mut data_final = 0;
         let mut events = self
             .finality
             .subscribe(self.checkpoint.clone(), cancellation.clone())
@@ -505,11 +533,20 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             else {
                 continue;
             };
+            // Blocks up to `observed` were read before; reading again from
+            // an open channel's first frame only rebuilds that channel.
+            let observed = cursor.as_ref().map(|cursor| cursor.number);
             let start = cursor.as_ref().map_or_else(
                 || block_number.0.saturating_sub(self.lookback),
-                |cursor| cursor.number.saturating_add(1),
+                |cursor| {
+                    let next = cursor.number.saturating_add(1);
+                    cursor
+                        .batches
+                        .resume_from
+                        .map_or(next, |from| from.min(next))
+                },
             );
-            if start > block_number.0 {
+            if observed.is_some_and(|observed| observed >= block_number.0) {
                 continue;
             }
             let range = BlockRange::new(BlockNumber(start), block_number)
@@ -521,27 +558,52 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
                 beacon_block_root,
             };
             let frames = self.blocks.frames(range, tip, &cancellation).await?;
-            if let (Some(cursor), Some(first)) = (&cursor, frames.first())
-                && first.block.number.0 == cursor.number.saturating_add(1)
-                && first.block.parent_hash.0 != cursor.hash.0
+            if let Some(cursor) = &cursor
+                && let Some(next) = frames
+                    .iter()
+                    .find(|frame| frame.block.number.0 == cursor.number.saturating_add(1))
+                && next.block.parent_hash.0 != cursor.hash.0
             {
                 return Err(SourceError::Unavailable(format!(
                     "finalized L1 block {} does not link to block {} read before",
-                    first.block.number.0, cursor.number
+                    next.block.number.0, cursor.number
                 )));
             }
             let mut found = 0_usize;
             for frame in &frames {
-                for observation in observe(&self.anchor, self.chain_id, self.system_config, frame) {
-                    found += 1;
-                    match observation {
-                        Observation::SignerChanged { signer } => learned.signer = Some(signer),
-                        Observation::GameTypeChanged { game_type } => {
-                            learned.game_type = Some(game_type);
-                            self.respect(game_type);
+                let mut seen = Vec::new();
+                if observed.is_none_or(|observed| frame.block.number.0 > observed) {
+                    for observation in
+                        observe(&self.anchor, self.chain_id, self.system_config, frame)
+                    {
+                        match observation {
+                            Observation::SignerChanged { signer } => learned.signer = Some(signer),
+                            Observation::BatcherChanged { batcher } => {
+                                learned.batcher = Some(batcher);
+                            }
+                            Observation::GameTypeChanged { game_type } => {
+                                learned.game_type = Some(game_type);
+                                self.respect(game_type);
+                            }
+                            _ => {}
                         }
-                        _ => {}
+                        seen.push(observation);
                     }
+                }
+                if let Some(reader) = &mut self.batches {
+                    let batcher = match reader.inbox {
+                        BatchInbox::OpStack { batcher, .. } => learned.batcher.unwrap_or(batcher),
+                        BatchInbox::Nitro { .. } => Address::ZERO,
+                    };
+                    if let Some((number, hash)) = reader.read(frame, batcher).await?
+                        && number > data_final
+                    {
+                        data_final = number;
+                        seen.push(Observation::DataFinal { number, hash });
+                    }
+                }
+                found += seen.len();
+                for observation in seen {
                     if observations.send(observation).await.is_err() {
                         return Ok(());
                     }
@@ -557,6 +619,11 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
                 number: block_number.0,
                 hash: B256::from(block_hash.0),
                 learned,
+                batches: self
+                    .batches
+                    .as_ref()
+                    .map(BatchReader::cursor)
+                    .unwrap_or_default(),
             };
             write_atomically(
                 &self.cursor_path,
@@ -600,25 +667,19 @@ fn read_cursor(path: &Path) -> Result<Option<Cursor>, SourceError> {
         .map_err(|error| SourceError::Unavailable(format!("{}: {error}", path.display())))
 }
 
-/// The rollup block the L1 anchor finalized last.
-pub type FinalizedBlock = Option<(BlockNumber, BlockHash)>;
-
-/// Finality from the L1 anchor alone: each block it finalizes, newest first
-/// when several arrive between reads.
+/// Finality from Ethereum alone: the blocks the rollup's batches finalize
+/// and its anchor settles, newest first when several arrive between reads.
 #[derive(Debug)]
 pub struct AnchoredFinality {
     descriptor: SourceDescriptor,
-    finalized: watch::Receiver<FinalizedBlock>,
+    rollup: RollupFinality,
 }
 
 impl AnchoredFinality {
     /// # Errors
     ///
     /// Returns an error for an invalid source id.
-    pub fn new(
-        chain_id: ChainId,
-        finalized: watch::Receiver<FinalizedBlock>,
-    ) -> Result<Self, SourceError> {
+    pub fn new(chain_id: ChainId, rollup: RollupFinality) -> Result<Self, SourceError> {
         Ok(Self {
             descriptor: SourceDescriptor {
                 id: SourceId::new("l1-anchor")
@@ -635,20 +696,8 @@ impl AnchoredFinality {
                 schema_version: "l1-anchor.v1".to_owned(),
                 priority: 0,
             },
-            finalized,
+            rollup,
         })
-    }
-}
-
-/// The finality event of an anchored block; the beacon fields carry its
-/// number and a zero root.
-#[must_use]
-pub const fn finalized_event(number: BlockNumber, hash: BlockHash) -> FinalityEvent {
-    FinalityEvent::Finalized {
-        block_number: number,
-        block_hash: hash,
-        beacon_slot: number.0,
-        beacon_block_root: [0; 32],
     }
 }
 
@@ -663,22 +712,13 @@ impl FinalitySource for AnchoredFinality {
         _checkpoint: ConsensusCheckpoint,
         cancellation: CancellationToken,
     ) -> Result<FinalityEventStream, SourceError> {
-        let mut finalized = self.finalized.clone();
-        finalized.mark_changed();
         Ok(futures::stream::unfold(
-            (finalized, cancellation),
-            |(mut finalized, cancellation)| async move {
-                loop {
-                    tokio::select! {
-                        () = cancellation.cancelled() => return None,
-                        changed = finalized.changed() => {
-                            changed.ok()?;
-                            let latest = *finalized.borrow_and_update();
-                            if let Some((number, hash)) = latest {
-                                return Some((Ok(finalized_event(number, hash)), (finalized, cancellation)));
-                            }
-                        }
-                    }
+            (self.rollup.subscribe(), cancellation),
+            |(mut rollup, cancellation)| async move {
+                tokio::select! {
+                    () = cancellation.cancelled() => None,
+                    // A lane that ended ends the stream; the lanes restart.
+                    event = rollup.next() => event.ok().map(|event| (Ok(event), (rollup, cancellation))),
                 }
             },
         )
@@ -686,5 +726,10 @@ impl FinalitySource for AnchoredFinality {
     }
 }
 
+mod batches;
 #[cfg(test)]
 mod tests;
+
+pub use batches::{
+    BatchCursor, BatchInbox, BatchReader, Blobs, HeldBlocks, SEQUENCER_BATCH_DELIVERED,
+};
