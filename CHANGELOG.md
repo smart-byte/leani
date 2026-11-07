@@ -329,6 +329,10 @@ record, and documented RPC contracts.
 - Op-stack block gossip refuses a message that claims to decompress past
   10 MiB before decompressing it: such a message could make the node
   allocate gigabytes before its signature was checked.
+- A sequencer feed connection that has not finished its handshake within 30
+  seconds is opened again, and a handshake response with a line over 8 KiB
+  or more than 64 lines is refused: a feed server could hold the lane or
+  grow its memory without bound.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
