@@ -4508,6 +4508,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "leani-op-batches"
+version = "0.1.1"
+dependencies = [
+ "alloy-primitives",
+ "brotli-decompressor",
+ "c-kzg",
+ "flate2",
+ "sha2 0.11.1",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "leani-primitives"
 version = "0.1.1"
 dependencies = [

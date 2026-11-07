@@ -8,6 +8,7 @@ members = [
   "crates/finality-op-gossip",
   "crates/l1-anchor",
   "crates/node",
+  "crates/op-batches",
   "crates/primitives",
   "crates/processor-api",
   "crates/processor-block-summary",
@@ -60,6 +61,8 @@ op-alloy-rpc-types-engine = { version = "2.0.0", default-features = false, featu
 op-alloy-consensus = { version = "2.0.0", default-features = false, features = ["std", "k256", "serde", "reth-core"] }
 anyhow = "1.0"
 async-trait = "0.1"
+brotli-decompressor = "6.0"
+c-kzg = "2.1"
 arrow-array = "60.0.0"
 arrow-schema = "60.0.0"
 axum = { version = "0.8", features = ["ws"] }
