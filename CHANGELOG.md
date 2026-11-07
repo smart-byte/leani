@@ -346,6 +346,11 @@ record, and documented RPC contracts.
 - On-demand backfills read a configured `json_rpc` history source. They left
   it out, so a chain whose only history is JSON-RPC, such as Arbitrum Nova
   or Robinhood Chain, had none, and Arbitrum One lost its fallback.
+- The L1 anchor reads a long catch-up, as after downtime, chunk by chunk
+  and keeps its place after each: it held the whole gap in memory and lost
+  it all to one failed read. After a restart it hands on the chunk it read
+  last again, since a crash could lose what had not been kept yet, such as
+  a dispute game or a confirmed assertion.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of

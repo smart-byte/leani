@@ -10,12 +10,12 @@ use anyhow::{Context, Result, bail};
 use futures::StreamExt;
 use leani_chain::L1Anchor;
 use leani_l1_anchor::{
-    AnchorLane, BatchInbox, BatchReader, Blobs, FinalizedBlocks, FinalizedTip, GameLedger,
-    HeldBlocks, Observation,
+    AnchorLane, BatchInbox, BatchReader, Blobs, FinalizedBlocks, FinalizedTip, FrameChunks,
+    GameLedger, HeldBlocks, Observation,
 };
 use leani_primitives::{
-    Address, BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet,
-    ChainId, ConsensusAnchor, Finality, LogFieldSet,
+    Address, BlockHash, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet, ChainId,
+    ConsensusAnchor, Finality, LogFieldSet,
 };
 use leani_source_api::{
     ConsensusCheckpoint, DataRequest, FieldProjection, FilterSet, FinalitySource, HistorySource,
@@ -45,7 +45,7 @@ impl FinalizedBlocks for P2pFinalizedBlocks {
         range: BlockRange,
         tip: FinalizedTip,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError> {
+    ) -> Result<FrameChunks, SourceError> {
         let anchor = leani_source_p2p::P2pHistoryAnchor {
             block: BlockRef {
                 number: BlockNumber(tip.number),
@@ -63,33 +63,45 @@ impl FinalizedBlocks for P2pFinalizedBlocks {
                 beacon_block_root: tip.beacon_block_root,
             },
         };
-        let history = leani_source_p2p::RethP2pHistorySource::from_persistent_source(
-            self.source.clone(),
-            range,
-            anchor,
-        )?;
+        let history = Arc::new(
+            leani_source_p2p::RethP2pHistorySource::from_persistent_source(
+                self.source.clone(),
+                range,
+                anchor,
+            )?,
+        );
         let mut request = self.request.clone();
         request.range = range;
-        let plan = history.plan(&request).await?;
-        let input_bytes = range.len().saturating_mul(BYTES_PER_L1_BLOCK);
-        let mut frames = Vec::new();
-        for chunk in &plan.chunks {
-            let budget = SourceBudget {
-                max_input_bytes: input_bytes,
-                max_frame_bytes: BYTES_PER_L1_BLOCK,
-                max_frames: chunk.range.len(),
-                max_buffered_frames: 64,
-                max_in_flight_requests: 4,
-                temporary_disk_bytes: 1,
-                max_resident_bytes: input_bytes,
-            };
-            let mut stream = history.open(chunk, budget, cancellation.clone()).await?;
-            while let Some(frame) = stream.next().await {
-                frames.push(frame?);
-            }
-        }
-        frames.sort_by_key(|frame| frame.block.number);
-        Ok(frames)
+        let mut chunks = history.plan(&request).await?.chunks;
+        chunks.sort_by_key(|chunk| chunk.range.start());
+        let cancellation = cancellation.clone();
+        Ok(futures::stream::iter(chunks)
+            .then(move |chunk| {
+                let history = Arc::clone(&history);
+                let cancellation = cancellation.clone();
+                async move {
+                    // Each chunk's own bound, whatever the range: a lane far
+                    // behind reads it chunk by chunk.
+                    let input_bytes = chunk.range.len().saturating_mul(BYTES_PER_L1_BLOCK);
+                    let budget = SourceBudget {
+                        max_input_bytes: input_bytes,
+                        max_frame_bytes: BYTES_PER_L1_BLOCK,
+                        max_frames: chunk.range.len(),
+                        max_buffered_frames: 64,
+                        max_in_flight_requests: 4,
+                        temporary_disk_bytes: 1,
+                        max_resident_bytes: input_bytes,
+                    };
+                    let mut stream = history.open(&chunk, budget, cancellation).await?;
+                    let mut frames = Vec::new();
+                    while let Some(frame) = stream.next().await {
+                        frames.push(frame?);
+                    }
+                    frames.sort_by_key(|frame| frame.block.number);
+                    Ok(frames)
+                }
+            })
+            .boxed())
     }
 }
 

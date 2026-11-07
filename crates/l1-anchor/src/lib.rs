@@ -409,8 +409,12 @@ pub struct FinalizedTip {
     pub beacon_block_root: [u8; 32],
 }
 
+/// The blocks of a range, one chunk at a time, in order.
+pub type FrameChunks = futures::stream::BoxStream<'static, Result<Vec<BlockFrame>, SourceError>>;
+
 /// Finalized L1 blocks: the anchor's logs and creation calls of `range`,
-/// hash-linked down from `tip`, which ends it.
+/// hash-linked down from `tip`, which ends it, in ascending chunks, so a
+/// long range is never held whole.
 #[async_trait::async_trait]
 pub trait FinalizedBlocks: Send + Sync {
     async fn frames(
@@ -418,7 +422,7 @@ pub trait FinalizedBlocks: Send + Sync {
         range: BlockRange,
         tip: FinalizedTip,
         cancellation: &CancellationToken,
-    ) -> Result<Vec<BlockFrame>, SourceError>;
+    ) -> Result<FrameChunks, SourceError>;
 }
 
 #[derive(Deserialize, Serialize)]
@@ -429,6 +433,10 @@ struct Cursor {
     learned: Learned,
     #[serde(default)]
     batches: BatchCursor,
+    /// The first block of the chunk read last, which a restart hands on
+    /// again; `None` until a chunk is read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_chunk: Option<u64>,
 }
 
 /// What the lane learned from the rollup's contracts up to where it stopped.
@@ -501,6 +509,7 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
         if let (Some(reader), Some(cursor)) = (&mut self.batches, &cursor) {
             reader.resume(cursor.batches);
         }
+        let mut replay = cursor.as_ref().and_then(|cursor| cursor.last_chunk);
         let mut data_final = 0;
         let mut events = self
             .finality
@@ -523,22 +532,32 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
             else {
                 continue;
             };
-            // Blocks up to `observed` were read before; reading again from
-            // an open channel's first frame only rebuilds that channel.
-            let observed = cursor.as_ref().map(|cursor| cursor.number);
+            // Blocks up to `observed` were handed on before. A restart hands
+            // on the chunk read last again, since its observers may not have
+            // kept it; reading again from an open channel's first frame only
+            // rebuilds that channel.
+            let observed = cursor.as_ref().map(|cursor| {
+                replay.map_or(cursor.number, |from| {
+                    from.saturating_sub(1).min(cursor.number)
+                })
+            });
             let start = cursor.as_ref().map_or_else(
                 || block_number.0.saturating_sub(self.lookback),
                 |cursor| {
-                    let next = cursor.number.saturating_add(1);
+                    let next = observed.unwrap_or(cursor.number).saturating_add(1);
                     cursor
                         .batches
                         .resume_from
                         .map_or(next, |from| from.min(next))
                 },
             );
-            if observed.is_some_and(|observed| observed >= block_number.0) {
+            if cursor
+                .as_ref()
+                .is_some_and(|cursor| cursor.number >= block_number.0)
+            {
                 continue;
             }
+            replay = None;
             let range = BlockRange::new(BlockNumber(start), block_number)
                 .map_err(|error| SourceError::InvalidPlan(error.to_string()))?;
             let tip = FinalizedTip {
@@ -547,81 +566,98 @@ impl<B: FinalizedBlocks> AnchorLane<B> {
                 beacon_slot,
                 beacon_block_root,
             };
-            let frames = self.blocks.frames(range, tip, &cancellation).await?;
-            if let Some(cursor) = &cursor
-                && let Some(next) = frames
-                    .iter()
-                    .find(|frame| frame.block.number.0 == cursor.number.saturating_add(1))
-                && next.block.parent_hash.0 != cursor.hash.0
-            {
-                return Err(SourceError::Unavailable(format!(
-                    "finalized L1 block {} does not link to block {} read before",
-                    next.block.number.0, cursor.number
-                )));
-            }
-            let mut found = 0_usize;
-            for frame in &frames {
-                let mut seen = Vec::new();
-                if observed.is_none_or(|observed| frame.block.number.0 > observed) {
-                    for observation in
-                        observe(&self.anchor, self.chain_id, self.system_config, frame)
-                    {
-                        match observation {
-                            Observation::SignerChanged { signer } => learned.signer = Some(signer),
-                            Observation::BatcherChanged { batcher } => {
-                                learned.batcher = Some(batcher);
+            let mut chunks = self.blocks.frames(range, tip, &cancellation).await?;
+            while let Some(frames) = chunks.next().await {
+                let frames = frames?;
+                let (Some(first), Some(last)) = (frames.first(), frames.last()) else {
+                    continue;
+                };
+                let (first, last, last_hash) =
+                    (first.block.number.0, last.block.number.0, last.block.hash);
+                if let Some(cursor) = &cursor
+                    && let Some(next) = frames
+                        .iter()
+                        .find(|frame| frame.block.number.0 == cursor.number.saturating_add(1))
+                    && next.block.parent_hash.0 != cursor.hash.0
+                {
+                    return Err(SourceError::Unavailable(format!(
+                        "finalized L1 block {} does not link to block {} read before",
+                        next.block.number.0, cursor.number
+                    )));
+                }
+                let mut found = 0_usize;
+                for frame in &frames {
+                    let mut seen = Vec::new();
+                    if observed.is_none_or(|observed| frame.block.number.0 > observed) {
+                        for observation in
+                            observe(&self.anchor, self.chain_id, self.system_config, frame)
+                        {
+                            match observation {
+                                Observation::SignerChanged { signer } => {
+                                    learned.signer = Some(signer);
+                                }
+                                Observation::BatcherChanged { batcher } => {
+                                    learned.batcher = Some(batcher);
+                                }
+                                Observation::GameTypeChanged { game_type } => {
+                                    learned.game_type = Some(game_type);
+                                    self.respect(game_type);
+                                }
+                                _ => {}
                             }
-                            Observation::GameTypeChanged { game_type } => {
-                                learned.game_type = Some(game_type);
-                                self.respect(game_type);
-                            }
-                            _ => {}
+                            seen.push(observation);
                         }
-                        seen.push(observation);
+                    }
+                    if let Some(reader) = &mut self.batches {
+                        let batcher = match reader.inbox {
+                            BatchInbox::OpStack { batcher, .. } => {
+                                learned.batcher.unwrap_or(batcher)
+                            }
+                            BatchInbox::Nitro { .. } => Address::ZERO,
+                        };
+                        if let Some((number, hash)) = reader.read(frame, batcher).await?
+                            && number > data_final
+                        {
+                            data_final = number;
+                            seen.push(Observation::DataFinal { number, hash });
+                        }
+                    }
+                    found += seen.len();
+                    for observation in seen {
+                        if observations.send(observation).await.is_err() {
+                            return Ok(());
+                        }
                     }
                 }
-                if let Some(reader) = &mut self.batches {
-                    let batcher = match reader.inbox {
-                        BatchInbox::OpStack { batcher, .. } => learned.batcher.unwrap_or(batcher),
-                        BatchInbox::Nitro { .. } => Address::ZERO,
-                    };
-                    if let Some((number, hash)) = reader.read(frame, batcher).await?
-                        && number > data_final
-                    {
-                        data_final = number;
-                        seen.push(Observation::DataFinal { number, hash });
-                    }
+                info!(
+                    from = first,
+                    to = last,
+                    observations = found,
+                    "read finalized L1 blocks for the rollup anchor"
+                );
+                // A chunk handed on again moves nothing.
+                if cursor.as_ref().is_some_and(|cursor| cursor.number >= last) {
+                    continue;
                 }
-                found += seen.len();
-                for observation in seen {
-                    if observations.send(observation).await.is_err() {
-                        return Ok(());
-                    }
-                }
+                let next = Cursor {
+                    number: last,
+                    hash: B256::from(last_hash.0),
+                    learned,
+                    batches: self
+                        .batches
+                        .as_ref()
+                        .map(BatchReader::cursor)
+                        .unwrap_or_default(),
+                    last_chunk: Some(first),
+                };
+                write_atomically(
+                    &self.cursor_path,
+                    &serde_json::to_vec(&next)
+                        .map_err(|error| SourceError::Unavailable(error.to_string()))?,
+                )
+                .map_err(|error| SourceError::Unavailable(error.to_string()))?;
+                cursor = Some(next);
             }
-            info!(
-                from = range.start().0,
-                to = range.end().0,
-                observations = found,
-                "read finalized L1 blocks for the rollup anchor"
-            );
-            let next = Cursor {
-                number: block_number.0,
-                hash: B256::from(block_hash.0),
-                learned,
-                batches: self
-                    .batches
-                    .as_ref()
-                    .map(BatchReader::cursor)
-                    .unwrap_or_default(),
-            };
-            write_atomically(
-                &self.cursor_path,
-                &serde_json::to_vec(&next)
-                    .map_err(|error| SourceError::Unavailable(error.to_string()))?,
-            )
-            .map_err(|error| SourceError::Unavailable(error.to_string()))?;
-            cursor = Some(next);
         }
     }
 }
