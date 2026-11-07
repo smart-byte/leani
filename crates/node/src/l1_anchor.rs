@@ -164,38 +164,7 @@ async fn lane(
         .as_ref()
         .map(|op_stack| op_stack.system_config);
     let inbox = config.batch_inbox().map_err(anyhow::Error::msg)?;
-    let mut addresses = leani_l1_anchor::log_addresses(&anchor, system_config);
-    let mut recipients: Vec<_> = leani_l1_anchor::calldata_recipient(&anchor)
-        .into_iter()
-        .collect();
-    let mut required = CapabilitySet::of(Capability::Logs);
-    match &inbox {
-        // Derivation reads a batcher transaction only when it succeeded,
-        // from the batcher, by its blobs or calldata.
-        Some(BatchInbox::OpStack { inbox, .. }) => {
-            recipients.push(*inbox);
-            required = required
-                .with(Capability::Senders)
-                .with(Capability::BlobFields)
-                .with(Capability::ReceiptOutcome);
-        }
-        // A recipient filter would keep only the logs of transactions to the
-        // inbox, and the rollup confirms assertions in others: the inbox's
-        // log names its post, and every transaction keeps its calldata.
-        Some(BatchInbox::Nitro {
-            sequencer_inbox, ..
-        }) => {
-            addresses.push(*sequencer_inbox);
-            required = required.with(Capability::Calldata);
-        }
-        None => {}
-    }
-    let mut filters = FilterSet::default();
-    filters.scope.addresses = addresses.into_iter().map(Address::from).collect();
-    if !recipients.is_empty() {
-        filters.recipients = recipients.into_iter().map(Address::from).collect();
-        required = required.with(Capability::Calldata);
-    }
+    let (filters, required) = anchor_request(&anchor, system_config, inbox.as_ref());
     let chain_id = ChainId(config.chain_entry()?.chain_id);
     let batches = inbox.map(|inbox| {
         let blobs = matches!(inbox, BatchInbox::OpStack { .. }).then(|| {
@@ -229,6 +198,45 @@ async fn lane(
         follow_game_type: l1.game_type.is_none(),
         batches,
     })
+}
+
+/// What the lane reads from each finalized Ethereum block: the anchor's
+/// logs and, where game creations or batches are read from calls, every
+/// transaction's calldata. A recipient filter would keep only the logs of
+/// transactions to those recipients, and registries, games and the
+/// `SystemConfig` log in calls to themselves.
+fn anchor_request(
+    anchor: &L1Anchor,
+    system_config: Option<alloy_primitives::Address>,
+    inbox: Option<&BatchInbox>,
+) -> (FilterSet, CapabilitySet) {
+    let mut addresses = leani_l1_anchor::log_addresses(anchor, system_config);
+    let mut required = CapabilitySet::of(Capability::Logs);
+    if matches!(anchor, L1Anchor::DisputeGames { .. }) {
+        required = required.with(Capability::Calldata);
+    }
+    match inbox {
+        // Derivation reads a batcher transaction only when it succeeded,
+        // from the batcher, by its blobs or calldata.
+        Some(BatchInbox::OpStack { .. }) => {
+            required = required
+                .with(Capability::Calldata)
+                .with(Capability::Senders)
+                .with(Capability::BlobFields)
+                .with(Capability::ReceiptOutcome);
+        }
+        // The inbox's log names each post, whose call carries its count.
+        Some(BatchInbox::Nitro {
+            sequencer_inbox, ..
+        }) => {
+            addresses.push(*sequencer_inbox);
+            required = required.with(Capability::Calldata);
+        }
+        None => {}
+    }
+    let mut filters = FilterSet::default();
+    filters.scope.addresses = addresses.into_iter().map(Address::from).collect();
+    (filters, required)
 }
 
 struct StoreHeldBlocks {
@@ -771,5 +779,40 @@ pub(crate) fn follow_assertions(
     Assertions {
         rollup: rollup_finality(config, data_final_receiver, settled_receiver),
         confirmed: confirmed_receiver,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_lane_keeps_the_logs_of_transactions_to_any_contract() {
+        let base = leani_chain::ChainRegistry::standard()
+            .get("base")
+            .expect("entry");
+        let op_stack = base.op_stack.as_ref().expect("op-stack");
+        let registry = alloy_primitives::Address::repeat_byte(2);
+        let anchor = L1Anchor::DisputeGames {
+            factory: alloy_primitives::Address::repeat_byte(1),
+            registry,
+            game_type: 0,
+            claims: leani_chain::GameClaims::OutputRoots,
+        };
+        let batches = BatchInbox::OpStack {
+            inbox: alloy_primitives::Address::repeat_byte(4),
+            batcher: alloy_primitives::Address::repeat_byte(5),
+            cadence: op_stack.cadence(),
+        };
+        // A game's own call, closing it, is where the registry logs the
+        // anchor's move; the SystemConfig logs in calls to itself.
+        let game = Address::new([6; 20]);
+        for inbox in [None, Some(&batches)] {
+            let (filters, required) = anchor_request(&anchor, Some(op_stack.system_config), inbox);
+            let scope = filters.effective_scope();
+            assert!(scope.matches_transaction(2, Some(&game), || unreachable!()));
+            assert!(scope.matches_log(&Address::from(registry), &[[0_u8; 32]]));
+            assert!(required.contains(Capability::Calldata));
+        }
     }
 }
