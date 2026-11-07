@@ -7998,6 +7998,7 @@ async fn run_rpc_lanes(
     if bounds.is_none() {
         spawn_cold(backfills).await?;
     }
+    let mut resume_on_chain = true;
     if signed.is_some()
         && let Some(start) = resume
     {
@@ -8015,12 +8016,7 @@ async fn run_rpc_lanes(
             )
             .await
             .context("prove the catch-up chain down from the signed block")?;
-        if proven.get(&start.number.0).map(|hash| hash.0) != Some(start.hash.0) {
-            bail!(
-                "block {} is not on the chain down from the signed block",
-                start.number.0
-            );
-        }
+        resume_on_chain = proven.get(&start.number.0).map(|hash| hash.0) == Some(start.hash.0);
         live = live.with_proven_hashes(proven);
     }
     let live = Arc::new(live);
@@ -8067,7 +8063,7 @@ async fn run_rpc_lanes(
         spawn_cold(backfills).await?;
     }
     let live_start = match resume {
-        Some(start) => leani_source_api::LiveStart::Block(start),
+        Some(start) => resume_start(&store, chain_id, start, resume_on_chain, 64).await?,
         None => retained_live_start(&store, chain_id, anchor, overlap_blocks, 64, false).await?,
     };
     let (live_ready, mut live_ready_updates) = tokio::sync::watch::channel(false);
@@ -8445,17 +8441,13 @@ async fn run_op_lanes(
         },
     };
     let follows_rpc = rpc.is_some();
+    let mut start_on_chain = true;
     if let Some((quorum, signed, _)) = rpc {
         // The endpoints' blocks up from a stored tip are proven down from the
         // signed block before any is delivered.
         if let (Some(start), None) = (start, &proven) {
             let hashes = prove_down_from(&quorum, anchor, start.number.0).await?;
-            if hashes.get(&start.number.0).map(|hash| hash.0) != Some(start.hash.0) {
-                bail!(
-                    "block {} is not on the chain down from the signed block",
-                    start.number.0
-                );
-            }
+            start_on_chain = hashes.get(&start.number.0).map(|hash| hash.0) == Some(start.hash.0);
             proven = Some(hashes);
         }
         let mut live = leani_source_rpc::RpcLiveSource::new(
@@ -8471,7 +8463,10 @@ async fn run_op_lanes(
         live_runtime =
             SharedLiveRuntime::new(store.clone(), Arc::new(live), processors, live_config)?;
     }
-    let live_start = leani_source_api::LiveStart::Block(start.unwrap_or(anchor));
+    let live_start = match start {
+        Some(start) => resume_start(&store, chain_id, start, start_on_chain, 64).await?,
+        None => leani_source_api::LiveStart::Block(anchor),
+    };
     let checkpoint = leani_source_api::ConsensusCheckpoint {
         beacon_slot: anchor.number.0,
         beacon_block_root: [0; 32],
@@ -9907,6 +9902,44 @@ where
             Some(Vec::new())
         }
     }
+}
+
+/// Where a JSON-RPC lane resumes a store whose newest block is `tip`: at
+/// `tip`, or, when the chain proven down from the signed block left it while
+/// the node was down, on the retained blocks below it, at most `depth` of
+/// them, among which the live source finds where the chains part and
+/// reverts the rest.
+async fn resume_start(
+    store: &leani_store_sqlite::SqliteStore,
+    chain_id: leani_primitives::ChainId,
+    tip: leani_primitives::BlockRef,
+    on_chain: bool,
+    depth: usize,
+) -> Result<leani_source_api::LiveStart> {
+    if on_chain {
+        return Ok(leani_source_api::LiveStart::Block(tip));
+    }
+    warn!(
+        block = tip.number.0,
+        "the retained tip is not on the chain down from the signed block; the live lane reverts it"
+    );
+    let mut canonical = Vec::new();
+    let mut number = tip.number.0;
+    while canonical.len() < depth {
+        let Some(frame) = store
+            .recent_frame(chain_id, leani_primitives::BlockNumber(number))
+            .await?
+        else {
+            break;
+        };
+        canonical.push(frame.block);
+        let Some(below) = number.checked_sub(1) else {
+            break;
+        };
+        number = below;
+    }
+    canonical.reverse();
+    Ok(leani_source_api::LiveStart::RetainedCanonical { canonical })
 }
 
 async fn retained_live_start(
@@ -12071,6 +12104,46 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(1_500), runtime.shutdown())
             .await
             .expect("embedded shutdown is bounded");
+    }
+
+    #[tokio::test]
+    async fn a_resume_off_the_signed_chain_starts_on_the_retained_blocks_below_it() {
+        use leani_primitives::{BlockHash, ChainId};
+        use leani_source_api::LiveStart;
+        use leani_store_sqlite::{SqliteStore, StoreConfig};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("resume.sqlite")))
+            .await
+            .expect("store");
+        let mut parent = BlockHash::ZERO;
+        let mut tip = None;
+        for number in 10..=13 {
+            let frame = fixture_frame(number, parent);
+            parent = frame.block.hash;
+            store
+                .store_recent_frame(&frame)
+                .await
+                .expect("recent frame");
+            tip = Some(frame.block);
+        }
+        let tip = tip.expect("tip");
+        let start =
+            |on_chain: bool, depth: usize| resume_start(&store, ChainId(1), tip, on_chain, depth);
+        assert_eq!(start(true, 64).await.expect("start"), LiveStart::Block(tip));
+        let numbers = |start: LiveStart| match start {
+            LiveStart::RetainedCanonical { canonical } => canonical
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            numbers(start(false, 64).await.expect("start")),
+            [10, 11, 12, 13]
+        );
+        // No deeper than a reorg the runtime may revert.
+        assert_eq!(numbers(start(false, 2).await.expect("start")), [12, 13]);
     }
 
     #[tokio::test]

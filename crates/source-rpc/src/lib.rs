@@ -1462,6 +1462,94 @@ mod tests {
         );
     }
 
+    fn live_request() -> leani_source_api::DataRequest {
+        leani_source_api::DataRequest {
+            chain_id: leani_primitives::ChainId(1),
+            range: leani_primitives::BlockRange::new(
+                leani_primitives::BlockNumber(9),
+                leani_primitives::BlockNumber(u64::MAX - 1),
+            )
+            .unwrap(),
+            required: CapabilitySet::of(Capability::Header),
+            log_fields: leani_primitives::LogFieldSet::NONE,
+            allow_filtered: false,
+            projection: leani_source_api::FieldProjection::default(),
+            filters: leani_source_api::FilterSet::default(),
+            minimum_finality: leani_primitives::Finality::Unattested,
+            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
+        }
+    }
+
+    fn live_budget() -> leani_source_api::SourceBudget {
+        leani_source_api::SourceBudget {
+            max_input_bytes: 1 << 30,
+            max_frame_bytes: 1 << 20,
+            max_frames: 1_000,
+            max_buffered_frames: 64,
+            max_in_flight_requests: 4,
+            temporary_disk_bytes: 1,
+            max_resident_bytes: 1 << 30,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retained_tip_the_endpoints_replaced_is_reverted_from_the_blocks_below_it() {
+        use leani_source_api::LiveSource as _;
+
+        let (served, hashes) = header_chain(10, 0);
+        let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+        let source = RpcLiveSource::new(
+            "rpc",
+            leani_primitives::ChainId(1),
+            pool,
+            Duration::from_millis(10),
+        )
+        .unwrap();
+        let block = |number: u64, hash: B256| leani_primitives::BlockRef {
+            number: leani_primitives::BlockNumber(number),
+            hash: leani_primitives::BlockHash::new(hash.0),
+            parent_hash: leani_primitives::BlockHash::new(
+                hashes[usize::try_from(number).unwrap() - 2].0,
+            ),
+            timestamp: 0,
+        };
+        // The store kept blocks 6 and 7 of the endpoints' chain, and a block
+        // 8 that chain replaced.
+        let canonical = vec![
+            block(6, hashes[5]),
+            block(7, hashes[6]),
+            block(8, B256::repeat_byte(0xee)),
+        ];
+        let mut events = source
+            .subscribe(
+                live_request(),
+                leani_source_api::LiveStart::RetainedCanonical { canonical },
+                live_budget(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        let first = tokio::time::timeout(Duration::from_secs(30), events.next())
+            .await
+            .expect("an event")
+            .expect("open stream")
+            .expect("a reorg");
+        let leani_source_api::ChainEvent::Reorg { reverted, applied } = first else {
+            panic!("{first:?}");
+        };
+        assert_eq!(
+            reverted
+                .iter()
+                .map(|block| block.number.0)
+                .collect::<Vec<_>>(),
+            [8]
+        );
+        assert_eq!(
+            applied.first().map(|frame| frame.block.hash),
+            Some(leani_primitives::BlockHash::new(hashes[7].0))
+        );
+    }
+
     #[tokio::test]
     async fn the_live_lane_hands_over_blocks_as_soon_as_it_fetched_them() {
         use leani_source_api::LiveSource as _;
@@ -1476,30 +1564,7 @@ mod tests {
             Duration::from_secs(5),
         )
         .unwrap();
-        let request = leani_source_api::DataRequest {
-            chain_id: leani_primitives::ChainId(1),
-            range: leani_primitives::BlockRange::new(
-                leani_primitives::BlockNumber(9),
-                leani_primitives::BlockNumber(u64::MAX - 1),
-            )
-            .unwrap(),
-            required: CapabilitySet::of(Capability::Header),
-            log_fields: leani_primitives::LogFieldSet::NONE,
-            allow_filtered: false,
-            projection: leani_source_api::FieldProjection::default(),
-            filters: leani_source_api::FilterSet::default(),
-            minimum_finality: leani_primitives::Finality::Unattested,
-            verification_policy: leani_source_api::VerificationPolicy::CompleteCryptographic,
-        };
-        let budget = leani_source_api::SourceBudget {
-            max_input_bytes: 1 << 30,
-            max_frame_bytes: 1 << 20,
-            max_frames: 1_000,
-            max_buffered_frames: 64,
-            max_in_flight_requests: 4,
-            temporary_disk_bytes: 1,
-            max_resident_bytes: 1 << 30,
-        };
+        let (request, budget) = (live_request(), live_budget());
         let start = leani_source_api::LiveStart::Block(leani_primitives::BlockRef {
             number: leani_primitives::BlockNumber(8),
             hash: leani_primitives::BlockHash::new(hashes[7].0),

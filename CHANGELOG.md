@@ -351,6 +351,9 @@ record, and documented RPC contracts.
   it all to one failed read. After a restart it hands on the chunk it read
   last again, since a crash could lose what had not been kept yet, such as
   a dispute game or a confirmed assertion.
+- A JSON-RPC lane whose stored newest block was replaced while the node was
+  down reverts it, up to 64 blocks deep, instead of refusing to start again
+  and again.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
