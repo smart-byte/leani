@@ -8263,13 +8263,21 @@ impl SqliteStore {
         let Some((head, _)) = self.settled_head(cursor.chain_id).await? else {
             return Ok(None);
         };
+        // Maintenance moves a block-local processor's finalized coverage into
+        // compact intervals long before its blocks settle.
+        let head = u64_i64(head.0, "block_number")?;
         let through: Option<i64> = sqlx::query_scalar(
-            "SELECT MAX(block_number) FROM processor_coverage
-             WHERE instance = ? AND finality = ? AND block_number <= ?",
+            "SELECT MAX(block_number) FROM (
+                SELECT MAX(block_number) AS block_number FROM processor_coverage
+                WHERE instance = ?1 AND finality = ?2 AND block_number <= ?3
+                UNION ALL
+                SELECT MIN(MAX(end_block), ?3) FROM finalized_coverage_intervals
+                WHERE instance = ?1 AND start_block <= ?3
+             )",
         )
         .bind(&instance)
         .bind(finality_i64(Finality::Finalized))
-        .bind(u64_i64(head.0, "block_number")?)
+        .bind(head)
         .fetch_one(&self.inner.pool)
         .await?;
         let Some(through) = through else {
@@ -22491,6 +22499,32 @@ mod tests {
                 (3, Finality::Finalized, "apply"),
                 (2, Finality::Settled, "settled"),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn settlement_reaches_finalized_coverage_already_compacted() {
+        let (_directory, store) = store().await;
+        let mut processor = finalized_only_processor();
+        processor.descriptor.mode = ReductionMode::BlockLocal;
+        let blocks = apply_finalized_blocks(&store, &processor, 6).await;
+        let compacted = store
+            .compact_finalized_coverage(&processor.descriptor, BlockNumber(6), 2, 6)
+            .await
+            .expect("compact");
+        assert_eq!(compacted.exact_coverage_deleted, 6);
+        assert!(
+            store
+                .mark_chain_settled(ChainId(1), BlockNumber(4), blocks[3].block.hash)
+                .await
+                .expect("settle")
+        );
+        assert_eq!(
+            store
+                .mark_settled(&processor.descriptor)
+                .await
+                .expect("mark"),
+            Some(BlockNumber(4))
         );
     }
 
