@@ -4,7 +4,7 @@
 //! as Holocene requires. A Nitro batch post names the chain's message count,
 //! which numbers its last block.
 
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 use alloy_primitives::{Address, B256};
 use leani_chain::Cadence;
@@ -17,6 +17,12 @@ use tracing::{debug, info, warn};
 /// `SequencerBatchDelivered(uint256 indexed, bytes32 indexed, bytes32
 /// indexed, bytes32, uint256, (uint64,uint64,uint64,uint64), uint8)`, which
 /// a `SequencerInbox` emits for every batch it accepts.
+/// L1 blocks after its origin that a batch may still be included in: the
+/// Superchain's sequencing window, which every bundled op-stack chain uses.
+const SEQUENCING_WINDOW: u64 = 3_600;
+/// Seconds a block may be made after its L1 origin, since Fjord.
+const MAX_SEQUENCER_DRIFT: u64 = 1_800;
+
 pub const SEQUENCER_BATCH_DELIVERED: B256 =
     alloy_primitives::b256!("0x7394f4a19a13c7b92b5bb71033245305946ef78452f7b4986ac1390b5df4ebd7");
 
@@ -89,11 +95,36 @@ pub struct BatchReader {
     pub blobs: Option<Arc<dyn Blobs>>,
     channels: Channels,
     next_parent: Option<u64>,
+    /// The finalized L1 blocks of the last sequencing window, by number:
+    /// their hash and time.
+    origins: BTreeMap<u64, (B256, u64)>,
+    last_origin: Option<u64>,
 }
 
 enum Parent {
     Hash(B256),
     Prefix([u8; 20]),
+}
+
+enum Origin {
+    Hash(B256),
+    Prefix([u8; 20]),
+}
+
+impl Origin {
+    fn matches(&self, hash: B256) -> bool {
+        match self {
+            Self::Hash(origin) => *origin == hash,
+            Self::Prefix(prefix) => hash[..20] == prefix[..],
+        }
+    }
+}
+
+enum Eligibility {
+    Valid,
+    /// Its L1 origin is older than the blocks this lane has read.
+    Unknown,
+    Invalid(&'static str),
 }
 
 impl Parent {
@@ -118,6 +149,26 @@ impl BatchReader {
             blobs,
             channels: Channels::default(),
             next_parent: None,
+            origins: BTreeMap::new(),
+            last_origin: None,
+        }
+    }
+
+    /// Remember `frame`, a finalized L1 block read in order, as a later
+    /// batch's L1 origin, for a sequencing window.
+    pub fn read_origin(&mut self, frame: &BlockFrame) {
+        let number = frame.block.number.0;
+        self.origins.insert(
+            number,
+            (B256::from(frame.block.hash.0), frame.block.timestamp),
+        );
+        let oldest = number.saturating_sub(SEQUENCING_WINDOW);
+        while self
+            .origins
+            .first_key_value()
+            .is_some_and(|(kept, _)| *kept < oldest)
+        {
+            self.origins.pop_first();
         }
     }
 
@@ -149,6 +200,7 @@ impl BatchReader {
     ) -> Result<Option<(u64, B256)>, SourceError> {
         match self.inbox {
             BatchInbox::OpStack { inbox, cadence, .. } => {
+                self.read_origin(frame);
                 self.read_op_stack(frame, inbox, batcher, cadence).await
             }
             BatchInbox::Nitro {
@@ -196,7 +248,8 @@ impl BatchReader {
                     for batch in readable {
                         match batch {
                             Ok(batch) => {
-                                if let Some(final_block) = self.match_batch(&batch, cadence).await?
+                                if let Some(final_block) =
+                                    self.match_batch(&batch, cadence, l1).await?
                                 {
                                     newest = Some(final_block);
                                 }
@@ -257,19 +310,22 @@ impl BatchReader {
         Ok(data)
     }
 
-    /// The block `batch` makes final, if it follows the batches before it
-    /// and names a block the node holds.
+    /// The block `batch`, included in L1 block `l1`, makes final, if it
+    /// follows the batches before it, passes the rules of derivation its
+    /// header shows, and names a block the node holds.
     async fn match_batch(
         &mut self,
         batch: &Batch,
         cadence: Cadence,
+        l1: u64,
     ) -> Result<Option<(u64, B256)>, SourceError> {
         let blocks = batch.blocks();
-        let (parent, number) = match *batch {
+        let (parent, number, origin, named, last_time) = match *batch {
             Batch::Singular {
                 parent_hash,
+                epoch,
+                epoch_hash,
                 timestamp,
-                ..
             } => {
                 // Once the node holds a block newer than the batch's, its
                 // parent is either held or on another branch.
@@ -277,11 +333,19 @@ impl BatchReader {
                     return Ok(None);
                 }
                 let number = self.held.number_of(parent_hash).await?;
-                (Parent::Hash(parent_hash), number)
+                (
+                    Parent::Hash(parent_hash),
+                    number,
+                    epoch,
+                    Origin::Hash(epoch_hash),
+                    timestamp,
+                )
             }
             Batch::Span {
                 relative_timestamp,
+                l1_origin,
                 parent_check,
+                l1_origin_check,
                 ..
             } => {
                 let Some(first) = cadence
@@ -294,7 +358,13 @@ impl BatchReader {
                 if !self.holds(|head| head.0 >= last).await? {
                     return Ok(None);
                 }
-                (Parent::Prefix(parent_check), first.checked_sub(1))
+                (
+                    Parent::Prefix(parent_check),
+                    first.checked_sub(1),
+                    l1_origin,
+                    Origin::Prefix(l1_origin_check),
+                    cadence.slot_start(last),
+                )
             }
         };
         // A singular batch whose parent the node does not hold builds, if it
@@ -304,20 +374,37 @@ impl BatchReader {
             debug!("a batch builds on a block this node does not hold");
             return Ok(None);
         };
-        if let Some(next) = self.next_parent {
-            if number < next {
-                debug!(parent = number, next, "a batch for blocks already read");
+        if !self.follows(number) {
+            return Ok(None);
+        }
+        let timed = match *batch {
+            Batch::Singular { timestamp, .. } => cadence.slot_start(number + 1) == timestamp,
+            Batch::Span { .. } => true,
+        };
+        let singular = matches!(batch, Batch::Singular { .. });
+        match self.eligibility(origin, &named, last_time, singular, timed, l1) {
+            Eligibility::Valid => {}
+            Eligibility::Unknown => {
+                if self.next_parent.take().is_some() {
+                    info!(
+                        origin,
+                        "a batch names an L1 origin older than the blocks this lane read; matching starts over at a later batch"
+                    );
+                }
+                self.last_origin = None;
                 return Ok(None);
             }
-            if number > next {
+            // The batches after it still build on the same block.
+            Eligibility::Invalid(reason) => {
                 warn!(
                     parent = number,
-                    next, "a batch skips blocks, which derivation drops; finality waits"
+                    origin, reason, "derivation drops a batch; finality waits"
                 );
                 return Ok(None);
             }
         }
         let held = self.held.hash_at(number).await?;
+        self.last_origin = Some(origin);
         match held {
             Some(hash) if parent.matches(hash) => {
                 self.next_parent = Some(number + blocks);
@@ -337,6 +424,61 @@ impl BatchReader {
         }
     }
 
+    /// Whether a batch whose parent is block `number` follows the batches
+    /// before it: one for blocks already read, or one that skips blocks,
+    /// does not.
+    fn follows(&self, number: u64) -> bool {
+        match self.next_parent {
+            Some(next) if number < next => {
+                debug!(parent = number, next, "a batch for blocks already read");
+                false
+            }
+            Some(next) if number > next => {
+                warn!(
+                    parent = number,
+                    next, "a batch skips blocks, which derivation drops; finality waits"
+                );
+                false
+            }
+            _ => true,
+        }
+    }
+
+    fn eligibility(
+        &self,
+        origin: u64,
+        named: &Origin,
+        last_time: u64,
+        singular: bool,
+        timed: bool,
+        l1: u64,
+    ) -> Eligibility {
+        if origin.saturating_add(SEQUENCING_WINDOW) < l1 {
+            return Eligibility::Invalid("its L1 origin is outside the sequencing window");
+        }
+        if !timed {
+            return Eligibility::Invalid("its time is not its block's");
+        }
+        if let Some(previous) = self.last_origin
+            && (origin < previous || (singular && origin > previous + 1))
+        {
+            return Eligibility::Invalid("its L1 origin does not follow the batch before it");
+        }
+        let Some(&(hash, origin_time)) = self.origins.get(&origin) else {
+            return Eligibility::Unknown;
+        };
+        if !named.matches(hash) {
+            return Eligibility::Invalid("its L1 origin is not the finalized block of its number");
+        }
+        if last_time < origin_time {
+            return Eligibility::Invalid("it is older than its L1 origin");
+        }
+        if last_time > origin_time.saturating_add(MAX_SEQUENCER_DRIFT) {
+            return Eligibility::Invalid("it drifts past its L1 origin");
+        }
+        Eligibility::Valid
+    }
+
     /// Whether the node's head satisfies `ready`. While it does not, the
     /// node does not hold a finalized batch's blocks yet: matching starts
     /// over at a later batch whose parent it holds, and the lane goes on.
@@ -349,6 +491,7 @@ impl BatchReader {
                 "this node does not hold a finalized batch's blocks yet; matching starts over at a later batch"
             );
         }
+        self.last_origin = None;
         Ok(false)
     }
 

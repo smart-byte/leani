@@ -662,6 +662,11 @@ finalized, so the block can no longer change, minutes after it was made
   `beacon_api`. A batch names the block it builds on; when that is this
   node's block and the batch follows the ones before it, that block and
   every block below it are `finalized`, about one batch after their own.
+  A batch counts only when its header passes the rules of derivation that
+  need no transaction: its L1 origin is a finalized block the lane read,
+  inside the sequencing window, and its blocks are timed at their slots, no
+  earlier than their origin and within the sequencer's drift of it. That
+  the transactions in it are valid is left to the batcher.
   The blobs cost about 2.2 GB a day on Base and 0.8 GB on OP Mainnet. On a
   Nitro chain each call to the SequencerInbox the entry's `sequencer_inbox`
   names counts the chain's messages, and message n is block
