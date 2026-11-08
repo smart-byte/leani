@@ -1,7 +1,7 @@
-export type Level = 'unattested' | 'attested' | 'confirmed' | 'finalized';
+export type Level = 'unattested' | 'attested' | 'confirmed' | 'finalized' | 'settled';
 
 /** How far a level goes: a block at one has passed every lower one. */
-export const RANK: Record<Level, number> = { unattested: 0, attested: 1, confirmed: 2, finalized: 3 };
+export const RANK: Record<Level, number> = { unattested: 0, attested: 1, confirmed: 2, finalized: 3, settled: 4 };
 export type Family = 'ethereum' | 'op-stack' | 'arbitrum';
 
 export interface Chain {
@@ -11,7 +11,7 @@ export interface Chain {
   family: Family;
   chainId: number;
   color: string;
-  /** How Ethereum settles the rollup, which leani reports as `finalized`:
+  /** How Ethereum settles the rollup, which leani reports as `settled`:
    * the claims its L1 anchor reads, and how long after a block that
    * typically takes. `null` for Ethereum, final by its own consensus. */
   settlement: { via: string; typical: string; seconds: number } | null;
@@ -107,15 +107,15 @@ export const STAGES: Record<Family, Stage[]> = {
       typical: { 'op-mainnet': 'minutes', 'base-mainnet': '~30 s' },
     },
     {
-      level: null,
+      level: 'finalized',
       name: 'Final on Ethereum',
       evidence:
-        'The Ethereum block that carries the blobs is finalized, so the blocks’ data can no longer change. Op-stack nodes call these blocks finalized; leani does not report it as a level.',
+        'The Ethereum block that carries the blobs is finalized, so the blocks’ data can no longer change. Leani reads the batches from finalized Ethereum blocks, checks each blob against its versioned hash, and finalizes the blocks they carry, as op-stack nodes do.',
       undo: 'Never.',
       typical: '~15–30 min',
     },
     {
-      level: 'finalized',
+      level: 'settled',
       name: 'Settled on Ethereum',
       evidence:
         'A dispute game claimed the block’s output root, or on OP Mainnet a super root over it, and the anchor state registry moved to it after its challenge window, read from finalized Ethereum blocks and their receipts: withdrawals can complete.',
@@ -136,23 +136,24 @@ export const STAGES: Record<Family, Stage[]> = {
       level: null,
       name: 'Batch on Ethereum',
       evidence:
-        'The batch poster posts the sequenced transactions to Ethereum, calling the chain’s SequencerInbox with its message counts before and after the batch: the page reads which blocks the batch carries from that call. Leani does not report this as a level.',
+        'The batch poster posts the sequenced transactions to Ethereum, calling the chain’s SequencerInbox with its message counts before and after the batch: the page reads which blocks the batch carries from that call.',
       undo: 'An Ethereum reorg before the batch’s L1 block is final.',
       typical: 'minutes',
     },
     {
-      level: null,
-      name: 'Assertion',
-      evidence: 'A validator posts a BoLD assertion naming the block hash at the end of its range. Anyone can challenge it.',
-      undo: 'A successful challenge.',
-      typical: '~1 h',
+      level: 'finalized',
+      name: 'Final on Ethereum',
+      evidence:
+        'The Ethereum block with the batch is finalized. Leani reads the SequencerInbox call in it, whose message count names the batch’s last block, and finalizes the blocks up to there, as Nitro nodes do.',
+      undo: 'Never.',
+      typical: '~15–30 min',
     },
     {
-      level: 'finalized',
+      level: 'settled',
       name: 'Confirmed on Ethereum',
       evidence:
-        'The rollup confirmed the assertion after the challenge period, read from finalized Ethereum blocks and their receipts.',
-      undo: 'Never.',
+        'A validator posts a BoLD assertion naming the block hash at the end of its range, about every hour, and the rollup confirms it after the challenge period, read from finalized Ethereum blocks and their receipts.',
+      undo: 'Never; before confirmation, a successful challenge replaces the assertion.',
       typical: settles('arbitrum'),
     },
   ],

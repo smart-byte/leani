@@ -38,9 +38,16 @@ const levels = [
   {
     level: 'finalized',
     title: 'Final',
-    use: 'Accounting, bridges, and anything that cannot be undone: Ethereum finality, or Ethereum settling the rollup.',
+    use: 'Accounting and anything that cannot be undone: Ethereum finality, or the rollup’s batch final on Ethereum.',
     toml: 'publish = "finalized"',
     cli: 'leani subscribe blocks --finality finalized',
+  },
+  {
+    level: 'settled',
+    title: 'Settled',
+    use: 'Withdrawals and bridges that wait for Ethereum to accept the rollup’s state, days after its blocks.',
+    toml: 'publish = "settled"',
+    cli: 'leani subscribe blocks --finality settled',
   },
 ];
 
@@ -51,7 +58,8 @@ for await (const change of leani.blocks.subscribe()) {
   switch (change.operation) {
     case "apply":     show(change.data, change.finality); break;
     case "attested":
-    case "finalized": promote(change.data, change.operation); break;
+    case "finalized":
+    case "settled":   promote(change.data, change.operation); break;
     case "undo":      remove(change.block); break;
   }
 }`;
@@ -195,16 +203,17 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
     <div class="cols">
       <div>
         <p>
-          <strong>Data.</strong> Once the Ethereum block carrying a rollup block’s blob is final,
-          anyone can derive the block from Ethereum and it can no longer change. Op-stack nodes call
-          this finalized. It takes minutes, shows as a dashed line in each rollup’s row, and is not
-          a level leani reports.
+          <strong>Data.</strong> Once the Ethereum block carrying a rollup block’s batch is final,
+          anyone can derive the block from Ethereum and it can no longer change. That is leani’s
+          <code>finalized</code> for a rollup, as op-node and Nitro call it: leani reads the batches
+          from finalized Ethereum blocks. It takes minutes and shows as a dashed line in each rollup’s
+          row.
         </p>
         <p>
           <strong>Settlement.</strong> For withdrawals, Ethereum must also accept the rollup’s claim
-          about its state, after a challenge window of days. That is leani’s <code>finalized</code> for
-          a rollup, read from the settlement contracts’ logs in finalized Ethereum blocks, no RPC
-          trusted. The picture’s right edge opens onto those days.
+          about its state, after a challenge window of days. That is leani’s <code>settled</code>, read
+          from the settlement contracts’ logs in finalized Ethereum blocks, no RPC trusted. The
+          picture’s right edge opens onto those days.
         </p>
       </div>
       <ul class="anchors mono">
@@ -256,7 +265,8 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
     unattested: 'seen, unattested',
     attested: chain.family === 'ethereum' ? 'attested by the sync committee' : 'signed by the sequencer',
     confirmed: 'confirmed by the fast confirmation rule',
-    finalized: chain.family === 'ethereum' ? 'finalized' : 'settled on Ethereum',
+    finalized: chain.family === 'ethereum' ? 'finalized' : 'final on Ethereum',
+    settled: 'settled on Ethereum',
   })[level];
   const scene = new Scene(canvas, {
     now: () => feed?.now() ?? Date.now(),
@@ -411,7 +421,7 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
       put(cell('posted'), values.posted);
       put(cell('confirmed'), values.confirmed);
       put(cell('finalized'), values.finalized);
-      put(cell('settled'), summary.finalizedAge !== null ? `newest ${duration(summary.finalizedAge)} old` : summary.chain.settlement?.typical ?? '—');
+      put(cell('settled'), summary.settledAge !== null ? `newest ${duration(summary.settledAge)} old` : summary.chain.settlement?.typical ?? '—');
     }
     showJourney(scene.journey());
   };

@@ -21,6 +21,9 @@ test("changes become the page's events, markers carrying their block's time", ()
   expect(toEvent("base", change("finalized", 6, { throughBlock: 5 }), times)).toMatchObject({
     type: "level", level: "finalized", through: 5, time: 1_005,
   });
+  expect(toEvent("base", change("settled", 7, { throughBlock: 5 }), times)).toMatchObject({
+    type: "level", level: "settled", through: 5, time: 1_005,
+  });
   expect(toEvent("base", change("undo", 5, summary), times)).toMatchObject({ type: "undo", number: 5, hash: "0x5" });
 });
 
@@ -82,6 +85,11 @@ test("a packed recording unpacks to the same events, earlier ones arriving at it
   expect(replay.shift()).toEqual({ at: 6_000, event: early });
   expect(replay.map(({ at }) => at)).toEqual([6_000, 6_000, 7_000, 7_500, 7_600, 7_700, 8_000]);
   expect(replay.map(({ event }) => event)).toEqual(events.slice(0, 7));
+});
+
+test("a packed recording keeps a rollup's settled marker", () => {
+  const settled = { type: "level", chain: "a", level: "settled", through: 10, time: 100, at: 8_000 } as const;
+  expect(unpack(pack([settled])).map(({ event }) => event)).toEqual([settled]);
 });
 
 test("a packed recording keeps two blocks a second of a chain, and from before its window only what the page still draws", () => {

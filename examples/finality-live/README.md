@@ -62,10 +62,11 @@ bun hub.ts pack recording.jsonl FROM_MS TO_MS | gzip -9 > ../../site/public/fina
 
 ## What a host needs
 
-- Rollup nodes with an L1 anchor finalize a block only once they hold it,
-  and the anchor's finalized block is days old: the lane catches up from
-  there before it follows the head, and rollup finality reaches the page
-  about a week after a fresh start.
+- Rollup nodes with an L1 anchor finalize blocks minutes after they are
+  made, from their batches, but settle a block only once they hold it, and
+  the anchor's settled block is days old: the lane catches up from there
+  before it follows the head, and settlement reaches the page about a week
+  after a fresh start.
 - Op-stack gossip peers dial in: each op-stack node needs its gossip port
   (`[finality] listen_port` and `discovery_port`) reachable from the
   internet.
