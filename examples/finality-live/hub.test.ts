@@ -110,6 +110,28 @@ test("a packed recording keeps two blocks a second of a chain, and from before i
   expect(through("level")).toEqual([100, 105]);
 });
 
+test("a packed recording opens with every chain's history from the same moment", () => {
+  const block = (chain: string, time: number): HubEvent => ({
+    type: "block", chain, number: time, hash: "", time, seen: time * 1_000, level: "attested", txs: 1, gas: 0.1,
+  });
+  const batch = (chain: string, firstTime: number, lastTime: number, at: number): HubEvent => ({
+    type: "batch", chain, l1: 1, l1Hash: "", l1Time: lastTime, at, blobs: 1, first: firstTime, last: lastTime,
+    firstTime, lastTime, txs: 1, bytes: 0, raw: 0, verified: null, source: "blobs",
+  });
+  // Chain a's node kept blocks from 100 s, chain b's from 160 s, and a's
+  // first batch the hub decoded covers blocks from 130 s.
+  const events = [
+    ...[100, 130, 160, 190].map((time) => block("a", time)),
+    ...[160, 190].map((time) => block("b", time)),
+    batch("a", 130, 160, 170_000),
+    batch("b", 160, 190, 195_000),
+  ];
+  const replay = unpack(pack(events, 200_000, 260_000));
+  const first = (chain: string) =>
+    Math.min(...replay.flatMap(({ event }) => (event.type === "block" && event.chain === chain ? [event.time] : [])));
+  expect([first("a"), first("b")]).toEqual([160, 160]);
+});
+
 test("a batch's blocks follow the block its parent check names, which Base's whole-second timestamps no longer do", () => {
   const base = { genesisBlock: 0, genesisTime: 1_686_789_347, blockSeconds: 2, until: 1_793_901_600 };
   const check = (number: number) => `0x${number.toString(16).padStart(40, "0")}`;
