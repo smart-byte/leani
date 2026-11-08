@@ -605,6 +605,9 @@ struct AttachedState {
     greeted: bool,
     /// Whether any connection did. The first hello seeds the finality gate.
     identified: bool,
+    /// The chain the first hello named, which every later hello and every
+    /// row must name too.
+    chain_id: Option<u64>,
 }
 
 /// The connection handshake an attached subscription requires first.
@@ -679,6 +682,11 @@ pub(crate) async fn subscribe(
                 subscribe_attached(&options, &markets, endpoint, &stop).await
             }
             (SubscribeMode::Auto | SubscribeMode::Embedded, _) => {
+                if options.finality == SubscribeFinality::Settled {
+                    bail!(
+                        "embedded subscriptions follow Ethereum mainnet, whose blocks end at finalized; settled is a rollup's level: attach to a rollup node with --endpoint"
+                    );
+                }
                 Box::pin(subscribe_embedded(
                     &options,
                     &markets,
@@ -2418,6 +2426,37 @@ fn render_price(format: SubscribeFormat, output: &RenderedPrice<'_>) -> Result<(
     }
 }
 
+/// How a pretty row names its chain: not at all for Ethereum mainnet, else
+/// by the chain entry's name, or its id for a chain without one.
+fn chain_label(chain_id: u64) -> String {
+    if chain_id == MAINNET_CHAIN_ID {
+        return String::new();
+    }
+    leani_chain::ChainRegistry::standard()
+        .iter()
+        .find(|chain| chain.chain_id == chain_id)
+        .map_or_else(
+            || format!("chain={chain_id}  "),
+            |chain| format!("{}  ", chain.name),
+        )
+}
+
+/// Refuse a startup snapshot that holds a row of another chain than the
+/// attached node's.
+fn one_chain(snapshot: &[AttachedItem], chain_id: u64) -> Result<()> {
+    for item in snapshot {
+        if let AttachedItem::Block(block) = item
+            && block.chain_id != chain_id
+        {
+            bail!(
+                "the attached node serves chain {chain_id}, but its snapshot holds a row of chain {}",
+                block.chain_id
+            );
+        }
+    }
+    Ok(())
+}
+
 fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) -> Result<()> {
     match format {
         SubscribeFormat::Pretty => {
@@ -2455,8 +2494,9 @@ fn render_block_summary(format: SubscribeFormat, output: &RenderedBlockSummary) 
                 .transaction_count
                 .map_or_else(|| "unknown".to_owned(), |count| count.to_string());
             print_row(&format!(
-                "{}  block={}  txs={}  gas={}  base_fee={}  blobs={}  {}{}",
+                "{}  {}block={}  txs={}  gas={}  base_fee={}  blobs={}  {}{}",
                 timestamp,
+                chain_label(output.chain_id),
                 output.block_number,
                 transactions,
                 gas,
@@ -2927,6 +2967,18 @@ fn render_attached_sse_events(
             }
             Some("hello") => {
                 let hello = validate_attached_hello(&event.data, options)?;
+                if let Some(chain) = state.chain_id
+                    && chain != hello.chain_id
+                {
+                    bail!(
+                        "the attached node served chain {chain} and now serves chain {}",
+                        hello.chain_id
+                    );
+                }
+                if !state.identified {
+                    one_chain(&state.snapshot, hello.chain_id)?;
+                }
+                state.chain_id = Some(hello.chain_id);
                 state.greeted = true;
                 if !state.identified {
                     state.identified = true;
@@ -2961,6 +3013,14 @@ fn render_attached_sse_events(
             serde_json::from_str(&event.data).context("node sent malformed SSE JSON")?;
         let envelope: AttachedEnvelope = serde_json::from_value(value.clone())
             .context("node sent an invalid SSE change envelope")?;
+        if let Some(chain) = value["data"]["chainId"].as_u64()
+            && Some(chain) != state.chain_id
+        {
+            bail!(
+                "the attached node serves chain {}, but sent a row of chain {chain}",
+                state.chain_id.unwrap_or_default()
+            );
+        }
         if envelope.cursor.is_empty()
             || !matches!(
                 envelope.operation.as_str(),
@@ -3064,9 +3124,18 @@ fn render_attached_sse_events(
 fn validate_attached_hello(data: &str, options: &SubscribeOptions) -> Result<AttachedHello> {
     let hello: AttachedHello =
         serde_json::from_str(data).context("node sent a malformed stream hello")?;
-    if hello.chain_id != MAINNET_CHAIN_ID {
+    if options.protocol == SubscribeProtocol::UniswapV3 && hello.chain_id != MAINNET_CHAIN_ID {
         bail!(
-            "the attached node serves chain {}, but built-in subscriptions follow Ethereum mainnet (chain {MAINNET_CHAIN_ID}); use --endpoint to select a mainnet node or --mode embedded",
+            "the attached node serves chain {}, but Uniswap markets are Ethereum mainnet's (chain {MAINNET_CHAIN_ID}); use --endpoint to select a mainnet node or --mode embedded",
+            hello.chain_id
+        );
+    }
+    let ethereum = leani_chain::ChainRegistry::standard().iter().any(|chain| {
+        chain.chain_id == hello.chain_id && chain.family == leani_chain::Family::Ethereum
+    });
+    if options.finality == SubscribeFinality::Settled && ethereum {
+        bail!(
+            "the attached node serves chain {}, whose blocks end at finalized: settled is a rollup's level",
             hello.chain_id
         );
     }
@@ -3777,6 +3846,50 @@ mod tests {
     }
 
     #[test]
+    fn attached_block_subscriptions_follow_any_chain_and_settle_only_rollups() {
+        let hello = |chain_id: u64, processor: &str| {
+            let event =
+                String::from_utf8(attached_hello(chain_id, processor, None)).expect("utf-8");
+            event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .expect("data")
+                .to_owned()
+        };
+        let mut options = subscribe_options(Vec::new());
+        options.mode = SubscribeMode::Client;
+        options.protocol = SubscribeProtocol::Blocks;
+        options.processor = "block-summary".to_owned();
+        assert!(validate_attached_hello(&hello(8453, "block-summary"), &options).is_ok());
+        options.finality = SubscribeFinality::Settled;
+        assert!(validate_attached_hello(&hello(8453, "block-summary"), &options).is_ok());
+        let refused = validate_attached_hello(&hello(1, "block-summary"), &options)
+            .expect_err("Ethereum's blocks end at finalized");
+        assert!(refused.to_string().contains("settled"), "{refused}");
+        // Uniswap markets are Ethereum mainnet's.
+        options.finality = SubscribeFinality::Attested;
+        options.protocol = SubscribeProtocol::UniswapV3;
+        options.processor = "uniswap-observations".to_owned();
+        assert!(validate_attached_hello(&hello(8453, "uniswap-observations"), &options).is_err());
+        assert!(validate_attached_hello(&hello(1, "uniswap-observations"), &options).is_ok());
+    }
+
+    #[test]
+    fn a_rollup_node_prints_its_blocks_under_its_chain() {
+        let now = unix_seconds();
+        let mut options = attached_included_options();
+        options.format = SubscribeFormat::Pretty;
+        let mut buffer = EventBuffer::default();
+        buffer.push(&attached_hello(8453, "block-summary", None));
+        buffer.push(&attached_chain_block_event(8453, 1, 100, "attested", now));
+        let (outcome, rows) =
+            captured(|| render_blocks(&mut buffer, &mut AttachedState::default(), &options));
+        outcome.expect("a Base node renders");
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert!(rows[0].contains("base-mainnet"), "{rows:?}");
+    }
+
+    #[test]
     fn finalized_subscriptions_never_select_included_records() {
         let items = latest_fresh_items(
             SubscribeProtocol::Blocks,
@@ -3803,6 +3916,16 @@ mod tests {
     }
 
     fn attached_block_event(sequence: u64, block: u64, finality: &str, now: u64) -> Vec<u8> {
+        attached_chain_block_event(1, sequence, block, finality, now)
+    }
+
+    fn attached_chain_block_event(
+        chain_id: u64,
+        sequence: u64,
+        block: u64,
+        finality: &str,
+        now: u64,
+    ) -> Vec<u8> {
         let hash = format!(
             "0x{}",
             hex::encode([u8::try_from(block).unwrap_or(u8::MAX); 32])
@@ -3812,7 +3935,7 @@ mod tests {
             "data: {{\"sequence\":\"{sequence}\",\"cursor\":\"cursor-{sequence}\",\"operation\":\"apply\",\
              \"block\":{{\"number\":{block},\"hash\":\"{hash}\",\"parentHash\":\"0x{zero}\",\"timestamp\":{now}}},\
              \"finality\":\"{finality}\",\"kind\":\"{BLOCK_SUMMARY_KIND}.put\",\
-             \"data\":{{\"chainId\":1,\"blockNumber\":{block},\"blockHash\":\"{hash}\",\"parentHash\":\"0x{zero}\",\
+             \"data\":{{\"chainId\":{chain_id},\"blockNumber\":{block},\"blockHash\":\"{hash}\",\"parentHash\":\"0x{zero}\",\
              \"timestamp\":{now},\"gasLimit\":60000000,\"gasUsed\":30000000,\"baseFeePerGas\":null,\
              \"blobGasUsed\":null,\"excessBlobGas\":null,\"transactionCount\":3,\"sizeBytes\":null,\
              \"finality\":\"{finality}\"}}}}\n\n"

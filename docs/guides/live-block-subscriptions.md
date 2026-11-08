@@ -127,12 +127,16 @@ or `--mode embedded` only when you need to force one behavior. With
 `--endpoint URL`, client and auto mode attach to that node without reading a
 local configuration.
 
-The subscription prints nothing until the stream's `hello` shows an Ethereum
-mainnet node (chain 1) serving `block-summary` under the requested
-`--processor`, and it checks every reconnect again. A node for another chain
-or processor, or another service answering at `api.bind`, ends the command
-with an error instead of printing its stream. A stream error the node marks
-`retryable` reconnects from the last cursor.
+The subscription prints nothing until the stream's `hello` shows a node
+serving `block-summary` under the requested `--processor`, and it checks
+every reconnect again. An attached subscription follows the chain the node
+serves, a rollup's too, and names it on every row of another chain than
+Ethereum Mainnet; JSON rows carry `chainId`. A hello for another processor,
+a reconnect to another chain, a row of a chain other than the hello's, or
+another service answering at `api.bind` ends the command with an error
+instead of printing its stream. Embedded subscriptions and `uniswap-v3`
+follow Ethereum Mainnet. A stream error the node marks `retryable`
+reconnects from the last cursor.
 
 `--finality finalized` replays the node's retained change log, so a block
 that was not yet final when the subscription connected still
