@@ -361,6 +361,10 @@ record, and documented RPC contracts.
   transaction a receipt or log belongs to, come from the checked bytes
   instead of the endpoint's JSON, so receipts and logs are fetched with
   their transactions.
+- `leani subscribe blocks` attached to a node follows the chain the node
+  serves, a rollup's too, and names that chain on each pretty row; it
+  followed Ethereum Mainnet only, so `--finality settled` could never print.
+  A row of another chain than the node's hello is refused.
 - `nat = "none"` also keeps Reth's Discv4 from asking public IP services for
   the host's address every five minutes.
 - `leani benchmark real-source` measures the configured chain instead of
