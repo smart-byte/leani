@@ -109,7 +109,7 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
       <span><i class="swatch slab final"></i>finalized</span>
       <span><i class="swatch reorg"></i>reorg</span>
       <span class="buttons">
-        <button type="button" class="toggle" data-expand aria-pressed="false">days of settlement ▸</button>
+        <button type="button" class="toggle" data-expand aria-pressed="false" hidden>days of settlement ▸</button>
       </span>
     </div>
     <div class="stage">
@@ -213,7 +213,8 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
           <strong>Settlement.</strong> For withdrawals, Ethereum must also accept the rollup’s claim
           about its state, after a challenge window of days. That is leani’s <code>settled</code>, read
           from the settlement contracts’ logs in finalized Ethereum blocks, no RPC trusted. The
-          picture’s right edge opens onto those days.
+          picture’s right edge names how long each rollup takes, and opens onto those days once a
+          node that holds them reports a settled block.
         </p>
       </div>
       <ul class="anchors mono">
@@ -397,6 +398,7 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   };
   const refresh = () => {
     const summaries = scene.summaries();
+    expand.hidden = !scene.settles();
     const following = summaries.filter((summary) => summary.head !== null).length;
     status.textContent = `${source} · ${following} of ${present.length} chains`;
     for (const button of picks) button.hidden = !present.includes(button.dataset.pick!);

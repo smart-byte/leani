@@ -350,9 +350,15 @@ export class Scene {
     this.followed = null;
   }
 
-  /** Open or fold the days of settlement. */
+  /** Whether the days of settlement have something to show: a rollup's
+   * settled block, which only a node holding days of blocks reports. */
+  settles() {
+    return this.lanes.some((lane) => lane.settledTime !== null);
+  }
+
+  /** Open or fold the days of settlement; they open only once something settled. */
   expand(expanded: boolean) {
-    if (this.expanded === expanded) return;
+    if (this.expanded === expanded || (expanded && !this.settles())) return;
     this.expanded = expanded;
     if (this.options.reducedMotion) this.window = expanded ? DAYS : WINDOW;
     this.layout();
@@ -366,6 +372,7 @@ export class Scene {
     }));
     this.followed = null;
     this.frontiers.clear();
+    this.expand(false);
     this.layout();
   }
 
@@ -731,7 +738,7 @@ export class Scene {
 
   private click(x: number, y: number) {
     this.followed = null;
-    if (!this.narrow && !this.expanded && x > this.width - this.edge) {
+    if (!this.narrow && !this.expanded && this.settles() && x > this.width - this.edge) {
       this.expand(true);
       return;
     }
@@ -747,7 +754,8 @@ export class Scene {
   }
 
   private pointer(event: PointerEvent) {
-    this.canvas.style.cursor = !this.narrow && !this.expanded && event.offsetX > this.width - this.edge ? 'pointer' : 'crosshair';
+    const opens = !this.narrow && !this.expanded && this.settles() && event.offsetX > this.width - this.edge;
+    this.canvas.style.cursor = opens ? 'pointer' : 'crosshair';
     this.hover(event.offsetX, event.offsetY);
   }
 
@@ -1252,7 +1260,7 @@ export class Scene {
     context.textBaseline = 'middle';
     context.font = '600 10.5px "JetBrains Mono", ui-monospace, monospace';
     context.fillStyle = '#9ff0c4';
-    context.fillText('days of settlement ▸', left + 8, 22, this.edge - 28);
+    context.fillText(this.settles() ? 'days of settlement ▸' : 'settlement', left + 8, 22, this.edge - 28);
     context.font = '400 10px "Inter Variable", system-ui, sans-serif';
     for (const lane of this.rollups()) {
       const text = lane.settledTime !== null ? `settled ${duration(now - lane.settledTime)} ago` : `settles ${lane.chain.settlement?.typical ?? ''}`;
