@@ -1,13 +1,8 @@
-//! Data finality: a rollup block is final once the batch that carries it is
-//! in a finalized Ethereum block, which fixes it for good.
-//!
-//! An op-stack batch names the block it builds on, in full or by the first 20
-//! bytes of its hash. When a batch in finalized Ethereum data names the
-//! node's block, that block and, by their parent hashes, its ancestors are
-//! the chain derivation produces. Batches must follow each other, as
-//! Holocene requires: a batch that skips blocks finalizes nothing, and one
-//! naming another block than the node's moves no finality. A Nitro batch
-//! post names how many messages the chain has, which numbers its last block.
+//! Data finality: a rollup block is final once the batch carrying it is in a
+//! finalized Ethereum block. An op-stack batch names the block it builds on,
+//! in full or by a 20-byte hash prefix, and batches must follow each other,
+//! as Holocene requires. A Nitro batch post names the chain's message count,
+//! which numbers its last block.
 
 use std::sync::Arc;
 
@@ -96,7 +91,6 @@ pub struct BatchReader {
     next_parent: Option<u64>,
 }
 
-/// What a batch builds on.
 enum Parent {
     Hash(B256),
     Prefix([u8; 20]),
@@ -423,7 +417,6 @@ fn nitro_message_counts(frame: &BlockFrame, sequencer_inbox: Address) -> Vec<u64
         .collect()
 }
 
-/// `newMessageCount` of a `SequencerInbox` batch post's calldata.
 fn new_message_count(input: &[u8]) -> Option<u64> {
     let (selector, arguments) = input.split_first_chunk::<4>()?;
     let (_, word) = NITRO_BATCH_POSTS

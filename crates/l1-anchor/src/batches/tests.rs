@@ -33,7 +33,6 @@ const BASE_BLOCKS: [(u64, B256); 4] = [
 ];
 const BASE_TIME: u64 = 1_793_983_174;
 
-/// The node's chain: `blocks` and its head.
 struct Held {
     blocks: Mutex<Vec<(u64, B256)>>,
     head: Mutex<(u64, u64)>,
@@ -90,7 +89,6 @@ fn base_reader(held: Arc<Held>) -> BatchReader {
     )
 }
 
-/// Derivation data of one frame of channel `id`.
 fn frame_data(id: u8, number: u16, data: &[u8], last: bool) -> Vec<u8> {
     let mut bytes = vec![0];
     bytes.extend([id; 16]);
@@ -442,7 +440,6 @@ impl leani_source_api::FinalitySource for Scripted {
     }
 }
 
-/// Finalized L1 blocks: the posts given for their number, empty otherwise.
 struct Posts(std::collections::BTreeMap<u64, BlockFrame>);
 
 #[async_trait::async_trait]

@@ -231,7 +231,6 @@ async fn lane(
     })
 }
 
-/// The rollup chain this node holds, read from its store.
 struct StoreHeldBlocks {
     store: leani_store_sqlite::SqliteStore,
     chain_id: ChainId,
