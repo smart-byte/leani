@@ -50,7 +50,7 @@ export interface Recording {
   events: number[][];
 }
 
-const LEVELS: Level[] = ['unattested', 'attested', 'finalized', 'confirmed'];
+const LEVELS: Level[] = ['unattested', 'attested', 'finalized', 'confirmed', 'settled'];
 
 export function unpack(recording: Recording): { at: number; event: HubEvent }[] {
   let at = recording.recordedAt;

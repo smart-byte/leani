@@ -101,6 +101,9 @@ interface Lane {
   finalized: number;
   /** Block time of the newest finalized block, in seconds. */
   finalizedTime: number | null;
+  settled: number;
+  /** Block time of the newest settled block, in seconds. */
+  settledTime: number | null;
   marked: Set<Level>;
   /** The lowest block number seen with each recent timestamp. */
   seconds: Map<number, number>;
@@ -252,6 +255,8 @@ interface LevelLane {
   confirmed: number;
   finalized: number;
   finalizedTime: number | null;
+  settled: number;
+  settledTime: number | null;
   marked: Set<Level>;
   attestedAfter: number[];
   confirmedAfter: number[];
@@ -271,9 +276,11 @@ export function applyLevel(lane: LevelLane, event: Omit<Extract<HubEvent, { type
   if (through <= lane[level]) return;
   lane[level] = through;
   if (RANK[level] >= RANK.confirmed) lane.attested = Math.max(lane.attested, through);
-  if (level === 'finalized') {
-    lane.confirmed = Math.max(lane.confirmed, through);
-    if (event.time !== null) lane.finalizedTime = event.time;
+  if (RANK[level] >= RANK.finalized) lane.confirmed = Math.max(lane.confirmed, through);
+  if (level === 'finalized' && event.time !== null) lane.finalizedTime = event.time;
+  if (level === 'settled') {
+    lane.finalized = Math.max(lane.finalized, through);
+    if (event.time !== null) lane.settledTime = event.time;
   }
   for (const block of lane.blocks) {
     if (block.number > through || block.undoneAt !== null || RANK[block.level] >= RANK[level]) continue;
@@ -282,9 +289,10 @@ export function applyLevel(lane: LevelLane, event: Omit<Extract<HubEvent, { type
     // A higher level implies the lower ones, but not when the block reached them.
     if (timed && level === 'attested') block.attestedAt ??= event.at;
     else if (timed && level === 'confirmed') block.confirmedAt ??= event.at;
-    else if (timed) block.finalizedAt = event.at;
-    if (live) remember(level === 'attested' ? lane.attestedAfter : level === 'confirmed' ? lane.confirmedAfter : lane.finalizedAfter, after);
+    else if (timed && level === 'finalized') block.finalizedAt = event.at;
+    if (live && level !== 'settled') remember(level === 'attested' ? lane.attestedAfter : level === 'confirmed' ? lane.confirmedAfter : lane.finalizedAfter, after);
     if (level === 'finalized' && (lane.finalizedTime === null || block.number === through)) lane.finalizedTime = block.born;
+    if (level === 'settled' && (lane.settledTime === null || block.number === through)) lane.settledTime = block.born;
     block.level = level;
     block.levelAt = event.at;
   }
@@ -353,7 +361,7 @@ export class Scene {
 
   reset() {
     this.lanes = CHAINS.map((chain) => ({
-      chain, blocks: [], batches: [], attested: 0, confirmed: 0, finalized: 0, finalizedTime: null, marked: new Set(), seconds: new Map(), connected: false,
+      chain, blocks: [], batches: [], attested: 0, confirmed: 0, finalized: 0, finalizedTime: null, settled: 0, settledTime: null, marked: new Set(), seconds: new Map(), connected: false,
       reorgs: 0, seen: [], attestedAfter: [], confirmedAfter: [], finalizedAfter: [], top: 0, height: 0,
     }));
     this.followed = null;
@@ -378,6 +386,7 @@ export class Scene {
         confirmed: median(lane.confirmedAfter),
         finalized: median(lane.finalizedAfter),
         finalizedAge: lane.finalizedTime === null ? null : this.options.now() / 1000 - lane.finalizedTime,
+        settledAge: lane.settledTime === null ? null : this.options.now() / 1000 - lane.settledTime,
         reorgs: lane.reorgs,
       };
     });
@@ -481,10 +490,11 @@ export class Scene {
           number: event.number, hash: event.hash, time: event.time, born, seen: event.seen, level: event.level,
           levelAt: event.seen, attestedAt: RANK[event.level] >= RANK.attested ? event.seen : null,
           confirmedAt: RANK[event.level] >= RANK.confirmed ? event.seen : null,
-          finalizedAt: event.level === 'finalized' ? event.seen : null, txs: event.txs, gas: event.gas,
+          finalizedAt: RANK[event.level] >= RANK.finalized ? event.seen : null, txs: event.txs, gas: event.gas,
           blobs: event.blobs ?? null, batch: null, jitter: jitterOf(event.number), undoneAt: null, consumed: new Map(),
         };
-        if (event.number <= lane.finalized) block.level = 'finalized';
+        if (event.number <= lane.settled) block.level = 'settled';
+        else if (event.number <= lane.finalized && RANK[block.level] < RANK.finalized) block.level = 'finalized';
         else if (event.number <= lane.confirmed && RANK[block.level] < RANK.confirmed) block.level = 'confirmed';
         else if (event.number <= lane.attested && block.level === 'unattested') block.level = 'attested';
         block.batch = lane.batches.find((batch) => batch.first <= event.number && event.number <= batch.last) ?? null;
@@ -925,7 +935,7 @@ export class Scene {
 
   private drawTick(x: number, top: number, width: number, level: Level) {
     const context = this.context;
-    context.fillStyle = level === 'finalized' ? '#3ee07fb3' : level === 'confirmed' ? '#d6dbff8c' : level === 'attested' ? '#9aa8ff59' : '#9aa8ff2e';
+    context.fillStyle = RANK[level] >= RANK.finalized ? '#3ee07fb3' : level === 'confirmed' ? '#d6dbff8c' : level === 'attested' ? '#9aa8ff59' : '#9aa8ff2e';
     context.fillRect(x - width / 2, top + 1, width, BED - 2);
   }
 
@@ -956,7 +966,7 @@ export class Scene {
       context.globalAlpha = alpha * border;
       context.beginPath();
       context.roundRect(left, top, length, thickness, Math.min(4, thickness / 3));
-      if (level === 'finalized') {
+      if (RANK[level] >= RANK.finalized) {
         context.fillStyle = '#2b3c33';
         context.fill();
         context.strokeStyle = '#3ee07f';
@@ -974,7 +984,7 @@ export class Scene {
     const cellLength = Math.max(0.6, cell - (cell > 2 ? 0.6 : 0));
     const cellThickness = Math.max(0.6, thickness - 2 * pad);
     // A final capsule dims its cells; a bar shows them whole.
-    const cellAlpha = alpha * (level === 'finalized' ? 1 - 0.45 * border : 1);
+    const cellAlpha = alpha * (RANK[level] >= RANK.finalized ? 1 - 0.45 * border : 1);
     cells.forEach((blob, index) => {
       const cellLeft = left + pad + index * cell;
       context.globalAlpha = cellAlpha;
@@ -1002,7 +1012,7 @@ export class Scene {
     });
     context.restore();
     context.globalAlpha = alpha;
-    this.flash(x, y, slab.width, slab.height, block, level === 'finalized' ? '#3ee07f' : '#c9d0ff', clock);
+    this.flash(x, y, slab.width, slab.height, block, RANK[level] >= RANK.finalized ? '#3ee07f' : '#c9d0ff', clock);
   }
 
   private drawBlocks(lane: Lane, now: number, clock: number) {
@@ -1054,8 +1064,8 @@ export class Scene {
       const level = this.carrierLevel(batch);
       const appear = gathers ? Math.min(1, Math.max(0, since - GATHER_MS) / 500) : 1;
       const to = Math.min(bracket.to, this.gx + this.gw);
-      context.fillStyle = level === 'finalized' ? '#3ee07f' : lane.chain.color;
-      context.globalAlpha = appear * (level === 'finalized' ? 0.75 : RANK[level] >= RANK.confirmed ? 0.9 : 0.5);
+      context.fillStyle = RANK[level] >= RANK.finalized ? '#3ee07f' : lane.chain.color;
+      context.globalAlpha = appear * (RANK[level] >= RANK.finalized ? 0.75 : RANK[level] >= RANK.confirmed ? 0.9 : 0.5);
       context.fillRect(bracket.from, bracket.y - 2, Math.max(2, to - bracket.from), 4);
       context.globalAlpha = appear;
       const width = to - bracket.from;
@@ -1065,7 +1075,7 @@ export class Scene {
       if (text && lane.height > 40) {
         context.textAlign = 'left';
         context.textBaseline = 'bottom';
-        context.fillStyle = level === 'finalized' ? '#9ff0c4' : '#c9d6cf';
+        context.fillStyle = RANK[level] >= RANK.finalized ? '#9ff0c4' : '#c9d6cf';
         context.fillText(text, bracket.from + 2, bracket.y - 4);
       }
       const carrier = this.carrier(batch);
@@ -1074,10 +1084,10 @@ export class Scene {
       if (dropped && age <= this.window) {
         const capsule = carrier ? this.capsule(carrier, now) : this.slab(age, batch.blobs);
         const highlight = this.hovered === lane.chain.id;
-        context.strokeStyle = level === 'finalized' ? '#3ee07f' : lane.chain.color;
+        context.strokeStyle = RANK[level] >= RANK.finalized ? '#3ee07f' : lane.chain.color;
         // Older threads step back, so the newest postings lead.
         const recent = 1 - 0.75 * this.share(age);
-        context.globalAlpha = appear * (highlight ? 0.75 : (level === 'finalized' ? 0.3 : 0.45) * recent);
+        context.globalAlpha = appear * (highlight ? 0.75 : (RANK[level] >= RANK.finalized ? 0.3 : 0.45) * recent);
         context.lineWidth = highlight ? 1.4 : 1;
         if (level === 'unattested') context.setLineDash([3, 4]);
         context.beginPath();
@@ -1211,8 +1221,8 @@ export class Scene {
   private drawSettlement(lane: Lane, now: number) {
     const settlement = lane.chain.settlement;
     if (!settlement) return;
-    if (lane.finalizedTime !== null) {
-      this.frontier(this.x(now - lane.finalizedTime), lane.top, lane.top + lane.height, `settled · ${duration(now - lane.finalizedTime)}`, '#3ee07f', false, lane.top + 24);
+    if (lane.settledTime !== null) {
+      this.frontier(this.x(now - lane.settledTime), lane.top, lane.top + lane.height, `settled · ${duration(now - lane.settledTime)}`, '#3ee07f', false, lane.top + 24);
     } else {
       this.frontier(this.x(settlement.seconds), lane.top, lane.top + lane.height, `settles ${settlement.typical}`, 'rgba(62, 224, 127, 0.6)', true, lane.top + 24);
     }
@@ -1245,7 +1255,7 @@ export class Scene {
     context.fillText('days of settlement ▸', left + 8, 22, this.edge - 28);
     context.font = '400 10px "Inter Variable", system-ui, sans-serif';
     for (const lane of this.rollups()) {
-      const text = lane.finalizedTime !== null ? `settled ${duration(now - lane.finalizedTime)} ago` : `settles ${lane.chain.settlement?.typical ?? ''}`;
+      const text = lane.settledTime !== null ? `settled ${duration(now - lane.settledTime)} ago` : `settles ${lane.chain.settlement?.typical ?? ''}`;
       context.fillStyle = '#8fa89a';
       context.fillText(text, left + 8, lane.top + lane.height / 2, this.edge - 28);
     }

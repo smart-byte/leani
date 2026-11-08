@@ -101,7 +101,7 @@ export function toEvent(
       gas: summary.gasUsed !== null && summary.gasLimit ? summary.gasUsed / summary.gasLimit : null,
     };
   }
-  if ((change.operation === "attested" || change.operation === "finalized") && change.data && "throughBlock" in change.data) {
+  if ((change.operation === "attested" || change.operation === "finalized" || change.operation === "settled") && change.data && "throughBlock" in change.data) {
     const through = change.data.throughBlock;
     return { type: "level", chain, level: change.operation, through, time: times.get(through) ?? null, at };
   }
@@ -504,7 +504,7 @@ function serve(
   console.error(`hub: http://127.0.0.1:${port}/events for ${[...lanes.keys()].join(", ")}`);
 }
 
-const LEVELS: Level[] = ["unattested", "attested", "finalized", "confirmed"];
+const LEVELS: Level[] = ["unattested", "attested", "finalized", "confirmed", "settled"];
 const SOURCES = [...POSTERS.map((poster) => poster.chain), "other"];
 
 /**

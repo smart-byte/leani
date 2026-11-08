@@ -10,7 +10,8 @@ const block = (number: number, time: number) => ({
 test('a level first seen on connect marks older blocks without timing them', () => {
   const lane = {
     blocks: [block(100, 1_000), block(101, 1_012), block(102, 1_024), block(103, 1_036)],
-    attested: 102, confirmed: 0, finalized: 0, finalizedTime: null as number | null, marked: new Set<Level>(),
+    attested: 102, confirmed: 0, finalized: 0, settled: 0, finalizedTime: null as number | null,
+    settledTime: null as number | null, marked: new Set<Level>(),
     attestedAfter: [] as number[], confirmedAfter: [] as number[], finalizedAfter: [] as number[],
   };
   // The page connects an hour on: Ethereum finality first, then its first confirmation.
@@ -30,6 +31,26 @@ test('a level first seen on connect marks older blocks without timing them', () 
   expect(lane.blocks[3].confirmedAt).toBeNull();
   expect(lane.blocks[1].confirmedAt).toBeNull();
   expect(lane.finalizedAfter).toHaveLength(3);
+});
+
+test("a rollup's blocks settle after they are final, and settling leaves their finality's time", () => {
+  const lane = {
+    blocks: [block(100, 1_000), block(101, 1_012), block(102, 1_024)],
+    attested: 102, confirmed: 0, finalized: 0, settled: 0, finalizedTime: null as number | null,
+    settledTime: null as number | null, marked: new Set<Level>(),
+    attestedAfter: [] as number[], confirmedAfter: [] as number[], finalizedAfter: [] as number[],
+  };
+  applyLevel(lane, { level: 'finalized', through: 101, time: 1_012, at: 2_000_000 });
+  applyLevel(lane, { level: 'finalized', through: 102, time: 1_024, at: 2_100_000 });
+  const finalizedAt = lane.blocks.map((one) => one.finalizedAt);
+  const finalizedAfter = [...lane.finalizedAfter];
+  // Days later the rollup's settlement contracts accept a claim covering block 101.
+  applyLevel(lane, { level: 'settled', through: 101, time: 1_012, at: 500_000_000 });
+  expect(lane.blocks.map((one) => one.level)).toEqual(['settled', 'settled', 'finalized']);
+  expect(lane.blocks.map((one) => one.finalizedAt)).toEqual(finalizedAt);
+  expect(lane.finalizedAfter).toEqual(finalizedAfter);
+  expect(lane.settledTime).toBe(1_012);
+  expect(lane.finalizedTime).toBe(1_024);
 });
 
 test("a batch lands in its carrier, and in the blocks just before that hold the rest of its blobs", () => {
