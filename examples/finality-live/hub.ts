@@ -508,17 +508,51 @@ const LEVELS: Level[] = ["unattested", "attested", "finalized", "confirmed", "se
 const SOURCES = [...POSTERS.map((poster) => poster.chain), "other"];
 
 /**
+ * Where a recording's rows all have their history: the latest moment from
+ * which every chain has blocks and every rollup has batches. A hub that
+ * connects to running nodes gets the history each kept, which starts at
+ * different times.
+ */
+function sharedStart(events: HubEvent[]): number {
+  const earliest = new Map<string, number>();
+  for (const event of events) {
+    const made = event.type === "block" ? event.time : event.type === "batch" ? event.firstTime : null;
+    if (made === null) continue;
+    const key = `${event.chain} ${event.type}`;
+    earliest.set(key, Math.min(earliest.get(key) ?? Infinity, made * 1_000));
+  }
+  return Math.max(-Infinity, ...earliest.values());
+}
+
+/** When the chain made what `event` draws, in milliseconds. */
+function made(event: HubEvent) {
+  switch (event.type) {
+    case "block":
+      return event.time * 1_000;
+    case "batch":
+      return event.lastTime * 1_000;
+    case "level":
+      return event.time === null ? event.at : event.time * 1_000;
+    default:
+      return event.at;
+  }
+}
+
+/**
  * A recording's events as deltas, the shape the page's replay reads. Events
  * before `from` all arrive as the replay starts, keeping their own times, so
- * it opens on the state a page connecting then would have seen; those after
- * `to` are left out.
+ * it opens on the state a page connecting then would have seen, every row
+ * from the same moment on; those after `to` are left out.
  */
 export function pack(events: HubEvent[], from = -Infinity, to = Infinity) {
   const time = (event: HubEvent) => (event.type === "block" ? event.seen : event.at);
   const at = (event: HubEvent) => Math.max(from, time(event));
+  const since = sharedStart(events);
+  const history = (event: HubEvent) =>
+    time(event) >= from || (time(event) >= from - PACKED_HISTORY_MS && made(event) >= since);
   const kept = new Map<string, number>();
   const sorted = events
-    .filter((event) => at(event) <= to && (event.type === "status" || time(event) >= from - PACKED_HISTORY_MS))
+    .filter((event) => at(event) <= to && (event.type === "status" || history(event)))
     .sort((a, b) => at(a) - at(b))
     .filter((event) => {
       if (event.type !== "block" && event.type !== "level") return true;

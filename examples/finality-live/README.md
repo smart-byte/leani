@@ -54,7 +54,9 @@ confirmation rule's verdict on each slot, which the page draws as Ethereum's
 
 The page plays a recording when it has no hub. Pack one from a window of the
 hub's recording; events before the window's start happen at once, so the
-replay opens on the state of a page connecting then:
+replay opens on the state of a page connecting then, every chain from the
+latest moment all of them have blocks and every rollup has batches. Start the
+hub with the nodes, so that moment is their first blocks:
 
 ```sh
 bun hub.ts pack recording.jsonl FROM_MS TO_MS | gzip -9 > ../../site/public/finality/replay.json.gz
