@@ -72,21 +72,49 @@ impl HeldBlocks for Held {
     }
 }
 
+/// Base's block times, its 200 ms blocks since Denim included.
+fn base_cadence() -> Cadence {
+    leani_chain::ChainRegistry::standard()
+        .get("base")
+        .expect("entry")
+        .op_stack
+        .as_ref()
+        .expect("op-stack")
+        .cadence()
+}
+
+/// The L1 block the Base batches name as their origin, `seconds` before them.
+fn base_origin(seconds: u64) -> BlockFrame {
+    let Some(Ok(leani_op_batches::Batch::Singular {
+        epoch, epoch_hash, ..
+    })) = leani_op_batches::batches(BASE_CHANNEL)
+        .expect("channel")
+        .next()
+    else {
+        panic!("a singular batch");
+    };
+    origin_block(epoch, epoch_hash, BASE_TIME - seconds)
+}
+
+fn origin_block(number: u64, hash: B256, timestamp: u64) -> BlockFrame {
+    let mut frame = l1_block(number, Vec::new(), Vec::new());
+    frame.block.hash = BlockHash::new(hash.0);
+    frame.block.timestamp = timestamp;
+    frame
+}
+
 fn base_reader(held: Arc<Held>) -> BatchReader {
-    BatchReader::new(
+    let mut reader = BatchReader::new(
         BatchInbox::OpStack {
             inbox: INBOX,
             batcher: BATCHER,
-            cadence: Cadence {
-                genesis_time: 1_686_789_347,
-                seconds: 2,
-                first_block: Some(0),
-                fast_from: None,
-            },
+            cadence: base_cadence(),
         },
         held,
         None,
-    )
+    );
+    reader.read_origin(&base_origin(12));
+    reader
 }
 
 fn frame_data(id: u8, number: u16, data: &[u8], last: bool) -> Vec<u8> {
@@ -213,6 +241,62 @@ async fn singular_batches_finalize_the_blocks_they_build_on() {
 }
 
 #[tokio::test]
+async fn batches_derivation_drops_finalize_nothing() {
+    let held = || Held::new(&BASE_BLOCKS, (53_963_995, BASE_TIME + 1));
+    let Some(Ok(leani_op_batches::Batch::Singular { epoch, .. })) =
+        leani_op_batches::batches(BASE_CHANNEL)
+            .expect("channel")
+            .next()
+    else {
+        panic!("a singular batch");
+    };
+    // An L1 origin other than the canonical block of its number.
+    let mut reader = base_reader(held());
+    reader.read_origin(&origin_block(epoch, B256::repeat_byte(9), BASE_TIME - 12));
+    assert_eq!(read(&mut reader, &base_post(100)).await, None);
+    // Posted again under the right origin, the same batches count.
+    reader.read_origin(&base_origin(12));
+    assert_eq!(
+        read(&mut reader, &base_post(101)).await,
+        Some(BASE_BLOCKS[2])
+    );
+    // Included past the sequencing window of its origin.
+    let mut reader = base_reader(held());
+    assert_eq!(read(&mut reader, &base_post(epoch + 3_601)).await, None);
+    // Made further from its origin than the sequencer may drift.
+    let mut reader = base_reader(held());
+    reader.read_origin(&base_origin(1_801));
+    assert_eq!(read(&mut reader, &base_post(100)).await, None);
+    // Timed off its block's slot: on a chain whose blocks take two seconds.
+    let mut reader = BatchReader::new(
+        BatchInbox::OpStack {
+            inbox: INBOX,
+            batcher: BATCHER,
+            cadence: Cadence {
+                fast_from: None,
+                ..base_cadence()
+            },
+        },
+        held(),
+        None,
+    );
+    reader.read_origin(&base_origin(12));
+    assert_eq!(read(&mut reader, &base_post(100)).await, None);
+    // An origin the lane has not read yet: matching starts over.
+    let mut reader = BatchReader::new(
+        BatchInbox::OpStack {
+            inbox: INBOX,
+            batcher: BATCHER,
+            cadence: base_cadence(),
+        },
+        held(),
+        None,
+    );
+    assert_eq!(read(&mut reader, &base_post(100)).await, None);
+    assert_eq!(reader.cursor().next_parent, None);
+}
+
+#[tokio::test]
 async fn a_batch_that_skips_blocks_finalizes_nothing() {
     let mut reader = base_reader(Held::new(&BASE_BLOCKS, (53_963_995, BASE_TIME + 1)));
     reader.resume(BatchCursor {
@@ -320,20 +404,34 @@ async fn a_span_batch_finalizes_the_block_its_parent_check_names() {
     let channel = include_bytes!("../../../op-batches/tests/fixtures/mode-span-channel.bin");
     let parent = b256!("0x56562d6dd27c555278f14d51301de67a4bcb374eb58277ef3db13053d1ff552b");
     let held = Held::new(&[(46_906_110, parent)], (46_907_000, 0));
+    let cadence = Cadence {
+        genesis_time: 1_700_167_583,
+        seconds: 2,
+        first_block: Some(0),
+        fast_from: None,
+    };
     let mut reader = BatchReader::new(
         BatchInbox::OpStack {
             inbox: INBOX,
             batcher: BATCHER,
-            cadence: Cadence {
-                genesis_time: 1_700_167_583,
-                seconds: 2,
-                first_block: Some(0),
-                fast_from: None,
-            },
+            cadence,
         },
         held,
         None,
     );
+    // The span's last block names its L1 origin by number and hash prefix.
+    let Some(Ok(leani_op_batches::Batch::Span {
+        l1_origin,
+        l1_origin_check,
+        ..
+    })) = leani_op_batches::batches(channel).expect("channel").next()
+    else {
+        panic!("a span batch");
+    };
+    let mut origin = [0; 32];
+    origin[..20].copy_from_slice(&l1_origin_check);
+    let last = cadence.slot_start(46_906_110 + 867);
+    reader.read_origin(&origin_block(l1_origin, B256::from(origin), last - 60));
     let post = l1_block(
         26_356_926,
         vec![posted(frame_data(1, 0, channel, true))],
