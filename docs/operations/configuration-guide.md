@@ -671,8 +671,11 @@ finalized, so the block can no longer change, minutes after it was made
   Nitro chain each call to the SequencerInbox the entry's `sequencer_inbox`
   names counts the chain's messages, and message n is block
   `sequencer_feed.first_block` + n; the block this node holds at the last
-  one is `finalized`. Batch reading starts where the node starts following;
-  history keeps the trust of its source.
+  one is `finalized`. Nothing in a Nitro block names the messages it came
+  from, so this trusts the sequencer to post the messages it signed on the
+  feed, as `attested` does; a confirmed assertion names the block's hash,
+  so `settled` does not. Batch reading starts where the node starts
+  following; history keeps the trust of its source.
 - `json_rpc` takes the `finalized` block the chain's JSON-RPC endpoints
   agree on, which trusts them: two of them must agree where there are two,
   or `sources.json_rpc.quorum` when that is set. It is the one that needs

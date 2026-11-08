@@ -42,8 +42,10 @@ default), the `finalized` block the chain's JSON-RPC endpoints agree on,
 which needs no L1 anchor, or settlement alone. Batches prove that a block's
 transactions and their order are fixed on Ethereum and that the batcher
 built on the block this node holds; they do not re-execute it, so the state
-root is the one the sequencer signed until the block settles. Ethereum's own
-blocks end at `finalized`.
+root is the one the sequencer signed until the block settles. On a Nitro
+chain they fix how many blocks the chain has, and the block at that height
+is the one the sequencer signed on its feed. Ethereum's own blocks end at
+`finalized`.
 
 `publish` sets the first level a processor's consumers see:
 
