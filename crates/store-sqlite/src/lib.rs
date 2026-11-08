@@ -22383,8 +22383,6 @@ mod tests {
         );
     }
 
-    /// Finalized blocks 1 to `through`, held as canonical and applied by
-    /// `processor`.
     async fn apply_finalized_blocks(
         store: &SqliteStore,
         processor: &FixtureProcessor,

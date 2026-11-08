@@ -177,12 +177,10 @@ fn a_channel_open_past_the_timeout_is_dropped() {
     );
 }
 
-/// RLP of a byte string.
 fn rlp_bytes(bytes: &[u8]) -> Vec<u8> {
     rlp_with(0x80, bytes)
 }
 
-/// RLP of a list of encoded items.
 fn rlp_list(items: &[Vec<u8>]) -> Vec<u8> {
     rlp_with(0xc0, &items.concat())
 }
@@ -213,8 +211,6 @@ fn rlp_uint(value: u64) -> Vec<u8> {
     rlp_bytes(&bytes)
 }
 
-/// A channel of `batches`, each a byte string of version and content,
-/// compressed with zlib.
 fn zlib_channel(batches: &[Vec<u8>]) -> Vec<u8> {
     let stream: Vec<u8> = batches.iter().flat_map(|batch| rlp_bytes(batch)).collect();
     let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());

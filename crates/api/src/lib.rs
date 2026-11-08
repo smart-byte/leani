@@ -2644,8 +2644,6 @@ fn labeled_coverage_intervals(
     intervals
 }
 
-/// `intervals` with their finalized blocks at or below `settled`, a
-/// rollup's settled head, labelled settled.
 fn settled_intervals(
     intervals: Vec<CoverageInterval>,
     settled: Option<u64>,

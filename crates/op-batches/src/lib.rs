@@ -458,7 +458,6 @@ fn singular(content: &[u8]) -> Result<Batch, Error> {
     })
 }
 
-/// A span batch's prefix and block count.
 fn span(content: &[u8]) -> Result<Batch, Error> {
     let mut at = 0;
     let relative_timestamp = varint(content, &mut at)?;
