@@ -1,0 +1,46 @@
+---
+import { Image } from 'astro:assets';
+import ticker from '../assets/landing/ticker.webp';
+import { BLOBS_MONEY_URL, TICKER_URL } from '../config';
+---
+<section id="demos" class="wrap section" aria-labelledby="demos-h">
+  <h2 id="demos-h"><span class="mono"># </span>Built with leani</h2>
+  <div class="exhibit">
+    <a class="shot" href={TICKER_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="ticker">
+      <Image
+        src={ticker}
+        alt="Leani Ticker: the ETH price, swaps indexed, and a table of assets with prices, changes, and volume."
+        width={1280}
+        widths={[640, 1280]}
+        sizes="(min-width: 56rem) 39rem, calc(100vw - 2.5rem)"
+      />
+    </a>
+    <div class="text">
+      <h3>Ticker</h3>
+      <p>
+        Onchain prices and trades on Ethereum: hundreds of tokens, tokenized
+        stocks, and stablecoins, priced from swaps on dozens of exchanges as
+        each block lands. It runs on leani.
+      </p>
+      <a class="mono" href={TICKER_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="ticker">ticker.leani.dev ↗</a>
+    </div>
+  </div>
+  <p class="also">
+    <a href={BLOBS_MONEY_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="blobs.money">blobs.money</a> runs on leani too: Ethereum’s blob economy, live in 3D.
+  </p>
+</section>
+
+<style>
+  .exhibit {
+    display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 2.5rem;
+    align-items: center; margin-top: 2.25rem;
+  }
+  .shot { display: block; border: 1px solid var(--panel-edge); border-radius: 8px; overflow: hidden; }
+  .shot:hover { border-color: var(--accent-dim); }
+  .shot img { display: block; width: 100%; height: auto; }
+  h3 { font-size: 1.3rem; }
+  .text p { color: var(--ink-dim); margin-block: 0.6rem 1rem; max-width: 40ch; }
+  .text a { font-size: 0.9rem; }
+  .also { color: var(--ink-dim); margin-top: 2rem; }
+  @media (max-width: 56rem) { .exhibit { grid-template-columns: 1fr; gap: 1.5rem; } }
+</style>

@@ -1,0 +1,63 @@
+---
+import { Image } from 'astro:assets';
+import still from '../assets/landing/finality.webp';
+
+const levels = [
+  ['attested', 'signed by the chain’s sequencer', 'seconds'],
+  ['finalized', 'its batch is in a finalized Ethereum block', '15–30 min'],
+  ['settled', 'Ethereum accepted a claim covering it, so withdrawals can complete', '5–7 days'],
+] as const;
+---
+<section id="rollups" class="wrap section" aria-labelledby="rollups-h">
+  <h2 id="rollups-h"><span class="mono"># </span>Rollups, final in minutes</h2>
+  <p class="lede">
+    OP Mainnet, Base, Arbitrum One, and the other bundled rollups run on the
+    same node and processors. Every block says how final it is, so your app
+    waits only as long as it needs to.
+  </p>
+  <dl class="levels">
+    {levels.map(([level, meaning, typical]) => (
+      <div class="level">
+        <dt class="mono">{level}</dt>
+        <dd>{meaning}</dd>
+        <dd class="typical mono">{typical}</dd>
+      </div>
+    ))}
+  </dl>
+  <figure>
+    <a class="still" href="/finality/">
+      <Image
+        src={still}
+        alt="Blocks from OP Mainnet, Base, Arbitrum One, and Robinhood Chain flowing into Ethereum blocks, which turn final about 20 minutes later."
+        width={1600}
+        widths={[800, 1600]}
+        sizes="(min-width: 72rem) 69.5rem, calc(100vw - 2.5rem)"
+      />
+    </a>
+    <figcaption>
+      Each rollup’s blocks drop into the Ethereum block that carries their
+      batch and turn green when it is final. <a href="/finality/">See how each rollup settles</a>
+    </figcaption>
+  </figure>
+</section>
+
+<style>
+  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
+  .levels { margin-top: 2rem; border-top: 1px solid var(--panel-edge); max-width: 46rem; }
+  .level {
+    display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) auto; gap: 1.25rem;
+    padding-block: 0.7rem; border-bottom: 1px solid var(--panel-edge); align-items: baseline;
+  }
+  dt { color: var(--accent); font-size: 0.85rem; }
+  dd { margin: 0; }
+  .typical { color: var(--ink-dim); font-size: 0.85rem; white-space: nowrap; }
+  figure { margin-top: 2.5rem; }
+  .still { display: block; border: 1px solid var(--panel-edge); border-radius: 8px; overflow: hidden; }
+  .still:hover { border-color: var(--accent-dim); }
+  .still img { display: block; width: 100%; height: auto; }
+  figcaption { color: var(--ink-dim); font-size: 0.9rem; margin-top: 0.85rem; max-width: 62ch; }
+  @media (max-width: 560px) {
+    .level { grid-template-columns: 1fr auto; gap: 0.2rem 1rem; }
+    .level dd:not(.typical) { grid-column: 1 / -1; grid-row: 2; }
+  }
+</style>

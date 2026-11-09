@@ -1,15 +1,22 @@
 ---
 import EngineWorld from './EngineWorld.astro';
-import { GITHUB_URL, HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
-import processorReference from '../generated/processors-reference.json';
+import { HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
 
-// Measured or catalog-backed facts; the storage figure is the externalized
+// The chain entries the node bundles; testnets are not counted.
+const chainEntries = Object.values(
+  import.meta.glob<string>('../../../config/chains/*.toml', { query: '?raw', import: 'default', eager: true }),
+);
+const rollups = chainEntries.filter(
+  (entry) => !/^family = "ethereum"/m.test(entry) && !/^name = "[^"]*-(sepolia|hoodi)"/m.test(entry),
+).length;
+
+// Measured or registry-backed facts; the storage figure is the externalized
 // profile's evidence row in data/costs.json, footnoted there as workload-specific.
 const stats = [
-  ['1M blocks → 9.5 MB', 'externalized policy, real Mainnet run'],
-  ['0 API keys', 'public Xatu datasets + Ethereum P2P'],
-  [`${processorReference.processors.length} processors`, 'built in, or your own native Rust'],
-  ['MIT-licensed', 'Rust library + standalone node'],
+  ['0 API keys', 'public datasets and peer-to-peer'],
+  [`Ethereum + ${rollups} rollups`, 'OP Mainnet, Base, Arbitrum One, and more'],
+  ['1M blocks → 9.5 MB', 'on disk when your database keeps the results'],
+  ['MIT-licensed', 'Rust library and standalone node'],
 ];
 // Install, then run: the card's button copies both lines, which a shell runs
 // in order; clicking a line copies just that command.
@@ -19,17 +26,15 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
   <div class="wrap body">
     <div class="intro">
       <a class="eyebrow mono" href={LIMITATIONS_URL}>Stable release</a>
-      <h1>Ethereum data, <span class="shaped">shaped</span> for your application.</h1>
+      <h1>Ethereum data without the RPC bill.</h1>
       <p class="sub">
-        An Ethereum indexing node you run inside your own infra. Backfill from
-        public datasets, follow the head over Ethereum P2P, and deterministically
-        reduce blocks into only the state, outputs, and durable streams you
-        choose to retain. Point viem or any JSON-RPC client at it, or stream
-        changes over the SDK.
+        An indexing node you run yourself. It backfills history from public
+        datasets, follows Ethereum and its rollups live, and serves your app's
+        data over JSON-RPC, HTTP, and a TypeScript SDK.
       </p>
       <div class="cta">
-        <a class="btn btn-primary" href="#quickstart">Quickstart →</a>
-        <a class="btn btn-ghost" href={GITHUB_URL} data-umami-event="outbound" data-umami-event-place="hero" data-umami-event-to="github">GitHub ↗</a>
+        <a class="btn btn-primary" href="#quickstart">Quickstart</a>
+        <a class="btn btn-ghost" href="#demos">Live demos</a>
       </div>
     </div>
 
@@ -64,11 +69,6 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
   .body { display: flex; flex-direction: column; align-items: flex-start; padding-top: 3.5rem; padding-bottom: 3rem; }
   .intro, .run, .stats { position: relative; z-index: 2; min-width: 0; }
   h1 { font-size: clamp(2.4rem, 6vw, 4.2rem); max-width: 18ch; margin-top: 0.9rem; }
-  .shaped { color: var(--accent); }
-  /* Decode state; the script builds these nodes and removes them when done. */
-  .shaped :global(.glyph) { display: inline-block; text-align: center; }
-  .shaped :global(.raw) { color: #6f8d7c; font-family: var(--font-mono); font-size: 0.78em; font-weight: 400; }
-  .shaped :global(.sr-only) { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
   .sub { color: var(--ink-dim); font-size: 1.15rem; max-width: 52ch; margin-top: 1.1rem; }
   .cta { display: flex; gap: 0.9rem; margin-top: 1.7rem; flex-wrap: wrap; }
 
@@ -209,36 +209,6 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
         copiedTimer = window.setTimeout(() => { copied.textContent = ''; }, 2400);
       });
     });
-
-    // "shaped" resolves from raw hex once, the way leani reduces chain bytes.
-    // Letters are split only while decoding, so the settled heading is plain,
-    // kerned text; a hidden copy keeps the accessible name whole meanwhile.
-    const shaped = hero.querySelector<HTMLElement>('.shaped');
-    if (shaped && !reducedMotion.matches) {
-      void document.fonts.ready.then(() => {
-        const word = shaped.textContent ?? '';
-        const letters = [...word].map((char) => Object.assign(document.createElement('span'), { textContent: char }));
-        const glyphs = document.createElement('span');
-        glyphs.setAttribute('aria-hidden', 'true');
-        glyphs.append(...letters);
-        shaped.replaceChildren(Object.assign(document.createElement('span'), { className: 'sr-only', textContent: word }), glyphs);
-        const widths = letters.map((letter) => letter.getBoundingClientRect().width);
-        letters.forEach((letter, i) => { letter.className = 'glyph'; letter.style.width = `${widths[i]}px`; });
-        const start = performance.now();
-        const decode = window.setInterval(() => {
-          const elapsed = performance.now() - start;
-          letters.forEach((letter, i) => {
-            const raw = elapsed < 260 + i * 110;
-            letter.textContent = raw ? '0123456789abcdef'[Math.floor(Math.random() * 16)]! : word[i]!;
-            letter.classList.toggle('raw', raw);
-          });
-          if (elapsed >= 260 + letters.length * 110) {
-            window.clearInterval(decode);
-            shaped.textContent = word;
-          }
-        }, 55);
-      });
-    }
 
     update();
   }
