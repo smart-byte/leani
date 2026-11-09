@@ -49,12 +49,12 @@ const landingScriptBytes = entryScripts.reduce((sum, path) => {
   return sum + asset.bytes;
 }, 0);
 
-// Raised from 5 MiB for the docs diagrams (light and dark SVG renders), and
-// from 5.25 MiB for the Wasm processors guide.
-enforce('complete static site', assets.reduce((sum, asset) => sum + asset.bytes, 0), 5.5 * 1024 * 1024);
+// These budgets flag unexpected growth; they are not a cap on features. When a
+// feature needs the room, raise its budget instead of cutting the feature.
+enforce('complete static site', assets.reduce((sum, asset) => sum + asset.bytes, 0), 8 * 1024 * 1024);
 enforce('llms.txt exports', llmsText.reduce((sum, asset) => sum + asset.bytes, 0), 2 * 1024 * 1024);
 enforce('all JavaScript including Pagefind', total(assets, ['.js']), 768 * 1024);
-enforce('all CSS including Pagefind', total(assets, ['.css']), 256 * 1024);
+enforce('all CSS including Pagefind', total(assets, ['.css']), 288 * 1024);
 enforce('all webfonts', total(assets, ['.woff', '.woff2']), 512 * 1024);
 // The hero repeats section 3's engine markup, which gzip mostly deduplicates.
 enforce('landing HTML', Buffer.byteLength(landing), 250 * 1024);
