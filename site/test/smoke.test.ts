@@ -12,7 +12,7 @@ test('interactive widgets use scoped selectors and semantic copy controls', () =
   );
   const hero = readFileSync(new URL('../src/components/Hero.astro', import.meta.url), 'utf8');
 
-  expect(showcase).toContain("document.getElementById('processors')");
+  expect(showcase).toContain("document.getElementById('processor-examples')");
   expect(showcase).not.toContain("document.querySelector<HTMLElement>('[role=\"tablist\"]')");
   expect(quickstart).toContain('button type="button"');
   expect(quickstart).toContain('aria-live="polite"');

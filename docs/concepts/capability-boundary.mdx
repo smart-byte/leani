@@ -9,6 +9,8 @@ audience:
 status: preview
 ---
 
+import Boundary from '@docs/components/Boundary.astro';
+
 Leani exposes what the running node can answer. Capability depends on all three
 layers:
 
@@ -37,5 +39,11 @@ are processor products with documented scope; they are not substitutes for
 arbitrary historical Ethereum state.
 
 Keep an execution provider for unsupported methods and as an independent
-fallback. The exact matrix lives in
+fallback.
+
+## Over JSON-RPC
+
+<Boundary />
+
+The exact matrix lives in
 [Ethereum JSON-RPC compatibility](/docs/reference/ethereum-json-rpc/).

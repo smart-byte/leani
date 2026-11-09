@@ -19,7 +19,7 @@ const { title } = Astro.props;
     border: 1px solid var(--panel-edge);
     border-radius: 10px;
     overflow: hidden;
-    box-shadow: 0 12px 40px rgb(0 0 0 / 0.4);
+    box-shadow: var(--term-shadow, 0 12px 40px rgb(0 0 0 / 0.4));
   }
   .term-bar {
     display: flex; align-items: center; gap: 0.4rem;
