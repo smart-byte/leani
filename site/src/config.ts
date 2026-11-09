@@ -8,6 +8,7 @@ export const LIMITATIONS_URL = '/docs/operations/preview-limitations/';
 export const INSTALL_URL = '/docs/getting-started/install/';
 export const EVIDENCE_URL = '/docs/contributing/manual-verification/#real-source-delivery-benchmark';
 export const BLOBS_MONEY_URL = 'https://blobs.money';
+export const TICKER_URL = 'https://ticker.leani.dev';
 
 // The published release's install command, as docs/getting-started/install.mdx documents it.
 export const HOMEBREW_INSTALL = 'brew install smart-byte/tap/leani';

@@ -1,0 +1,41 @@
+---
+const steps = [
+  ['Backfill', 'History comes from public datasets or from peers, so there is no full node to sync.'],
+  ['Follow', 'New blocks arrive live: Ethereum’s over its peer-to-peer network, rollups’ over their gossip, sequencer feed, or JSON-RPC.'],
+  ['Process', 'Your processors turn each block into your app’s data, and leani keeps only their results.'],
+  ['Serve', 'Query it over HTTP, JSON-RPC, or the TypeScript SDK, and stream every change, reorgs included.'],
+] as const;
+---
+<section id="how" class="section" aria-labelledby="how-h">
+  <div class="wrap">
+    <h2 id="how-h"><span class="mono"># </span>How it works</h2>
+    <p class="lede">
+      History and the live chain take the same four steps and meet without a
+      gap. <a href="/docs/concepts/how-leani-works/">How leani works</a>
+    </p>
+    <ol class="steps">
+      {steps.map(([name, text]) => (
+        <li>
+          <h3 class="mono">{name}</h3>
+          <p>{text}</p>
+        </li>
+      ))}
+    </ol>
+  </div>
+</section>
+
+<style>
+  #how { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); border-block: 1px solid var(--panel-edge); }
+  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
+  .steps {
+    list-style: none; padding: 1.25rem 0 0; margin-top: 2.25rem; counter-reset: step;
+    border-top: 1px solid var(--panel-edge);
+    display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.75rem;
+  }
+  .steps li { counter-increment: step; }
+  h3 { font-size: 0.95rem; font-weight: 700; }
+  h3::before { content: counter(step, decimal-leading-zero) ' '; color: var(--accent); }
+  .steps p { color: var(--ink-dim); font-size: 0.92rem; margin-top: 0.4rem; }
+  @media (max-width: 860px) { .steps { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 480px) { .steps { grid-template-columns: 1fr; } }
+</style>

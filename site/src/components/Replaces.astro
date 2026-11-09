@@ -1,0 +1,56 @@
+---
+import { BLOBS_MONEY_URL } from '../config';
+
+const rows = [
+  [
+    'a metered RPC',
+    'JSON-RPC from your own node: blocks, transactions, receipts, logs, and subscriptions. Point viem at it.',
+    '/docs/guides/json-rpc/',
+  ],
+  [
+    'a hosted indexer',
+    'Processors that keep only your app’s data: built-in ones for blocks, blobs, token balances, events, and Uniswap pools, or your own in Rust or Wasm.',
+    '/docs/reference/processors/',
+  ],
+  [
+    'a streaming service',
+    'Change streams that resume from a cursor, undo reorgs, and wait for the finality your app asks for.',
+    '/docs/concepts/durable-delivery/',
+  ],
+] as const;
+---
+<section id="replaces" class="wrap section" aria-labelledby="replaces-h">
+  <h2 id="replaces-h"><span class="mono"># </span>What it replaces</h2>
+  <p class="lede">
+    We built leani for <a href={BLOBS_MONEY_URL}>blobs.money</a>, which paid a
+    metered RPC for millions of calls to fetch history that public datasets
+    serve for free.
+  </p>
+  <dl class="ledger">
+    {rows.map(([instead, leani, href]) => (
+      <div class="row">
+        <dt class="mono">instead of {instead}</dt>
+        <dd>{leani} <a class="more mono" href={href}>docs</a></dd>
+      </div>
+    ))}
+  </dl>
+  <p class="foot">
+    You pay for the machine it runs on, not per request. leani keeps no EVM
+    state, so keep a provider for <code>eth_call</code> and balances.
+  </p>
+</section>
+
+<style>
+  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
+  .ledger { margin-top: 2.25rem; border-top: 1px solid var(--panel-edge); }
+  .row {
+    display: grid; grid-template-columns: minmax(0, 14rem) minmax(0, 1fr); gap: 0.3rem 2rem;
+    padding-block: 1.15rem; border-bottom: 1px solid var(--panel-edge);
+  }
+  dt { color: var(--ink-dim); font-size: 0.85rem; padding-top: 0.2rem; }
+  dd { margin: 0; max-width: 62ch; }
+  .more { font-size: 0.8rem; margin-left: 0.35rem; }
+  .foot { color: var(--ink-dim); max-width: 62ch; margin-top: 1.4rem; }
+  .foot code { font-family: var(--font-mono); font-size: 0.85em; color: var(--ink); }
+  @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+</style>
