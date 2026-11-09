@@ -44,8 +44,8 @@ describe('canned data', () => {
   });
 
   test('the handoff session is one real parent-hash chain', () => {
-    // The landing seam and the docs sequence draw their hash match from these
-    // rows, so each block must name the previous block as its parent.
+    // The docs sequence draws its hash match from these rows, so each block
+    // must name the previous block as its parent.
     expect(handoffSession.recordedAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
     expect(handoffSession.rows.length).toBeGreaterThanOrEqual(2);
     handoffSession.rows.forEach((row, i) => {

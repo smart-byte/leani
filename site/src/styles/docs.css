@@ -1,3 +1,5 @@
+@import './syntax.css';
+
 :root {
   --sl-font: 'Inter Variable', system-ui, sans-serif;
   --__sl-font-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, monospace;
@@ -34,6 +36,29 @@ html[data-theme='light'] {
   --sl-color-bg: #f8fbf9;
   --sl-color-bg-nav: #f8fbf9f2;
   --sl-color-bg-sidebar: #f1f6f3;
+}
+
+/* The landing page's tokens, mapped onto the docs theme, so site components
+   embedded in docs pages follow the light and dark themes. */
+:root {
+  --bg: var(--sl-color-bg);
+  --panel: var(--sl-color-gray-6);
+  --panel-edge: var(--sl-color-gray-5);
+  --ink: var(--sl-color-white);
+  --ink-dim: var(--sl-color-gray-3);
+  --accent: var(--sl-color-accent);
+  --accent-dim: color-mix(in srgb, var(--sl-color-accent) 45%, var(--sl-color-bg));
+  --syntax-keyword: var(--sl-color-accent);
+  --syntax-string: var(--sl-color-accent-high);
+  --syntax-number: var(--sl-color-accent);
+  --syntax-name: var(--sl-color-white);
+  --syntax-muted: var(--sl-color-gray-3);
+  --font-mono: var(--__sl-font-mono);
+  --term-shadow: var(--sl-shadow-md);
+}
+
+.mono {
+  font-family: var(--font-mono);
 }
 
 code,

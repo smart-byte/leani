@@ -1,3 +1,5 @@
+@import './syntax.css';
+
 :root {
   --bg: #0b0f0d;
   --panel: #101613;
@@ -84,10 +86,3 @@ a:hover { text-decoration-thickness: 2px; }
   border-radius: 50%;
   background: var(--accent);
 }
-
-/* Token colors for highlighted terminal/code blocks (src/lib/highlight.ts). */
-.hl-prompt, .hl-flag, .hl-com { color: var(--syntax-muted); }
-.hl-str { color: var(--syntax-string); }
-.hl-num { color: var(--syntax-number); }
-.hl-kw { color: var(--syntax-keyword); }
-.hl-key { color: var(--syntax-name); }

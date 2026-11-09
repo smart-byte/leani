@@ -10,6 +10,7 @@ status: preview
 ---
 
 import { Aside } from '@astrojs/starlight/components';
+import CostTable from '@docs/components/CostTable.astro';
 
 “Retention” is not one switch. Each product answers a different recovery or
 query need and has its own budget.
@@ -27,6 +28,12 @@ query need and has its own budget.
 The policies are orthogonal. An externalized processor can retain durable state
 and an acknowledgement-fenced change log while keeping no query output. A
 latest-value processor can retain one materialized entity with no delivery log.
+
+## What each output policy keeps
+
+Four common output policies, from least to most retained:
+
+<CostTable />
 
 ## Hard ceilings and backpressure
 

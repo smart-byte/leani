@@ -12,9 +12,17 @@ generated: true
 ---
 
 import ReferenceTable from '@docs/components/docs/ReferenceTable.astro';
+import Showcase from '@docs/components/Showcase.astro';
 
 This catalog comes from `ProcessorRegistry::standard()`. Adding, removing, or
 renaming a built-in factory changes the tracked fixture in the same Rust commit.
 Runtime `/v1/capabilities` remains authoritative for one configured node.
 
 <ReferenceTable kind="processors" />
+
+## Examples
+
+Each tab shows a processor's configuration, the data format it extracts, and
+the change stream a client reads.
+
+<Showcase />
