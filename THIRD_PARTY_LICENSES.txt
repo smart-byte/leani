@@ -5160,7 +5160,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-tokio-rustls 0.26.4 — https://github.com/rustls/tokio-rustls
+tokio-rustls 0.26.6 — https://github.com/rustls/tokio-rustls
 
 Copyright (c) 2017 quininer kel
 
