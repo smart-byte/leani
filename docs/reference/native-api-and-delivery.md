@@ -296,7 +296,7 @@ export interface ProcessorCoverage {
   available: Array<{
     fromBlock: number;
     toBlock: number;
-    finality: "unattested" | "attested" | "finalized" | "settled";
+    finality: "unattested" | "attested" | "confirmed" | "finalized" | "settled";
   }>;
   configuredStartBlock: number;
   processedThrough: number | null;
@@ -530,7 +530,7 @@ return `boundaryCursor: null` and `recovery.follow: null`. Query-and-follow, cha
 change-page, and stream requests return non-retryable HTTP 409
 `delivery_disabled`; enable a delivery policy before subscribing.
 
-The snapshots of a processor that publishes from `attested` or `finalized`
+The snapshots of a processor that publishes from `attested`, `confirmed` or `finalized`
 also return `boundaryCursor: null` and `recovery.follow: null`, and
 query-and-follow returns HTTP 409 `deferred_publication_snapshot`: its
 retained state already holds blocks whose changes are published only once
@@ -644,7 +644,14 @@ export interface ChangeEnvelope<T = unknown> {
   apiVersion: "1";
   sequence: string;
   cursor: string;
-  operation: "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required";
+  operation:
+    | "apply"
+    | "undo"
+    | "attested"
+    | "confirmed"
+    | "finalized"
+    | "settled"
+    | "reset_required";
   originKind: "live" | "live_recovery" | "historical_backfill" | "recompute";
   originId: string;
   publicationRevision: string;
@@ -655,7 +662,7 @@ export interface ChangeEnvelope<T = unknown> {
     parentHash: `0x${string}`;
     timestamp: number;
   } | null;
-  finality: "unattested" | "attested" | "finalized" | "settled";
+  finality: "unattested" | "attested" | "confirmed" | "finalized" | "settled";
   kind: string;
   schema: string;
   key: string | null;
@@ -700,7 +707,7 @@ from another store, chain, processor version, or expired epoch is rejected.
 
 - introduces or updates the keyed domain value;
 - is emitted only after the state transaction commits;
-- may be `unattested` or `attested` but not yet finalized (see
+- may be `unattested`, `attested`, or `confirmed` but not yet finalized (see
   [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)).
 
 `attested`
@@ -709,6 +716,15 @@ from another store, chain, processor version, or expired epoch is rejected.
   `system.finality.put` with `data: { throughBlock }`: the highest block the
   sync committee has attested;
 - is emitted only by processors that publish `unattested` blocks;
+- never repeats an entity.
+
+`confirmed`
+
+- marks every block through `throughBlock` confirmed, as kind
+  `system.finality.put` with `data: { throughBlock }`: the highest block the
+  node's `[confirmation]` endpoints confirmed;
+- is emitted only while `[confirmation]` is active, by processors that
+  publish `unattested` or `attested` blocks;
 - never repeats an entity.
 
 `undo`
@@ -963,7 +979,7 @@ export interface BlobsBlock {
   targetBlobsPerBlock: number;
   maxBlobsPerBlock: number;
   transformVersion: number;
-  finality: "unattested" | "attested" | "finalized";
+  finality: "unattested" | "attested" | "confirmed" | "finalized";
 }
 
 export interface BlobTransaction {

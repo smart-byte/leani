@@ -281,9 +281,10 @@ paths:
         Copies the matching retained output into a stable, short-lived
         snapshot and returns its first page. Read later pages with GET and the
         page's `nextCursor`, and release the snapshot when done. The snapshot
-        of a processor that publishes from `attested` or `finalized` holds
-        blocks whose changes are not published yet, so it offers no boundary
-        to follow: `boundaryCursor` and `recovery.follow` are null.
+        of a processor that publishes from `attested`, `confirmed` or
+        `finalized` holds blocks whose changes are not published yet, so it
+        offers no boundary to follow: `boundaryCursor` and `recovery.follow`
+        are null.
       requestBody:
         required: true
         content:
@@ -353,9 +354,10 @@ paths:
           description: |
             This processor has delivery disabled; query retained entities
             without following, or enable delivery. Or it publishes from
-            `attested` or `finalized` (`deferred_publication_snapshot`): its
-            retained state holds blocks not published yet, so follow the
-            change stream from its head instead.
+            `attested`, `confirmed` or `finalized`
+            (`deferred_publication_snapshot`): its retained state holds
+            blocks not published yet, so follow the change stream from its
+            head instead.
           content:
             application/json:
               schema:
@@ -1890,7 +1892,7 @@ components:
       description: Store-, chain-, and processor-bound opaque value.
     Finality:
       type: string
-      enum: [unattested, attested, finalized, settled]
+      enum: [unattested, attested, confirmed, finalized, settled]
       description: |
         Chain-confidence level of the block a record belongs to.
         `unattested`: at least two execution peers served the block, it passed
@@ -1898,7 +1900,10 @@ components:
         sync committee has not attested it yet, and the block is undone if no
         attestation covers it. `attested`: its ancestry is verified to an
         execution block at least two thirds of the sync committee attested; a
-        reorg can still remove it. `finalized`: Ethereum consensus has
+        reorg can still remove it. `confirmed`: attested, and the node's
+        `[confirmation]` endpoints report that Ethereum's Fast Confirmation
+        Rule confirmed it or a descendant; this rests on those endpoints, and
+        a reorg removes it only if the rule's assumptions fail. `finalized`: Ethereum consensus has
         finalized the block, as verified by this node's configured finality
         source; on a rollup, the Ethereum block carrying its batch is
         finalized, so the block can no longer change. `settled`: a rollup's
@@ -2271,8 +2276,8 @@ components:
         boundaryCursor:
           description: |
             Null when the processor has delivery disabled or publishes from
-            `attested` or `finalized`: its retained state holds unpublished
-            blocks.
+            `attested`, `confirmed` or `finalized`: its retained state holds
+            unpublished blocks.
           oneOf:
             - $ref: "#/components/schemas/Cursor"
             - type: "null"
@@ -2910,7 +2915,7 @@ components:
           $ref: "#/components/schemas/Cursor"
         operation:
           type: string
-          enum: [apply, undo, attested, finalized, settled, reset_required]
+          enum: [apply, undo, attested, confirmed, finalized, settled, reset_required]
         originKind:
           type: string
           enum: [live, live_recovery, historical_backfill, recompute]
@@ -2943,7 +2948,10 @@ components:
             The processor's entity for `apply` and `undo`. For `attested`,
             the `system.finality.put` kind carries `{ throughBlock }`, the
             highest block the sync committee has attested; processors that
-            publish `unattested` blocks emit it. For `finalized`, the
+            publish `unattested` blocks emit it. For `confirmed`, the same
+            kind carries the highest block the `[confirmation]` endpoints
+            confirmed; processors that publish below `confirmed` emit it. For
+            `finalized`, the
             `system.finality.put` kind carries `{ throughBlock }`, and the
             `system.live_gap.put` kind carries
             `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live

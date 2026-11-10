@@ -6737,6 +6737,7 @@ async fn serve(path: &Path, registry: &ProcessorRegistry) -> Result<Exit> {
     let rpc_settings = &config.get().rpc;
     let rpc_config = leani_rpc::RpcConfig {
         chain_id: leani_primitives::ChainId(config.get().chain.chain_id),
+        confirmed_safe: config.get().active_confirmation().is_some(),
         readiness: rpc_readiness.clone(),
         websocket_enabled: true,
         history,
@@ -9244,7 +9245,7 @@ async fn run_network_lanes(
         readiness,
         rpc_readiness,
         committed_events,
-        network_telemetry: _,
+        network_telemetry,
         cancellation,
         backfill_control,
         verified_anchor,
@@ -9280,6 +9281,24 @@ async fn run_network_lanes(
             .join(leani_finality_beacon_api::FINALITY_ANCHOR_FILE),
         write_failures: readiness.finality_anchor_write_failures(),
     };
+    let confirmation_cancellation = lane_cancellation.child_token();
+    let _stop_confirmation = confirmation_cancellation.clone().drop_guard();
+    let confirmation_votes = config
+        .active_confirmation()
+        .map(|confirmation| {
+            leani_finality_beacon_api::spawn_confirmation(
+                &leani_finality_beacon_api::ConfirmationConfig {
+                    endpoints: confirmation.endpoints.clone(),
+                    minimum_agreement: confirmation.minimum_agreement,
+                },
+                beacon_network.clone(),
+                attested_heads.subscribe(),
+                leani_finality_beacon_api::Clock::default(),
+                network_telemetry.clone(),
+                confirmation_cancellation,
+            )
+        })
+        .transpose()?;
     let (finality_source, selected, bootstrap): (
         Arc<dyn FinalitySource>,
         VerifiedFinalityAnchor,
@@ -9410,6 +9429,8 @@ async fn run_network_lanes(
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
             live_gap_notices,
             live_gap_fill,
+            confirmation_votes,
+            network_telemetry,
             ..SharedLiveRuntimeConfig::default()
         },
     )?;

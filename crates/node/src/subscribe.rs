@@ -480,14 +480,7 @@ impl LevelGate {
 
 /// The level a wire name names.
 fn level_named(name: &str) -> Option<Finality> {
-    [
-        Finality::Unattested,
-        Finality::Attested,
-        Finality::Finalized,
-        Finality::Settled,
-    ]
-    .into_iter()
-    .find(|level| level.name() == name)
+    Finality::ALL.into_iter().find(|level| level.name() == name)
 }
 
 fn envelope_block_number(envelope: &AttachedEnvelope) -> Option<u64> {
@@ -979,7 +972,7 @@ fn explain_subscription_refusal(
     }
     let mut command = vec!["leani reset subscription uniswap-v3".to_owned()];
     command.extend(markets.iter().map(|market| market.symbol.to_owned()));
-    if options.finality.final_only() {
+    if options.finality != SubscribeFinality::Unattested {
         command.push(format!("--finality {}", options.finality.level().name()));
     }
     let paths = [
@@ -1451,6 +1444,7 @@ fn subscription_data_dir_for(
         // Attested keeps the bytes of 0.1.0-rc.7's `included`, so its
         // embedded state directories reopen.
         SubscribeFinality::Attested => b"included",
+        SubscribeFinality::Confirmed => b"confirmed",
         SubscribeFinality::Finalized => b"finalized",
         SubscribeFinality::Settled => b"settled",
     });
@@ -2573,7 +2567,8 @@ fn readable_timestamp(timestamp: u64) -> Result<String> {
 fn update_is_fresh(finality: SubscribeFinality, timestamp: u64, now: u64) -> bool {
     let maximum_age = match finality {
         SubscribeFinality::Unattested | SubscribeFinality::Attested => ATTESTED_UPDATE_MAX_AGE,
-        SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
+        // A block waits for finality while the confirmation endpoints stall.
+        SubscribeFinality::Confirmed | SubscribeFinality::Finalized => FINALIZED_UPDATE_MAX_AGE,
         SubscribeFinality::Settled => SETTLED_UPDATE_MAX_AGE,
     };
     now.saturating_sub(timestamp) <= maximum_age.as_secs()
@@ -3028,7 +3023,13 @@ fn render_attached_sse_events(
         if envelope.cursor.is_empty()
             || !matches!(
                 envelope.operation.as_str(),
-                "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required"
+                "apply"
+                    | "undo"
+                    | "attested"
+                    | "confirmed"
+                    | "finalized"
+                    | "settled"
+                    | "reset_required"
             )
         {
             bail!("node sent an invalid SSE change envelope");
@@ -4665,7 +4666,7 @@ mod tests {
         assert!(!message.contains("earlier start block"), "{message}");
         assert!(
             message.contains(
-                r"`leani reset subscription uniswap-v3 ETH/USDC --data-dir 'srv/my leani'\''s state' --config 'configs/node 1.toml' --yes`"
+                r"`leani reset subscription uniswap-v3 ETH/USDC --finality attested --data-dir 'srv/my leani'\''s state' --config 'configs/node 1.toml' --yes`"
             ),
             "{message}"
         );
@@ -5652,11 +5653,9 @@ mod tests {
             now - ATTESTED_UPDATE_MAX_AGE.as_secs() - 1,
             now
         ));
-        assert!(update_is_fresh(
-            SubscribeFinality::Finalized,
-            now - 15 * 60,
-            now
-        ));
+        for level in [SubscribeFinality::Confirmed, SubscribeFinality::Finalized] {
+            assert!(update_is_fresh(level, now - 15 * 60, now), "{level:?}");
+        }
     }
 
     #[test]

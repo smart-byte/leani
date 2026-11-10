@@ -16889,6 +16889,7 @@ mod tests {
             beacon_block_root: [0xa7; 32],
             block_number: BlockNumber(header.number),
             block_hash: block_hash(header.hash_slow()),
+            sync_participants: 512,
         }
     }
 

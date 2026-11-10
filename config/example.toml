@@ -164,6 +164,13 @@ checkpoint_slot = 0 # replace with that checkpoint's finalized beacon slot
 minimum_peers = 2
 discovery_port = 0
 
+[confirmation]
+# Consensus nodes with Fast Confirmation enabled, behind the `confirmed` level
+# and JSON-RPC `safe`; they serve no chain data. A public third-party node:
+# run your own for production, or set endpoints = [] to turn `confirmed` off.
+endpoints = ["https://lodestar-mainnet.chainsafe.io/"]
+minimum_agreement = 1
+
 [[processors]]
 id = "blobs-money"
 instance = "blobs-production"

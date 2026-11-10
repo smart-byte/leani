@@ -671,6 +671,7 @@ pub async fn publish_heads(
                 beacon_block_root: [0; 32],
                 block_number: BlockNumber(block.number),
                 block_hash: BlockHash::new(block.hash.0),
+                sync_participants: 0,
             });
             latest.send_if_modified(|current: &mut Option<SignedBlock>| {
                 let newer = current.is_none_or(|current| current.number < block.number);

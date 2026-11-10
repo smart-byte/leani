@@ -216,6 +216,7 @@ mod tests {
             beacon_block_root: [0; 32],
             block_number: BlockNumber(number),
             block_hash: BlockHash::new([hash; 32]),
+            sync_participants: 512,
         }
     }
 

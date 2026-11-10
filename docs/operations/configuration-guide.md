@@ -85,6 +85,7 @@ Compact Ethereum Mainnet configurations expand to:
 | execution | native P2P, one-peer availability floor, 16-peer healthy target, 100-peer cap |
 | history | public Xatu source, on-demand processor scheduling |
 | processor | selected built-in feed, unattested publication, checkpointed state, 256-block undo safety |
+| confirmation | ChainSafe's public Lodestar node behind the `confirmed` level; a `[confirmation]` section in the compact document replaces it |
 | resources | 512 MiB memory, 4 GiB temporary disk, four source and mapper tasks |
 | retention | full query output; 64 MiB or 24 hours of change delivery |
 | listeners | ephemeral P2P ports, RPC `127.0.0.1:18545`/`18546`, API `127.0.0.1:18080` |
@@ -489,6 +490,31 @@ backfills, not verified head following: the live lane includes a block only
 once its ancestry reaches an execution header the sync committee attested,
 which the finality source verifies each slot, so validation refuses
 `sources.live.kind = "p2p"` with `finality.kind = "disabled"`.
+
+`[confirmation]` names the consensus nodes behind the `confirmed` level and
+JSON-RPC `safe`: Beacon API endpoints with Fast Confirmation enabled
+(Lighthouse `--enable-fast-confirmation`, Lodestar `--chain.fastConfirmation`),
+whose `fast_confirmation` event stream the node follows. They serve no chain
+data, and credentials in their URLs are kept out of logs and status.
+
+```toml
+[confirmation]
+endpoints = ["http://127.0.0.1:5052/"]
+minimum_agreement = 1
+```
+
+`minimum_agreement` of the endpoints, within their count and each listed
+once, must confirm a block. The section applies on an Ethereum chain with
+`sources.live.kind = "p2p"` and `beacon_api` or `consensus_p2p` finality;
+under other sources it is inert, with a warning at startup, and on a rollup it
+is refused. Compact Ethereum Mainnet configurations name ChainSafe's public
+Lodestar node, a free third-party service: name your own node for production.
+An advanced configuration without the section, or any with `endpoints = []`,
+has no `confirmed` level, and `publish = "confirmed"` is then refused. The
+[finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes)
+say what the level means, and the
+[trust model](/docs/operations/trust-and-threat-model/) what the endpoints
+are trusted with.
 
 On an op-stack chain, such as Base, `finality.kind = "op_gossip"` follows the
 sequencer's signed block gossip and needs no checkpoint. Every block the

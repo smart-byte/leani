@@ -263,7 +263,7 @@ Processor descriptors include:
 - address/topic filters;
 - output schema;
 - current-only, bucketed, or full-history retention;
-- publication policy: unattested, attested or finalized;
+- publication policy: unattested, attested, confirmed or finalized;
 - whether deltas are commutative or strictly ordered.
 
 The concrete first-release modes are:

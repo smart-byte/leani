@@ -187,6 +187,9 @@ pub enum PublicationPolicy {
     /// The final aggregate of a bounded history job only.
     #[serde(rename = "terminal_only")]
     JobResult,
+    /// Blocks from confirmed on, with undo; lower ones wait in the store.
+    #[serde(rename = "confirmed_and_finalized")]
+    Confirmed,
 }
 
 impl PublicationPolicy {
@@ -198,6 +201,7 @@ impl PublicationPolicy {
         match self {
             Self::Unattested => Finality::Unattested,
             Self::Attested => Finality::Attested,
+            Self::Confirmed => Finality::Confirmed,
             Self::Finalized | Self::JobResult => Finality::Finalized,
             Self::Settled => Finality::Settled,
         }
@@ -206,7 +210,7 @@ impl PublicationPolicy {
     /// Whether unfinalized blocks reach consumers, with undo.
     #[must_use]
     pub const fn publishes_unfinalized(self) -> bool {
-        matches!(self, Self::Unattested | Self::Attested)
+        matches!(self, Self::Unattested | Self::Attested | Self::Confirmed)
     }
 }
 

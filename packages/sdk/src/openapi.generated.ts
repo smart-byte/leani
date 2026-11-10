@@ -251,9 +251,10 @@ export interface paths {
          * @description Copies the matching retained output into a stable, short-lived
          *     snapshot and returns its first page. Read later pages with GET and the
          *     page's `nextCursor`, and release the snapshot when done. The snapshot
-         *     of a processor that publishes from `attested` or `finalized` holds
-         *     blocks whose changes are not published yet, so it offers no boundary
-         *     to follow: `boundaryCursor` and `recovery.follow` are null.
+         *     of a processor that publishes from `attested`, `confirmed` or
+         *     `finalized` holds blocks whose changes are not published yet, so it
+         *     offers no boundary to follow: `boundaryCursor` and `recovery.follow`
+         *     are null.
          */
         post: operations["createProcessorEntitySnapshot"];
         delete?: never;
@@ -1627,7 +1628,10 @@ export interface components {
          *     sync committee has not attested it yet, and the block is undone if no
          *     attestation covers it. `attested`: its ancestry is verified to an
          *     execution block at least two thirds of the sync committee attested; a
-         *     reorg can still remove it. `finalized`: Ethereum consensus has
+         *     reorg can still remove it. `confirmed`: attested, and the node's
+         *     `[confirmation]` endpoints report that Ethereum's Fast Confirmation
+         *     Rule confirmed it or a descendant; this rests on those endpoints, and
+         *     a reorg removes it only if the rule's assumptions fail. `finalized`: Ethereum consensus has
          *     finalized the block, as verified by this node's configured finality
          *     source; on a rollup, the Ethereum block carrying its batch is
          *     finalized, so the block can no longer change. `settled`: a rollup's
@@ -1639,7 +1643,7 @@ export interface components {
          *     always equals the envelope `finality`.
          * @enum {string}
          */
-        Finality: "unattested" | "attested" | "finalized" | "settled";
+        Finality: "unattested" | "attested" | "confirmed" | "finalized" | "settled";
         AddProcessorRequest: {
             /** @description One `[[processors]]` configuration entry, with the configuration's field names. */
             processor: {
@@ -1800,8 +1804,8 @@ export interface components {
             snapshotId: string;
             /**
              * @description Null when the processor has delivery disabled or publishes from
-             *     `attested` or `finalized`: its retained state holds unpublished
-             *     blocks.
+             *     `attested`, `confirmed` or `finalized`: its retained state holds
+             *     unpublished blocks.
              */
             boundaryCursor: components["schemas"]["Cursor"] | null;
             rowCount: components["schemas"]["DecimalQuantity"];
@@ -2102,7 +2106,7 @@ export interface components {
             sequence: components["schemas"]["DecimalQuantity"];
             cursor: components["schemas"]["Cursor"];
             /** @enum {string} */
-            operation: "apply" | "undo" | "attested" | "finalized" | "settled" | "reset_required";
+            operation: "apply" | "undo" | "attested" | "confirmed" | "finalized" | "settled" | "reset_required";
             /**
              * @description Processing lane that produced this publication.
              * @enum {string}
@@ -2122,7 +2126,10 @@ export interface components {
              * @description The processor's entity for `apply` and `undo`. For `attested`,
              *     the `system.finality.put` kind carries `{ throughBlock }`, the
              *     highest block the sync committee has attested; processors that
-             *     publish `unattested` blocks emit it. For `finalized`, the
+             *     publish `unattested` blocks emit it. For `confirmed`, the same
+             *     kind carries the highest block the `[confirmation]` endpoints
+             *     confirmed; processors that publish below `confirmed` emit it. For
+             *     `finalized`, the
              *     `system.finality.put` kind carries `{ throughBlock }`, and the
              *     `system.live_gap.put` kind carries
              *     `{ fromBlock, toBlock, reason: "not_filled" }`: blocks the live
@@ -2717,9 +2724,10 @@ export interface operations {
             /**
              * @description This processor has delivery disabled; query retained entities
              *     without following, or enable delivery. Or it publishes from
-             *     `attested` or `finalized` (`deferred_publication_snapshot`): its
-             *     retained state holds blocks not published yet, so follow the
-             *     change stream from its head instead.
+             *     `attested`, `confirmed` or `finalized`
+             *     (`deferred_publication_snapshot`): its retained state holds
+             *     blocks not published yet, so follow the change stream from its
+             *     head instead.
              */
             409: {
                 headers: {

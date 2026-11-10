@@ -654,7 +654,7 @@
             "id": "finality",
             "long": "finality",
             "short": null,
-            "help": "Lowest level that counts as a result: `unattested` (default), `attested`, or `finalized`",
+            "help": "Lowest level that counts as a result: `unattested` (default), `attested`, `confirmed`, or `finalized`",
             "required": false,
             "action": "Set",
             "defaultValues": [
@@ -663,6 +663,7 @@
             "possibleValues": [
               "unattested",
               "attested",
+              "confirmed",
               "finalized",
               "settled"
             ]
@@ -999,7 +1000,7 @@
                 "id": "finality",
                 "long": "finality",
                 "short": null,
-                "help": "Finality of the subscription state being reset (`unattested`, `attested` or `finalized`)",
+                "help": "Finality of the subscription state being reset (`unattested`, `attested`, `confirmed` or `finalized`)",
                 "required": false,
                 "action": "Set",
                 "defaultValues": [
@@ -1008,6 +1009,7 @@
                 "possibleValues": [
                   "unattested",
                   "attested",
+                  "confirmed",
                   "finalized",
                   "settled"
                 ]

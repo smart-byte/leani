@@ -155,16 +155,17 @@ Wherever a block number is accepted, including `fromBlock` and `toBlock` of
 |---|---|
 | `latest` | the head `eth_blockNumber` reports, at any level |
 | `finalized` | the newest canonical block the node has verified as finalized |
-| `safe` | the same block as `finalized` |
+| `safe` | the newest canonical block at `confirmed` or above; without `[confirmation]`, the same block as `finalized` |
 | `earliest` | block 0 |
 | `pending` | none: Leani builds no pending block, so `-32004` (`pending_block_unavailable`) |
 
 Until the node has verified a finalized block, `finalized` and `safe` fail
-with `-32004` (`finalized_block_unavailable`). Leani does not track the
-justified checkpoint that execution clients call safe, so `safe` names the
-finalized head, which is never newer. A client that waits for `safe` blocks
-to avoid reorgs therefore stays safe, but it sees an older block than other
-clients report.
+with `-32004` (`finalized_block_unavailable`). With `[confirmation]` active,
+`safe` follows Ethereum's Fast Confirmation Rule, as clients that enable it
+report, usually a block or two behind `latest`. Without it, Leani does not track the
+justified checkpoint that other execution clients call safe, so `safe` names
+the finalized head, which is never newer: a client that waits for `safe`
+blocks stays safe, but sees an older block than other clients report.
 
 Block lookups return `null` only for a number above every block the node
 knows exists: its canonical tip and the progress processor's indexed height. Ethereum clients read `null` as "no such block", and a

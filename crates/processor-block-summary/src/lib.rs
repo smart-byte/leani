@@ -200,16 +200,12 @@ impl Processor for BlockSummaryProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlockSummaryEntity = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(6);
+        let mut checksums = Vec::with_capacity(2 * Finality::BLOCK_LEVELS.len());
         // Dataset rows carry no execution-block size. A block a dataset
         // summarized first matches the same block from verified material,
         // such as the live lane's handoff overlap after a Xatu backfill.
         for size_bytes in [decoded.size_bytes, None] {
-            for finality in [
-                Finality::Unattested,
-                Finality::Attested,
-                Finality::Finalized,
-            ] {
+            for finality in Finality::BLOCK_LEVELS {
                 let mut entity = decoded.clone();
                 entity.finality = finality;
                 entity.size_bytes = size_bytes;
@@ -445,7 +441,7 @@ mod tests {
         let checksums = processor
             .finality_variant_checksums(&delta)
             .expect("variants");
-        assert_eq!(checksums.len(), 3);
+        assert_eq!(checksums.len(), Finality::BLOCK_LEVELS.len());
 
         let unrelated = EncodedDelta::new(
             processor.descriptor(),

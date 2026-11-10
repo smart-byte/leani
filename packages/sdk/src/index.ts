@@ -31,11 +31,12 @@ export type {
 import type { components } from "./openapi.generated.ts";
 
 export type Hex = `0x${string}`;
-export type Finality = "unattested" | "attested" | "finalized" | "settled";
+export type Finality = "unattested" | "attested" | "confirmed" | "finalized" | "settled";
 export type ChangeOperation =
   | "apply"
   | "undo"
   | "attested"
+  | "confirmed"
   | "finalized"
   | "settled"
   | "reset_required";
@@ -484,7 +485,7 @@ export interface LiveGapChangeData {
 /** System transitions never pretend to contain a processor entity payload. */
 export type ChangeEnvelope<T = unknown> = ChangeMetadata & (
   | { operation: "apply" | "undo"; data: T | null }
-  | { operation: "attested"; data: { throughBlock: number } }
+  | { operation: "attested" | "confirmed"; data: { throughBlock: number } }
   | { operation: "finalized"; data: { throughBlock: number } }
   | { operation: "finalized"; data: LiveGapChangeData }
   | { operation: "settled"; data: { throughBlock: number } }
@@ -1794,7 +1795,9 @@ function validateChangeEnvelope(value: ChangeEnvelope): void {
     !/^\d+$/.test(value.sequence) ||
     typeof value.cursor !== "string" ||
     value.cursor.length === 0 ||
-    !["apply", "undo", "attested", "finalized", "settled", "reset_required"].includes(value.operation) ||
+    !["apply", "undo", "attested", "confirmed", "finalized", "settled", "reset_required"].includes(
+      value.operation,
+    ) ||
     typeof value.schema !== "string" ||
     value.schema.length === 0
   ) {

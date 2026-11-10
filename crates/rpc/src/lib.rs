@@ -260,6 +260,9 @@ pub struct RpcConfig {
     /// Tracks open WebSocket connections, which outlive their listener's
     /// graceful shutdown, so the node can wait for their close frames.
     pub websocket_sessions: TaskTracker,
+    /// Whether `safe` names the newest confirmed block, while
+    /// `[confirmation]` is active, instead of the finalized head.
+    pub confirmed_safe: bool,
 }
 
 impl Default for RpcConfig {
@@ -283,6 +286,7 @@ impl Default for RpcConfig {
             outbound_budget: RpcOutboundBudget::default(),
             shutdown: CancellationToken::new(),
             websocket_sessions: TaskTracker::new(),
+            confirmed_safe: false,
         }
     }
 }
@@ -2258,8 +2262,10 @@ async fn eth_get_transaction_receipt(
 #[derive(Clone, Copy, Debug)]
 enum BlockSelector {
     Latest,
-    /// The verified finalized head, which `finalized` and `safe` name.
+    /// The verified finalized head.
     Finalized,
+    /// See [`safe_head`].
+    Safe,
     Number(BlockNumber),
     Hash(BlockHash),
 }
@@ -2329,9 +2335,8 @@ fn parse_block_selector(value: &Value) -> Result<BlockSelector, RpcError> {
         .ok_or_else(|| RpcError::invalid_params("block selector must be a string"))?;
     match value {
         "latest" => Ok(BlockSelector::Latest),
-        // Leani does not track the justified checkpoint other clients call
-        // safe; the finalized head is never newer, so it is safe too.
-        "finalized" | "safe" => Ok(BlockSelector::Finalized),
+        "finalized" => Ok(BlockSelector::Finalized),
+        "safe" => Ok(BlockSelector::Safe),
         "earliest" => Ok(BlockSelector::Number(BlockNumber(0))),
         // Leani builds no pending block.
         "pending" => Err(RpcError::data_unavailable_reason(
@@ -2354,6 +2359,7 @@ async fn resolve_canonical_frame(
     let (number, on_demand) = match selector {
         BlockSelector::Latest => (reported_head(state).await?, true),
         BlockSelector::Finalized => (Some(finalized_head(state).await?), true),
+        BlockSelector::Safe => (Some(safe_head(state).await?), true),
         BlockSelector::Number(number) => (Some(number), true),
         BlockSelector::Hash(_) => {
             return Err(RpcError::invalid_params(
@@ -2404,6 +2410,23 @@ async fn finalized_head(state: &RpcState) -> Result<BlockNumber, RpcError> {
     state
         .store
         .finalized_canonical_head(state.config.chain_id)
+        .await
+        .map_err(|error| RpcError::store(&error))?
+        .map(|head| head.number)
+        .ok_or_else(|| RpcError::data_unavailable_reason("finalized_block_unavailable"))
+}
+
+/// The block `safe` names: the newest confirmed one while `[confirmation]`
+/// is active, else the finalized head. Leani tracks no justified
+/// checkpoint, which other clients name without Fast Confirmation, and the
+/// finalized head is never newer.
+async fn safe_head(state: &RpcState) -> Result<BlockNumber, RpcError> {
+    if !state.config.confirmed_safe {
+        return finalized_head(state).await;
+    }
+    state
+        .store
+        .canonical_head_at_least(state.config.chain_id, Finality::Confirmed)
         .await
         .map_err(|error| RpcError::store(&error))?
         .map(|head| head.number)
@@ -2919,6 +2942,7 @@ async fn log_range_bound(
             RpcError::data_unavailable_reason("latest_block_unavailable_for_open_log_range")
         }),
         BlockSelector::Finalized => finalized_head(state).await,
+        BlockSelector::Safe => safe_head(state).await,
         BlockSelector::Number(number) => Ok(number),
         BlockSelector::Hash(_) => Err(RpcError::invalid_params(
             "fromBlock and toBlock must be block numbers or tags",
@@ -5527,6 +5551,36 @@ mod tests {
         .await;
         let body = body.expect("body");
         assert_eq!(body["error"]["code"], INVALID_PARAMS, "{body}");
+    }
+
+    #[tokio::test]
+    async fn safe_names_the_newest_confirmed_block_only_while_confirmation_is_active() {
+        let (mut state, store, _directory) = test_state_and_store().await;
+        let finalized = rpc_frame(7);
+        let mut confirmed = rpc_frame_after(&finalized);
+        confirmed.finality = Finality::Confirmed;
+        let mut attested = rpc_frame_after(&confirmed);
+        attested.finality = Finality::Attested;
+        for frame in [&finalized, &confirmed, &attested] {
+            store.store_recent_frame(frame).await.expect("recent frame");
+        }
+        for (active, expected) in [(true, "0x8"), (false, "0x7")] {
+            state.config.confirmed_safe = active;
+            let router = http_router_with_progress(
+                state.store.clone(),
+                state.progress.clone(),
+                state.blob_schedule.clone(),
+                state.config.clone(),
+                state.committed_events.clone(),
+            );
+            let (_, body) = call(
+                router,
+                rpc_call("eth_getBlockByNumber", json!(["safe", false])),
+            )
+            .await;
+            let body = body.expect("body");
+            assert_eq!(body["result"]["number"], expected, "{active}: {body}");
+        }
     }
 
     #[tokio::test]

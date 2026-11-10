@@ -317,6 +317,7 @@ mod tests {
             beacon_block_root: [0; 32],
             block_number: leani_primitives::BlockNumber(0),
             block_hash: leani_primitives::BlockHash::ZERO,
+            sync_participants: 512,
         }
     }
 

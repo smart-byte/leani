@@ -729,6 +729,25 @@ again, across reconnects, until the lanes restart. Stale updates are retried,
 so neither ends the finality stream. An exhausted peer set logs a warning at
 most every five minutes.
 
+### Confirmation stalled or a confirmed block reorged
+
+When `[confirmation]` endpoints stall, reset, or disagree, nothing new is
+confirmed: blocks keep their level, `publish = "confirmed"` processors hold
+their changes until `finalized` releases them, and JSON-RPC `safe` stops
+advancing until the finalized head passes it. An endpoint's stream failure
+logs a warning and reconnects with backoff of up to 30 seconds.
+`/v1/network/status` shows each endpoint's state (`connecting`, `connected`,
+`stale`, `reset`, `error`) and the head they last agreed on under
+`network.confirmation`, and `leani_confirmation_lag_slots` in `/metrics`
+grows from its usual one or two slots while they stall. Check the endpoint,
+or name more endpoints and raise `minimum_agreement`.
+
+A reorg that reverts a `confirmed` block logs an error and counts in
+`leani_live_confirmed_reorgs_total`: the Fast Confirmation Rule's synchrony
+or honesty assumptions failed, or an endpoint misled the node. The blocks are
+undone as for any reorg. Review the endpoints before trusting `confirmed`
+again; `endpoints = []` turns the level off.
+
 ### Network fork this release does not support
 
 Each release verifies the consensus forks it knows. Both finality kinds know

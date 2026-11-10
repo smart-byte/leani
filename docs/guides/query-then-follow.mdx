@@ -18,7 +18,7 @@ boundary to `subscribe({ after })` closes the gap.
 
 <Aside type="caution" title="Unattested publication only">
   `query-and-follow` answers `409 deferred_publication_snapshot` for a
-  processor with `publish = "attested"` or `publish = "finalized"`. Its
+  processor with `publish = "attested"`, `"confirmed"` or `"finalized"`. Its
   retained state already holds blocks whose changes are unpublished, and the
   stream never emits an undo for them, so a snapshot could seed rows no later
   event corrects. Follow such a processor's change stream from its head

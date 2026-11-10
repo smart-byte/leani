@@ -71,7 +71,7 @@ JSON body send `x-leani-request: 1`, which the node requires.
 
 Typed subscriptions accept a configured `processor` instance when a kind is
 ambiguous. `blobs.subscribe()` yields a `{ block, transactions }` payload on
-apply. Check `operation` before reading processor data: an `attested`,
+apply. Check `operation` before reading processor data: an `attested`, `confirmed`,
 `finalized`, or `settled` event has `{ throughBlock }` instead, or, when `isLiveGapChange()` holds, the
 `{ fromBlock, toBlock }` the live lane skipped. Pass an `AbortSignal` to stop an idle stream;
 leaving the loop cancels its response body.

@@ -40,16 +40,19 @@ leani subscribe blocks --format json |
   jq '{block: .blockNumber, transactions: .transactionCount, gas: .gasUsed, baseFee: .baseFeePerGas}'
 ```
 
-Rows say `unattested`, `attested` or `finalized`, and JSON reports the same
-`finality`; see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes). Use `--finality attested` or
-`--finality finalized` when the first result must have that level, and on a
-rollup with an L1 anchor `--finality settled` for blocks its settlement
-contracts accepted. Attached
+Rows say `unattested`, `attested`, `confirmed` or `finalized`, and JSON reports
+the same `finality`; see [finality levels](/docs/concepts/coverage-finality-and-reorgs/#finality-levels-and-publish-modes). Use `--finality attested`,
+`--finality confirmed` or `--finality finalized` when the first result must
+have that level; `confirmed` needs a node with `[confirmation]` endpoints,
+which Ethereum Mainnet's defaults name, and a block they do not confirm
+prints once it is finalized. On a rollup with an L1 anchor,
+`--finality settled` waits for blocks its settlement contracts accepted.
+Attached
 output follows the node's configured source trust; a dataset's finality label
 does not become a cryptographic proof simply by subscribing to it. Against a
-node that publishes unattested blocks, an attached `--finality attested` or
-`--finality finalized` subscription prints each block once the node's marker
-for that level covers it.
+node that publishes unattested blocks, an attached `--finality attested`,
+`--finality confirmed` or `--finality finalized` subscription prints each
+block once the node's marker for that level, or a higher one, covers it.
 
 During a reorg, each reverted block prints again with `"operation": "undo"`
 (an `undo` suffix in the terminal), however late the undo arrives. The undo
