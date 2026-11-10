@@ -17,6 +17,12 @@ ignore = [
   # wasmtimer in for wasm32 only, which leani never builds the node for.
   # Revisit on every Helios bump.
   { id = "RUSTSEC-2026-0441", reason = "pin-utils is inherited through helios-consensus-core's wasm32-only wasmtimer, whose newest release still needs it" },
+  # The SQLite bundled in libsqlite3-sys 0.30.1 can return uninitialized memory
+  # when a database is opened beside a `-wal` file of another page size. The
+  # fix needs libsqlite3-sys 0.39, and sqlx 0.9.0, its newest release, allows
+  # only versions below 0.38. The node opens only the databases in its own
+  # data directory. Remove on the sqlx bump that allows 0.39.
+  { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 is capped by sqlx 0.9.0, whose newest release allows no patched version" },
 ]
 
 [licenses]
