@@ -28,7 +28,7 @@ alloy-primitives = { workspace = true, features = ["k256"] }
 alloy-rlp.workspace = true
 alloy-rpc-types-eth.workspace = true
 alloy-trie = "0.9.8"
-base64 = "0.22"
+base64 = "0.23"
 flate2.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
