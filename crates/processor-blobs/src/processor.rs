@@ -290,12 +290,8 @@ impl Processor for BlobsProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: BlobsDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(3);
-        for finality in [
-            Finality::Unattested,
-            Finality::Attested,
-            Finality::Finalized,
-        ] {
+        let mut checksums = Vec::with_capacity(Finality::BLOCK_LEVELS.len());
+        for finality in Finality::BLOCK_LEVELS {
             let mut variant = decoded.clone();
             variant.block.finality = finality;
             let payload = postcard::to_allocvec(&variant)
@@ -850,7 +846,7 @@ pub(crate) mod tests {
         let variants = processor
             .finality_variant_checksums(&encoded)
             .expect("finality variants");
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), Finality::BLOCK_LEVELS.len());
         assert!(variants.contains(&encoded.checksum));
         let decoded: BlobsDelta = postcard::from_bytes(&encoded.payload).expect("decode");
         assert_eq!(quantity_to_u256(decoded.block.blob_base_fee), U256::from(1));

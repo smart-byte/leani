@@ -343,12 +343,8 @@ impl Processor for EvmEventsProcessor {
         delta.validate(&self.descriptor)?;
         let decoded: EventDelta = postcard::from_bytes(&delta.payload)
             .map_err(|error| ProcessorError::DeltaPayload(error.to_string()))?;
-        let mut checksums = Vec::with_capacity(3);
-        for finality in [
-            Finality::Unattested,
-            Finality::Attested,
-            Finality::Finalized,
-        ] {
+        let mut checksums = Vec::with_capacity(Finality::BLOCK_LEVELS.len());
+        for finality in Finality::BLOCK_LEVELS {
             let mut variant = decoded.clone();
             for event in &mut variant.events {
                 event.entity.finality = finality;
@@ -1030,7 +1026,7 @@ mod tests {
             let variants = processor
                 .finality_variant_checksums(delta)
                 .expect("finality variants");
-            assert_eq!(variants.len(), 3);
+            assert_eq!(variants.len(), Finality::BLOCK_LEVELS.len());
             assert!(variants.contains(&included_delta.checksum));
             assert!(variants.contains(&finalized_delta.checksum));
             assert!(!variants.contains(&other.checksum));

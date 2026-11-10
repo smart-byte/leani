@@ -37,6 +37,10 @@ pub struct Config {
     pub budgets: BudgetConfig,
     pub sources: SourcesConfig,
     pub finality: FinalityConfig,
+    /// The endpoints behind the `confirmed` level. Ethereum Mainnet's
+    /// defaults name one; other chains have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationConfig>,
     /// Finalize a rollup's blocks from its Ethereum settlement contracts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub l1_anchor: Option<L1AnchorConfig>,
@@ -44,6 +48,19 @@ pub struct Config {
     pub processors: Vec<ProcessorConfig>,
     pub rpc: RpcConfig,
     pub api: ApiConfig,
+}
+
+/// Endpoints whose Fast Confirmation events back the `confirmed` level.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConfirmationConfig {
+    /// FCR-enabled consensus nodes whose `fast_confirmation` events this
+    /// node trusts to say which attested blocks are confirmed. Empty
+    /// disables `confirmed`.
+    #[serde(default)]
+    pub endpoints: Vec<Url>,
+    #[serde(default = "default_minimum_agreement")]
+    pub minimum_agreement: usize,
 }
 
 /// The opt-in L1 anchor: verified Ethereum finality names finalized L1
@@ -127,6 +144,9 @@ pub(crate) struct StarterConfig {
     /// anchor has none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finality: Option<StarterFinalityConfig>,
+    /// Replaces the chain's default `[confirmation]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confirmation: Option<ConfirmationConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocks: Option<StarterBlocksConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -195,6 +215,7 @@ impl StarterConfig {
             network: "ethereum-mainnet".to_owned(),
             data_dir,
             finality: Some(finality),
+            confirmation: None,
             blocks: None,
             uniswap: Some(StarterUniswapConfig { markets }),
             api: StarterApiConfig::default(),
@@ -211,6 +232,7 @@ impl StarterConfig {
             network,
             data_dir,
             finality,
+            confirmation: None,
             blocks: Some(StarterBlocksConfig::default()),
             uniswap: None,
             api: StarterApiConfig::default(),
@@ -279,6 +301,9 @@ impl StarterConfig {
 
         config.config_version = self.config_version;
         config.data_dir = self.data_dir;
+        if self.confirmation.is_some() {
+            config.confirmation = self.confirmation;
+        }
         config.processors = vec![processor];
         config.api.bind = self.api.bind;
         config.api.allow_wasm_builds = self.api.allow_wasm_builds;
@@ -1127,6 +1152,7 @@ impl ProcessorConfig {
             (DeliveryEmit::JobResult, _) => PublicationPolicy::JobResult,
             (DeliveryEmit::Changes, PublishMode::Unattested) => PublicationPolicy::Unattested,
             (DeliveryEmit::Changes, PublishMode::Attested) => PublicationPolicy::Attested,
+            (DeliveryEmit::Changes, PublishMode::Confirmed) => PublicationPolicy::Confirmed,
             (DeliveryEmit::Changes, PublishMode::Finalized) => PublicationPolicy::Finalized,
             (DeliveryEmit::Changes, PublishMode::Settled) => PublicationPolicy::Settled,
         }
@@ -1174,6 +1200,8 @@ pub enum PublishMode {
     #[default]
     Unattested,
     Attested,
+    /// Needs active `[confirmation]`.
+    Confirmed,
     Finalized,
     /// A rollup's settled blocks: finalized ones wait until its settlement
     /// contracts on Ethereum accept them. Needs an L1 anchor.
@@ -1765,6 +1793,8 @@ impl Config {
         if chain.chain_id == config.chain.chain_id {
             return Ok(config);
         }
+        // Mainnet's endpoints confirm Mainnet only.
+        config.confirmation = None;
         config.chain = ChainConfig {
             name: chain.name.clone(),
             chain_id: chain.chain_id,
@@ -2173,11 +2203,42 @@ impl Config {
         Ok((config, warnings))
     }
 
+    /// The `[confirmation]` section that applies: one with endpoints, on an
+    /// Ethereum chain the `p2p` live lane follows under verified finality.
+    /// Any other section with endpoints is inert.
+    #[must_use]
+    pub fn active_confirmation(&self) -> Option<&ConfirmationConfig> {
+        self.confirmation.as_ref().filter(|confirmation| {
+            !confirmation.endpoints.is_empty()
+                && self.sources.live.kind.primary() == LiveSourceKind::P2p
+                && matches!(
+                    self.finality.kind,
+                    FinalitySourceKind::BeaconApi | FinalitySourceKind::ConsensusP2p
+                )
+                && self
+                    .chain_entry()
+                    .is_ok_and(|entry| entry.family == leani_chain::Family::Ethereum)
+        })
+    }
+
     /// Settings the operator should know about: deprecated ones, which the
-    /// node ignores, and node-side builds.
+    /// node ignores, node-side builds, and an inert `[confirmation]`.
     #[must_use]
     pub fn setting_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
+        if self
+            .confirmation
+            .as_ref()
+            .is_some_and(|confirmation| !confirmation.endpoints.is_empty())
+            && self.active_confirmation().is_none()
+            && self
+                .chain_entry()
+                .is_ok_and(|entry| entry.family == leani_chain::Family::Ethereum)
+        {
+            warnings.push(
+                "[confirmation] is inert: the confirmed level needs the p2p live source and beacon_api or consensus_p2p finality".to_owned(),
+            );
+        }
         if self.rpc.transaction_locator.is_some() {
             warnings
                 .push("rpc.transaction_locator is deprecated and ignored; remove it".to_owned());
@@ -2489,6 +2550,7 @@ impl Config {
             ));
         }
         validate_finality(&self.finality, &mut errors);
+        validate_confirmation(self, &mut errors);
         let rpc_live = self.sources.live.kind.primary() == LiveSourceKind::JsonRpc;
         let rpc_finality = matches!(
             self.finality.kind,
@@ -3272,6 +3334,62 @@ fn validate_artifact_storage(
             "artifact_storage.maximum_segment_physical_bytes",
             "must not exceed budgets.store.maximum_physical_bytes",
         ));
+    }
+}
+
+fn validate_confirmation(config: &Config, errors: &mut Vec<ValidationError>) {
+    if let Some(confirmation) = config
+        .confirmation
+        .as_ref()
+        .filter(|confirmation| !confirmation.endpoints.is_empty())
+    {
+        if config
+            .chain_entry()
+            .is_ok_and(|entry| entry.family != leani_chain::Family::Ethereum)
+        {
+            errors.push(ValidationError::new(
+                "confirmation",
+                "applies to Ethereum chains only; remove the section",
+            ));
+        }
+        if confirmation.minimum_agreement == 0
+            || confirmation.minimum_agreement > confirmation.endpoints.len()
+        {
+            errors.push(ValidationError::new(
+                "confirmation.minimum_agreement",
+                "must be within 1..=the number of endpoints",
+            ));
+        }
+        let mut identities = HashMap::new();
+        for (index, endpoint) in confirmation.endpoints.iter().enumerate() {
+            if !matches!(endpoint.scheme(), "http" | "https") {
+                errors.push(ValidationError::new(
+                    format!("confirmation.endpoints[{index}]"),
+                    "only http and https URLs are supported",
+                ));
+            }
+            let first = *identities
+                .entry(finality_endpoint_identity(endpoint))
+                .or_insert(index);
+            if first != index {
+                errors.push(ValidationError::new(
+                    format!("confirmation.endpoints[{index}]"),
+                    format!(
+                        "duplicates confirmation.endpoints[{first}]; each endpoint counts once toward agreement"
+                    ),
+                ));
+            }
+        }
+    }
+    if config.active_confirmation().is_none() {
+        for (index, processor) in config.processors.iter().enumerate() {
+            if processor.publish == Some(PublishMode::Confirmed) {
+                errors.push(ValidationError::new(
+                    format!("processors[{index}].publish"),
+                    "confirmed needs [confirmation] endpoints, the p2p live source, and beacon_api or consensus_p2p finality",
+                ));
+            }
+        }
     }
 }
 
@@ -4131,6 +4249,89 @@ verification_segment_blocks = 8192"#;
         assert_eq!(
             config.artifact_storage.compression,
             leani_store_artifacts::ArtifactCompression::Snappy
+        );
+    }
+
+    #[test]
+    fn confirmation_applies_on_ethereum_under_the_p2p_lane_and_verified_finality() {
+        let defaults = Config::ethereum_mainnet_defaults().expect("defaults");
+        assert_eq!(
+            defaults
+                .confirmation
+                .as_ref()
+                .map(|confirmation| confirmation.endpoints.len()),
+            Some(1)
+        );
+        let sepolia = leani_chain::ChainRegistry::standard()
+            .get("sepolia")
+            .expect("sepolia");
+        assert!(
+            Config::chain_defaults(&sepolia)
+                .expect("sepolia defaults")
+                .confirmation
+                .is_none(),
+            "Mainnet's endpoints confirm Mainnet only"
+        );
+
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let compact = |section: &str| {
+            let path = temp.path().join("leani.toml");
+            let document = format!("{}{section}", compact_blocks_config("ethereum-mainnet"));
+            fs::write(&path, document).expect("write config");
+            Config::load(&path)
+                .expect("compact config")
+                .active_confirmation()
+                .map(|confirmation| confirmation.endpoints.clone())
+        };
+        assert_eq!(compact("").map(|endpoints| endpoints.len()), Some(1));
+        assert_eq!(compact("\n[confirmation]\nendpoints = []\n"), None);
+        assert_eq!(
+            compact("\n[confirmation]\nendpoints = [\"http://127.0.0.1:5052/\"]\n"),
+            Some(vec![Url::parse("http://127.0.0.1:5052/").expect("url")])
+        );
+
+        let mut config = config();
+        assert!(
+            config.active_confirmation().is_none(),
+            "an explicit configuration without the section"
+        );
+        config.processors[0].publish = Some(PublishMode::Confirmed);
+        let refused = |config: &Config, field: &str| {
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == field)
+        };
+        assert!(refused(&config, "processors[0].publish"));
+        let endpoint = Url::parse("https://beacon.example/").expect("url");
+        config.confirmation = Some(ConfirmationConfig {
+            endpoints: vec![endpoint.clone()],
+            minimum_agreement: 1,
+        });
+        assert!(config.active_confirmation().is_some());
+        assert!(!refused(&config, "processors[0].publish"));
+        assert_eq!(
+            config.processors[0].publication_policy(),
+            PublicationPolicy::Confirmed
+        );
+        config.confirmation = Some(ConfirmationConfig {
+            endpoints: vec![endpoint.clone(), endpoint],
+            minimum_agreement: 3,
+        });
+        assert!(refused(&config, "confirmation.minimum_agreement"));
+        assert!(refused(&config, "confirmation.endpoints[1]"));
+        config
+            .confirmation
+            .as_mut()
+            .expect("section")
+            .minimum_agreement = 1;
+        config.finality.kind = FinalitySourceKind::Disabled;
+        assert!(config.active_confirmation().is_none());
+        assert!(
+            config
+                .setting_warnings()
+                .iter()
+                .any(|warning| warning.contains("[confirmation] is inert"))
         );
     }
 

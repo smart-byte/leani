@@ -170,7 +170,7 @@ satisfied, 130 interrupted before --once was satisfied.")]
         #[arg(long, env = "LEANI_API_TOKEN", hide_env_values = true)]
         token: Option<String>,
         /// Lowest level that counts as a result: `unattested` (default),
-        /// `attested`, or `finalized`.
+        /// `attested`, `confirmed`, or `finalized`.
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Finality transport for the embedded runtime.
@@ -571,6 +571,9 @@ pub enum SubscribeFinality {
     /// Print blocks once the sync committee attested them; a reorg can still
     /// remove them.
     Attested,
+    /// Print blocks once the node's `[confirmation]` endpoints report that
+    /// Ethereum's Fast Confirmation Rule confirmed them.
+    Confirmed,
     /// Print blocks only after Ethereum consensus has finalized them, or,
     /// on a rollup, the Ethereum block carrying their batch.
     Finalized,
@@ -586,6 +589,7 @@ impl SubscribeFinality {
         match self {
             Self::Unattested => leani_primitives::Finality::Unattested,
             Self::Attested => leani_primitives::Finality::Attested,
+            Self::Confirmed => leani_primitives::Finality::Confirmed,
             Self::Finalized => leani_primitives::Finality::Finalized,
             Self::Settled => leani_primitives::Finality::Settled,
         }
@@ -603,6 +607,7 @@ impl SubscribeFinality {
         match self {
             Self::Unattested => crate::config::PublishMode::Unattested,
             Self::Attested => crate::config::PublishMode::Attested,
+            Self::Confirmed => crate::config::PublishMode::Confirmed,
             Self::Finalized => crate::config::PublishMode::Finalized,
             Self::Settled => crate::config::PublishMode::Settled,
         }
@@ -639,7 +644,7 @@ pub enum ResetCommand {
         #[arg(num_args = 0.., value_name = "TARGET")]
         targets: Vec<String>,
         /// Finality of the subscription state being reset (`unattested`,
-        /// `attested` or `finalized`).
+        /// `attested`, `confirmed` or `finalized`).
         #[arg(long, value_enum, default_value_t = SubscribeFinality::Unattested)]
         finality: SubscribeFinality,
         /// Exact embedded subscription directory to reset.

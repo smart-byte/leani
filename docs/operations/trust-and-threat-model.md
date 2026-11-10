@@ -19,6 +19,14 @@ status: preview
 
 ## Trust boundaries
 
+`[confirmation]` endpoints are trusted for one judgement: that Ethereum's
+Fast Confirmation Rule confirmed a beacon root. Their events count only for
+roots this node verified as attested with at least 384 of 512 sync-committee
+signers, and only while it holds that block canonical, so a wrong endpoint can
+at worst label as `confirmed` a block the node already follows as attested.
+They cannot add blocks, change data, or move `attested` or `finalized`.
+`/v1/network/status` lists them and their state under `network.confirmation`.
+
 Public datasets, Beacon/HTTP endpoints, and consensus P2P peers are untrusted transports. A source
 descriptor declares which completeness claims are dataset-trusted and which
 commitments were cryptographically verified. Execution P2P peers are

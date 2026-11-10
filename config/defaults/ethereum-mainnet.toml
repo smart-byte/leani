@@ -53,6 +53,13 @@ endpoints = [
 ]
 minimum_agreement = 1
 
+[confirmation]
+# Consensus nodes with Fast Confirmation enabled. Their fast_confirmation
+# events mark blocks this node verified as attested `confirmed`; they serve no
+# chain data. A public third-party node: run your own for production.
+endpoints = ["https://lodestar-mainnet.chainsafe.io/"]
+minimum_agreement = 1
+
 [rpc]
 http_bind = "127.0.0.1:18545"
 ws_bind = "127.0.0.1:18546"

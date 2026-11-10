@@ -105,7 +105,7 @@ impl FinalityModel {
     pub const fn supports(self, required: Finality) -> bool {
         match self {
             Self::None => false,
-            Self::Attested => matches!(required, Finality::Unattested | Finality::Attested),
+            Self::Attested => required.rank() <= Finality::Attested.rank(),
             // Settlement is a rollup's finality event, never a block's
             // delivered level.
             Self::Finalized => !matches!(required, Finality::Settled),
@@ -379,10 +379,6 @@ pub enum FinalityEvent {
         block_hash: BlockHash,
         beacon_slot: u64,
     },
-    Safe {
-        block_hash: BlockHash,
-        beacon_slot: u64,
-    },
     /// A verified finalized execution block. Its number and hash come from
     /// the execution payload proof of the finalized beacon header.
     Finalized {
@@ -419,6 +415,9 @@ pub struct AttestedHead {
     pub beacon_block_root: [u8; 32],
     pub block_number: BlockNumber,
     pub block_hash: BlockHash,
+    /// Sync-committee members whose signature the head carries, out of 512;
+    /// 0 for a head no sync committee signs, such as a rollup sequencer's.
+    pub sync_participants: u64,
 }
 
 /// Publishes the newest verified [`AttestedHead`] to the execution live lane,
@@ -443,15 +442,22 @@ impl AttestedHeadPublisher {
         Self::default()
     }
 
-    /// Publish a verified head if its beacon slot is newer than the latest.
-    /// Returns whether it was published.
+    /// Publish a verified head if its beacon slot is newer than the latest,
+    /// or it is the latest head with more signatures. Returns whether it was
+    /// published.
     pub fn publish(&self, head: AttestedHead) -> bool {
         self.0.send_if_modified(|latest| {
-            if latest.is_some_and(|latest| latest.beacon_slot >= head.beacon_slot) {
-                return false;
+            let replaces = latest.is_none_or(|latest| {
+                latest.beacon_slot < head.beacon_slot
+                    || (latest.beacon_slot == head.beacon_slot
+                        && latest.beacon_block_root == head.beacon_block_root
+                        && latest.block_hash == head.block_hash
+                        && latest.sync_participants < head.sync_participants)
+            });
+            if replaces {
+                *latest = Some(head);
             }
-            *latest = Some(head);
-            true
+            replaces
         })
     }
 
@@ -490,6 +496,16 @@ impl AttestedHeadReceiver {
     pub async fn changed(&mut self) -> bool {
         self.0.changed().await.is_ok()
     }
+}
+
+/// What the operator's confirmation endpoints confirm now: each fresh
+/// endpoint's newest Fast Confirmation, as the attested head it names, and
+/// how many endpoints must agree. A vote's block counts only once the live
+/// lane holds it canonical and attested.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ConfirmationVotes {
+    pub minimum_agreement: usize,
+    pub votes: Vec<AttestedHead>,
 }
 
 /// Optional non-range lookup families implemented by a historical source.
@@ -759,6 +775,7 @@ mod tests {
             beacon_block_root: [marker; 32],
             block_number: BlockNumber(block),
             block_hash: BlockHash::new([marker; 32]),
+            sync_participants: 400,
         }
     }
 
@@ -775,6 +792,13 @@ mod tests {
         assert!(!heads.publish(head(99, 999, 2)));
         assert!(!heads.publish(head(100, 1_000, 3)));
         assert_eq!(heads.latest(), Some(head(100, 1_000, 1)));
+        let better = AttestedHead {
+            sync_participants: 512,
+            ..head(100, 1_000, 1)
+        };
+        assert!(heads.publish(better));
+        assert!(!heads.publish(head(100, 1_000, 1)));
+        assert_eq!(follower.latest(), Some(better));
         // A newer slot on another branch, even at a lower block, replaces it.
         assert!(heads.publish(head(101, 999, 4)));
         assert_eq!(follower.peek(), Some(head(101, 999, 4)));

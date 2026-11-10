@@ -53,9 +53,11 @@ use leani_processor_blobs::{
 };
 use leani_processor_erc20::{BALANCE_CHANGE_KIND, TokenBalanceEntity};
 use leani_processor_uniswap::PoolPriceEntity;
+use leani_source_api::{
+    LIVE_DELIVERY_LEVELS, NetworkTelemetry, NetworkTelemetrySnapshot, UnattestedUndo, coverage_gaps,
+};
 #[cfg(test)]
 use leani_source_api::{NetworkPeerOrigin, NetworkPeerQualification};
-use leani_source_api::{NetworkTelemetry, NetworkTelemetrySnapshot, UnattestedUndo, coverage_gaps};
 use leani_store_history::{
     RawHistoryIndexPolicy, RawHistoryJob, RawHistoryJobDeletion, RawHistoryMaterialProfile,
     RawHistoryRetention, RawHistorySegmentPolicy, VerificationClass,
@@ -2592,43 +2594,36 @@ pub struct RequestedRange {
 
 /// Split covered ranges at level boundaries so each interval carries the
 /// exact level of every block inside it. Every input must be normalized
-/// (ascending, non-overlapping); `finalized` labels its intersection with
-/// `coverage` first, then `unattested` its own, and everything else is
-/// attested.
+/// (ascending, non-overlapping). `levels` names the ranges at each level but
+/// attested: a block in several takes the first, and one in none is attested.
 fn labeled_coverage_intervals(
     coverage: &[BlockRange],
-    finalized: &[BlockRange],
-    unattested: &[BlockRange],
+    levels: &[(Finality, &[BlockRange])],
 ) -> Vec<CoverageInterval> {
     let mut intervals = Vec::new();
-    let mut finalized = finalized.iter().peekable();
-    let mut unattested = unattested.iter().peekable();
+    let mut levels = levels
+        .iter()
+        .map(|(level, ranges)| (*level, ranges.iter().peekable()))
+        .collect::<Vec<_>>();
     for range in coverage {
         let mut cursor = range.start().0;
         let end = range.end().0;
         loop {
-            while finalized.next_if(|range| range.end().0 < cursor).is_some() {}
-            while unattested.next_if(|range| range.end().0 < cursor).is_some() {}
             // The level at `cursor`, and the last block that level holds for.
-            let (last, level) = match (finalized.peek(), unattested.peek()) {
-                (Some(range), _) if range.start().0 <= cursor => {
-                    (range.end().0, Finality::Finalized)
+            let mut last = u64::MAX;
+            let mut level = Finality::Attested;
+            for (named, ranges) in &mut levels {
+                while ranges.next_if(|range| range.end().0 < cursor).is_some() {}
+                match ranges.peek() {
+                    Some(range) if range.start().0 <= cursor => {
+                        last = last.min(range.end().0);
+                        level = *named;
+                        break;
+                    }
+                    Some(range) => last = last.min(range.start().0 - 1),
+                    None => {}
                 }
-                (next_finalized, Some(range)) if range.start().0 <= cursor => (
-                    next_finalized
-                        .map_or(range.end().0, |next| range.end().0.min(next.start().0 - 1)),
-                    Finality::Unattested,
-                ),
-                (next_finalized, next_unattested) => (
-                    [next_finalized, next_unattested]
-                        .into_iter()
-                        .flatten()
-                        .map(|next| next.start().0 - 1)
-                        .min()
-                        .unwrap_or(u64::MAX),
-                    Finality::Attested,
-                ),
-            };
+            }
             let to_block = last.min(end);
             intervals.push(CoverageInterval {
                 from_block: cursor,
@@ -2733,15 +2728,25 @@ async fn coverage(
             BlockRange::new(BlockNumber(configured_start), cursor.block_number).ok()
         })
     });
-    let (ranges, finalized_ranges, unattested_ranges) = if let Some(range) = query_range {
-        (
-            state.store.coverage(descriptor, range).await?,
-            state.store.finalized_coverage(descriptor, range).await?,
-            state.store.unattested_coverage(descriptor, range).await?,
-        )
-    } else {
-        (Vec::new(), Vec::new(), Vec::new())
-    };
+    // Levels only rise, so reading the highest first never labels a block
+    // promoted in between above its level.
+    let (ranges, finalized_ranges, confirmed_ranges, unattested_ranges) =
+        if let Some(range) = query_range {
+            (
+                state.store.coverage(descriptor, range).await?,
+                state.store.finalized_coverage(descriptor, range).await?,
+                state
+                    .store
+                    .unfinalized_coverage(descriptor, range, Finality::Confirmed)
+                    .await?,
+                state
+                    .store
+                    .unfinalized_coverage(descriptor, range, Finality::Unattested)
+                    .await?,
+            )
+        } else {
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new())
+        };
     let finalized_through = state.store.finalized_through(descriptor).await?;
     let chain_finalized_head = state
         .store
@@ -2783,7 +2788,14 @@ async fn coverage(
             to_block: range.end().0,
         }),
         available: settled_intervals(
-            labeled_coverage_intervals(&ranges, &finalized_ranges, &unattested_ranges),
+            labeled_coverage_intervals(
+                &ranges,
+                &[
+                    (Finality::Finalized, &finalized_ranges),
+                    (Finality::Confirmed, &confirmed_ranges),
+                    (Finality::Unattested, &unattested_ranges),
+                ],
+            ),
             settled,
         ),
         configured_start_block: configured_start,
@@ -3775,14 +3787,7 @@ fn append_network_session_metrics(
     }
     let levels = &network.live_levels;
     writeln!(output, "# TYPE leani_live_block_delay_seconds summary")?;
-    for (index, level) in [
-        Finality::Unattested,
-        Finality::Attested,
-        Finality::Finalized,
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    for (index, level) in LIVE_DELIVERY_LEVELS.into_iter().enumerate() {
         let milliseconds = levels.delay_milliseconds[index];
         writeln!(
             output,
@@ -3820,6 +3825,20 @@ fn append_network_session_metrics(
         "leani_live_unattested_held_total {}",
         levels.unattested_held
     )?;
+    writeln!(output, "# TYPE leani_live_confirmed_reorgs_total counter")?;
+    writeln!(
+        output,
+        "leani_live_confirmed_reorgs_total {}",
+        levels.confirmed_reorgs
+    )?;
+    if let Some(lag) = network
+        .confirmation
+        .as_ref()
+        .and_then(|confirmation| confirmation.lag_slots)
+    {
+        writeln!(output, "# TYPE leani_confirmation_lag_slots gauge")?;
+        writeln!(output, "leani_confirmation_lag_slots {lag}")?;
+    }
     Ok(())
 }
 
@@ -15043,6 +15062,22 @@ mod tests {
             "hot/cold handoff retained pending deltas",
             Duration::from_secs(30),
         );
+        telemetry.record_confirmed_reorg();
+        telemetry.set_confirmation(Some(leani_source_api::NetworkConfirmationSnapshot {
+            minimum_agreement: 1,
+            agreed_head: Some(leani_source_api::NetworkConfirmationHeadSnapshot {
+                beacon_slot: 15_569_676,
+                block_number: 19_426_619,
+                block_hash: BlockHash::new([0xc1; 32]).to_string(),
+            }),
+            lag_slots: Some(2),
+            endpoints: vec![leani_source_api::NetworkConfirmationEndpointSnapshot {
+                endpoint: "https://beacon.example/".to_owned(),
+                state: leani_source_api::NetworkConfirmationEndpointState::Stale,
+                last_event_slot: Some(15_569_676),
+                last_event_received_slot: Some(15_569_677),
+            }],
+        }));
         let router = router(
             store,
             Arc::new(BlobsProcessor::default()),
@@ -15106,6 +15141,25 @@ mod tests {
         assert_eq!(
             body["network"]["sessions"][0]["lastError"],
             "receipt timeout"
+        );
+        assert_eq!(body["network"]["liveLevels"]["confirmedReorgs"], 1);
+        assert_eq!(
+            body["network"]["confirmation"],
+            json!({
+                "minimumAgreement": 1,
+                "agreedHead": {
+                    "beaconSlot": 15_569_676,
+                    "blockNumber": 19_426_619,
+                    "blockHash": format!("0x{}", "c1".repeat(32)),
+                },
+                "lagSlots": 2,
+                "endpoints": [{
+                    "endpoint": "https://beacon.example/",
+                    "state": "stale",
+                    "lastEventSlot": 15_569_676,
+                    "lastEventReceivedSlot": 15_569_677,
+                }],
+            })
         );
         assert_eq!(body["processors"][0]["storedRangeContiguous"], false);
         assert_eq!(body["processors"][0]["syncTargetBlock"], 19_426_620);
@@ -15210,6 +15264,8 @@ mod tests {
         assert!(metrics.contains("leani_p2p_max_concurrent_dials 30"));
         assert!(metrics.contains("leani_network_supervisor_info{state=\"backing_off\"} 1"));
         assert!(metrics.contains("leani_network_supervisor_failures_total 1"));
+        assert!(metrics.contains("leani_live_confirmed_reorgs_total 1"));
+        assert!(metrics.contains("leani_confirmation_lag_slots 2"));
         assert!(metrics.contains("leani_p2p_requests_started_total 2"));
         assert!(metrics.contains("leani_p2p_requests_timed_out_total 1"));
         assert!(metrics.contains("leani_p2p_peer_sessions_established_total 2"));
@@ -15416,12 +15472,18 @@ mod tests {
     }
 
     #[test]
-    fn coverage_labels_all_three_levels() {
+    fn coverage_labels_every_level() {
         let range = |from: u64, to: u64| {
             BlockRange::new(BlockNumber(from), BlockNumber(to)).expect("range")
         };
-        let intervals =
-            labeled_coverage_intervals(&[range(1, 10)], &[range(1, 4)], &[range(9, 10)]);
+        let intervals = labeled_coverage_intervals(
+            &[range(1, 10)],
+            &[
+                (Finality::Finalized, &[range(1, 4)]),
+                (Finality::Confirmed, &[range(4, 6)]),
+                (Finality::Unattested, &[range(9, 10)]),
+            ],
+        );
         let labels = intervals
             .iter()
             .map(|interval| (interval.from_block, interval.to_block, interval.finality))
@@ -15430,7 +15492,8 @@ mod tests {
             labels,
             vec![
                 (1, 4, "finalized"),
-                (5, 8, "attested"),
+                (5, 6, "confirmed"),
+                (7, 8, "attested"),
                 (9, 10, "unattested")
             ]
         );
@@ -15443,7 +15506,13 @@ mod tests {
         };
         let labels = |settled: Option<u64>| {
             settled_intervals(
-                labeled_coverage_intervals(&[range(1, 10)], &[range(1, 6)], &[range(9, 10)]),
+                labeled_coverage_intervals(
+                    &[range(1, 10)],
+                    &[
+                        (Finality::Finalized, &[range(1, 6)]),
+                        (Finality::Unattested, &[range(9, 10)]),
+                    ],
+                ),
                 settled,
             )
             .iter()
@@ -15482,7 +15551,10 @@ mod tests {
         let coverage = [range(5, 20), range(30, 35)];
         let finalized = [range(5, 8), range(12, 14), range(33, 40)];
         assert_eq!(
-            labels(&labeled_coverage_intervals(&coverage, &finalized, &[])),
+            labels(&labeled_coverage_intervals(
+                &coverage,
+                &[(Finality::Finalized, &finalized)]
+            )),
             vec![
                 (5, 8, "finalized"),
                 (9, 11, "attested"),
@@ -15493,22 +15565,20 @@ mod tests {
             ],
         );
         assert_eq!(
-            labels(&labeled_coverage_intervals(&coverage, &[], &[])),
+            labels(&labeled_coverage_intervals(&coverage, &[])),
             vec![(5, 20, "attested"), (30, 35, "attested")],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(
                 &[range(5, 20)],
-                &[range(0, 25)],
-                &[]
+                &[(Finality::Finalized, &[range(0, 25)])]
             )),
             vec![(5, 20, "finalized")],
         );
         assert_eq!(
             labels(&labeled_coverage_intervals(
                 &[range(0, u64::MAX)],
-                &[range(0, u64::MAX)],
-                &[],
+                &[(Finality::Finalized, &[range(0, u64::MAX)])],
             )),
             vec![(0, u64::MAX, "finalized")],
         );

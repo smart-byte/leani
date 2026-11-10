@@ -16,8 +16,7 @@ record, and documented RPC contracts.
   `[l1_anchor]`; change streams carry a `settled` marker, coverage reports
   `chainSettledHead`, `settledThrough`, and settled intervals, and
   `leani subscribe --finality settled` waits for it. The store moves to
-  schema 28: two small tables, and the change log accepts settled changes;
-  no rows are rewritten.
+  schema 28, which adds two small tables.
 - The L1 anchor reads a rollup's batches from finalized Ethereum blocks
   (`[finality] finalized_by = "batches"`, the default with an `[l1_anchor]`).
   On an op-stack chain
@@ -30,6 +29,24 @@ record, and documented RPC contracts.
   blocks without following Ethereum; `"settlement"` waits for settlement.
   Chain entries name
   `[op_stack] batch_inbox` and `batcher`, and `[l1_anchor] sequencer_inbox`.
+- A level `confirmed` between `attested` and `finalized`, from Ethereum's
+  Fast Confirmation Rule. `[confirmation] endpoints` names consensus nodes
+  with Fast Confirmation enabled; their `fast_confirmation` events count only
+  for blocks this node verified as attested with at least 384 of 512
+  sync-committee signers and holds canonical, and `minimum_agreement` of them
+  must agree. Ethereum Mainnet's defaults name ChainSafe's public Lodestar
+  node; an explicit configuration without the section, a non-`p2p` live
+  source, or other finality leaves it off. `publish = "confirmed"` publishes
+  from `confirmed` on. Processors publishing below it get a `confirmed`
+  marker per rise: consumers that check change operations strictly need SDK
+  this version or newer. A compact configuration takes a `[confirmation]`
+  section too, which replaces the default: `endpoints = []` turns the level
+  off. `leani subscribe --finality confirmed` waits for it, and coverage
+  intervals label confirmed blocks. `/v1/network/status` reports the
+  endpoints, their state, the head they agree on and its lag under
+  `network.confirmation`, and `/metrics` adds `leani_confirmation_lag_slots`
+  and `leani_live_confirmed_reorgs_total`, the reorgs that reverted a
+  confirmed block.
 
 - A chain is picked by name alone. `[chain] chain_id` may be left out: it
   comes from the chain entry, and a given one must still match it. A compact
@@ -320,6 +337,14 @@ record, and documented RPC contracts.
   instance `block-summary-1-3`, so the 1.2.0 rows of `block-summary-1-2` stay
   inert. `leani subscribe blocks` keys its state directory by this version,
   so it starts cold.
+- JSON-RPC `safe` names the newest confirmed block while `[confirmation]` is
+  active, usually a block or two behind `latest`, instead of the finalized
+  head.
+- The store moves to schema 30: stored levels become their rank, so finalized
+  rows change from 2 to 3, and `change_log`, `output_entity_meta` and
+  `query_snapshot_entities` are rebuilt in place on the first start. Nothing
+  re-indexes, but the rebuild takes time and free disk in proportion to those
+  tables, and an older binary no longer opens the store.
 - Execution P2P asks no public IP service for the host's address unless
   `nat` says so: generated configurations set `sources.live.nat = "none"`
   instead of `"any"`. A node whose configuration names `any`, `upnp`, or

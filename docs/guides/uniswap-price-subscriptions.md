@@ -140,7 +140,7 @@ undo or gap row.
 Embedded mode does not bind API or RPC ports, activate unrelated processors, or
 start a historical backfill. It starts from an independently verified finalized
 execution anchor and connects native execution P2P. Output from the configured
-processor lane says `unattested`, `attested` or `finalized`; use
+processor lane says `unattested`, `attested`, `confirmed` or `finalized`; use
 `--finality finalized` to wait for a block Ethereum consensus has finalized.
 Finalized output
 still waits for the fully joined path. Its small SQLite store, locally verified

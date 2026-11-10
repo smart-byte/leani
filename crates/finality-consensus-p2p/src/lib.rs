@@ -31,7 +31,7 @@ use leani_finality_beacon_api::{
     AnchorFile, AnchorWriter, BeaconApiError, CheckpointOrigin, Clock, DEFAULT_MAX_CHECKPOINT_AGE,
     ExecutionNumbers, HELIOS_REVISION, LightClientVerifier, StartAnchor, TrustedCheckpoint,
     VerifiedFinalityAnchor, current_slot, resolve_start_anchor, signed_implausibly_ahead,
-    until_next_attested_poll, verification_slot,
+    sync_participants, until_next_attested_poll, verification_slot,
 };
 use leani_primitives::{
     BlockNumber, Capability, CapabilitySet, ChainId, SourceId, SourceKind, TrustModel,
@@ -679,7 +679,15 @@ impl P2pLightClient {
                     continue;
                 }
             };
-            if published.is_some_and(|published| head.beacon_slot <= published.beacon_slot) {
+            let participants = sync_participants(&update);
+            // A better-signed copy of the published head counts as newer: a
+            // confirmation needs more signers than an attested head.
+            if published.is_some_and(|published| {
+                head.beacon_slot < published.beacon_slot
+                    || (head.beacon_slot == published.beacon_slot
+                        && (head.beacon_block_root != published.beacon_block_root
+                            || participants <= published.sync_participants))
+            }) {
                 debug!(
                     %peer,
                     beacon_slot = head.beacon_slot,
@@ -688,7 +696,7 @@ impl P2pLightClient {
                 continue;
             }
             match self.source.numbers.resolve(head).await {
-                Ok(head) => return Some(head.attested_head()),
+                Ok(head) => return Some(head.attested_head(participants)),
                 Err(error) => {
                     debug!(%peer, %error, "consensus peer's attested head has no execution block number");
                 }
@@ -2628,6 +2636,7 @@ mod tests {
             beacon_block_root: [0x77; 32],
             block_number: BlockNumber(ATTESTED_BLOCK + 1),
             block_hash: BlockHash::new([0x77; 32]),
+            sync_participants: 512,
         };
         assert!(heads.publish(newer));
         let source = scripted_source(
@@ -2748,14 +2757,14 @@ mod tests {
             .verify_attested_head(&update, now)
             .and_then(HeaderAnchor::numbered)
             .expect("verified attested head")
-            .attested_head();
+            .attested_head(sync_participants(&update));
         assert_eq!(
             head,
             verifier
                 .verify_attested_head(&fixture_optimistic(Behaviour::Honest), now)
                 .and_then(HeaderAnchor::numbered)
                 .expect("verified JSON update")
-                .attested_head()
+                .attested_head(sync_participants(&update))
         );
         assert_eq!(
             (head.beacon_slot, head.block_number, head.block_hash),

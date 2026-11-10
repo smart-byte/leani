@@ -59,6 +59,7 @@ fn beacon_header_root(header: &BeaconBlockHeader) -> [u8; 32] {
 }
 
 mod anchor;
+mod confirmation;
 mod http;
 
 pub use anchor::{
@@ -66,6 +67,7 @@ pub use anchor::{
     StartAnchor, TrustedCheckpoint, is_bootstrap_anchor, persist_finality_anchor,
     read_finality_anchor, resolve_start_anchor, slot_unix_seconds,
 };
+pub use confirmation::{ConfirmationConfig, spawn_confirmation};
 use http::{BeaconTransport, HttpTransport};
 pub use http::{
     endpoint_labels, normalized_endpoint, read_response, redacted_url, request_label, request_url,
@@ -253,14 +255,16 @@ pub struct VerifiedFinalityAnchor {
 }
 
 impl VerifiedFinalityAnchor {
-    /// The anchor as the attested head the live lane follows.
+    /// The anchor as the attested head the live lane follows, signed by
+    /// `sync_participants` of the sync committee.
     #[must_use]
-    pub const fn attested_head(self) -> AttestedHead {
+    pub const fn attested_head(self, sync_participants: u64) -> AttestedHead {
         AttestedHead {
             beacon_slot: self.beacon_slot,
             beacon_block_root: self.beacon_block_root,
             block_number: BlockNumber(self.execution_block_number),
             block_hash: self.execution_block_hash,
+            sync_participants,
         }
     }
 }
@@ -573,8 +577,7 @@ impl LightClientVerifier {
         update: &OptimisticUpdate<MainnetConsensusSpec>,
         now: SystemTime,
     ) -> Result<HeaderAnchor, BeaconApiError> {
-        let participants =
-            get_bits::<MainnetConsensusSpec>(&update.sync_aggregate().sync_committee_bits);
+        let participants = sync_participants(update);
         if !has_sync_committee_supermajority(participants) {
             return Err(BeaconApiError::InsufficientParticipation {
                 participants,
@@ -600,6 +603,12 @@ impl LightClientVerifier {
         let header = update.attested_header();
         anchor_from_header(&header, beacon_header_root(header.beacon()))
     }
+}
+
+/// Sync-committee members whose signature `update` carries.
+#[must_use]
+pub fn sync_participants(update: &OptimisticUpdate<MainnetConsensusSpec>) -> u64 {
+    get_bits::<MainnetConsensusSpec>(&update.sync_aggregate().sync_committee_bits)
 }
 
 /// Whether `participants` of the sync committee are at least two thirds of
@@ -1329,7 +1338,7 @@ async fn attested_endpoint_head(
         debug!(%error, "attested execution block has no number yet");
         format!("attested execution block has no number: {error}")
     })?;
-    Ok(attested.attested_head())
+    Ok(attested.attested_head(sync_participants(&update.data)))
 }
 
 /// Check an endpoint's network, then verify its bootstrap for `root`.
@@ -1588,20 +1597,30 @@ fn select_endpoint_agreement(
 /// transports: each head carries the signatures of at least two thirds of the
 /// sync committee, so one endpoint suffices and a lagging one never holds the
 /// head back. Two different heads at the newest slot fail closed: no head is
-/// followed from this poll.
+/// followed from this poll. Endpoints may aggregate different signatures for
+/// one head, so it keeps the largest count any of them proved.
 fn select_attested_head(heads: &[AttestedHead]) -> Option<AttestedHead> {
     let newest = heads.iter().copied().max_by_key(|head| head.beacon_slot)?;
-    if heads
-        .iter()
-        .any(|head| head.beacon_slot == newest.beacon_slot && *head != newest)
-    {
+    let block = |head: &AttestedHead| (head.beacon_block_root, head.block_number, head.block_hash);
+    let at_newest = || {
+        heads
+            .iter()
+            .filter(move |head| head.beacon_slot == newest.beacon_slot)
+    };
+    if at_newest().any(|head| block(head) != block(&newest)) {
         warn!(
             beacon_slot = newest.beacon_slot,
             "verified endpoints returned different attested heads at one slot; no head is followed from this poll"
         );
         return None;
     }
-    Some(newest)
+    Some(AttestedHead {
+        sync_participants: at_newest()
+            .map(|head| head.sync_participants)
+            .max()
+            .unwrap_or(newest.sync_participants),
+        ..newest
+    })
 }
 
 /// Helios's fork table for `network`. Forks Helios does not model are left
@@ -1969,6 +1988,7 @@ mod tests {
             beacon_block_root: beacon_header_root(update.data.attested_header().beacon()),
             block_number: BlockNumber(ATTESTED_BLOCK),
             block_hash: BlockHash::new(ATTESTED_EXECUTION_HASH.into()),
+            sync_participants: sync_participants(&update.data),
         }
     }
 
@@ -2904,7 +2924,7 @@ mod tests {
                 .verify_attested_head(&optimistic_update(OPTIMISTIC_JSON), now)
                 .and_then(HeaderAnchor::numbered)
                 .expect("verified optimistic update")
-                .attested_head(),
+                .attested_head(fixture_attested_head().sync_participants),
             fixture_attested_head()
         );
         // Signed ahead of the local clock: retryable, not invalid.
@@ -3074,6 +3094,7 @@ mod tests {
             beacon_block_root: [byte; 32],
             block_number: BlockNumber(slot * 2),
             block_hash: BlockHash::new([byte; 32]),
+            sync_participants: 400,
         };
         // A lagging endpoint never holds the head back.
         assert_eq!(
@@ -3086,6 +3107,16 @@ mod tests {
             None
         );
         assert_eq!(select_attested_head(&[]), None);
+        // One head that endpoints aggregated differently is still one head,
+        // with the most signatures any endpoint proved.
+        let better = AttestedHead {
+            sync_participants: 510,
+            ..at(12, 2)
+        };
+        assert_eq!(
+            select_attested_head(&[at(12, 2), better, at(10, 1)]),
+            Some(better)
+        );
     }
 
     #[test]
@@ -3833,6 +3864,73 @@ mod tests {
                 .is_some_and(|error| error.contains("by hash alone")),
             "{:?}",
             report.endpoints[0].error
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fast_confirmation_of_a_gloas_head_votes_for_the_payload_it_builds_on() {
+        let attested = BlockHash::new(SEPOLIA_ATTESTED_HASH.into());
+        let heads = AttestedHeadPublisher::new();
+        let source = sepolia_source()
+            .with_execution_headers(Arc::new(TableHeaders {
+                numbers: vec![
+                    (BlockHash::new(SEPOLIA_FINALIZED_HASH.into()), 9_000_000),
+                    (attested, 9_000_060),
+                ],
+                ..TableHeaders::default()
+            }))
+            .with_attested_heads(heads.clone());
+        assert!(source.probe_root(sepolia_checkpoint()).await.accepted);
+        let head = heads.latest().expect("verified Gloas head");
+        assert_eq!(
+            (head.block_number, head.block_hash, head.sync_participants),
+            (BlockNumber(9_000_060), attested, 495)
+        );
+
+        // An endpoint confirms the head's beacon block. From Gloas the head
+        // names the payload that block builds on, which is also the
+        // execution block Fast Confirmation calls safe for it.
+        let (endpoint, _served) = loopback_server(format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n: keepalive\n\n\
+             event: fast_confirmation\ndata: {{\"block\":\"0x{}\",\"slot\":\"{}\"}}\n\n",
+            hex::encode(head.beacon_block_root),
+            head.beacon_slot
+        ))
+        .await;
+        let telemetry = leani_source_api::NetworkTelemetry::default();
+        let now = sepolia_now();
+        let cancellation = CancellationToken::new();
+        let _stop = cancellation.clone().drop_guard();
+        let mut votes = spawn_confirmation(
+            &ConfirmationConfig {
+                endpoints: vec![endpoint],
+                minimum_agreement: 1,
+            },
+            sepolia().beacon().expect("Sepolia beacon").clone(),
+            heads.subscribe(),
+            Clock::new(move || UNIX_EPOCH + Duration::from_secs(now)),
+            telemetry.clone(),
+            cancellation,
+        )
+        .expect("confirmation");
+        let votes = tokio::time::timeout(
+            Duration::from_secs(10),
+            votes.wait_for(|votes| !votes.votes.is_empty()),
+        )
+        .await
+        .expect("a vote within ten seconds")
+        .expect("vote")
+        .clone();
+        assert_eq!(votes.votes, [head]);
+        let status = telemetry.snapshot().confirmation.expect("status");
+        assert_eq!(
+            status.agreed_head.map(|head| head.block_number),
+            Some(9_000_060)
+        );
+        assert_eq!(status.lag_slots, Some(2));
+        assert_eq!(
+            status.endpoints[0].last_event_slot,
+            Some(SEPOLIA_ATTESTED_SLOT)
         );
     }
 }

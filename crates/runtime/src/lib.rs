@@ -27,9 +27,9 @@ use leani_processor_api::{
     ProcessorError, PublicationPolicy, ReductionMode, StartPoint,
 };
 use leani_source_api::{
-    ChainEvent, ConsensusCheckpoint, DataRequest, FinalityEvent, FinalitySource, HistorySource,
-    LiveSource, LiveStart, SourceBudget, SourceChunk, SourceError, VerificationPolicy,
-    coverage_gaps,
+    ChainEvent, ConfirmationVotes, ConsensusCheckpoint, DataRequest, FinalityEvent, FinalitySource,
+    HistorySource, LiveSource, LiveStart, NetworkTelemetry, SourceBudget, SourceChunk, SourceError,
+    VerificationPolicy, coverage_gaps,
 };
 use leani_store_artifacts::{ArtifactBatchSink, ArtifactSinkError};
 use leani_store_sqlite::{
@@ -1132,11 +1132,7 @@ async fn map_with_finality_variants(
             "finality variants must include the exact delta checksum".to_owned(),
         ));
     }
-    for finality in [
-        Finality::Unattested,
-        Finality::Attested,
-        Finality::Finalized,
-    ] {
+    for finality in Finality::BLOCK_LEVELS {
         if finality == frame.finality {
             continue;
         }
@@ -3760,6 +3756,12 @@ pub struct SharedLiveRuntimeConfig {
     pub live_gap_fill: BTreeMap<String, u64>,
     /// Longest one fill runs before it announces the rest. Every lane waits.
     pub live_gap_fill_time_limit: Duration,
+    /// The `[confirmation]` endpoints' votes. The lane promotes blocks to
+    /// confirmed through the newest block enough of them confirm, once it
+    /// holds those blocks canonical and attested.
+    pub confirmation_votes: Option<tokio::sync::watch::Receiver<ConfirmationVotes>>,
+    /// Counts the reorgs that revert a confirmed block.
+    pub network_telemetry: NetworkTelemetry,
 }
 
 impl Default for SharedLiveRuntimeConfig {
@@ -3774,6 +3776,8 @@ impl Default for SharedLiveRuntimeConfig {
             live_gap_notices: BTreeSet::new(),
             live_gap_fill: BTreeMap::new(),
             live_gap_fill_time_limit: Duration::from_mins(5),
+            confirmation_votes: None,
+            network_telemetry: NetworkTelemetry::default(),
         }
     }
 }
@@ -3795,10 +3799,27 @@ pub struct SharedLiveReport {
     /// `ChainEvent::Attested` watermarks applied.
     #[serde(default)]
     pub attestations: u64,
+    /// Times the lane applied a confirmed head.
+    #[serde(default)]
+    pub confirmations: u64,
+    /// Reorgs that reverted a confirmed block.
+    #[serde(default)]
+    pub confirmed_reorgs: u64,
     pub disconnects: u64,
     pub last_block: Option<BlockNumber>,
     pub last_hash: Option<BlockHash>,
     pub processors: BTreeMap<String, SharedProcessorLiveReport>,
+}
+
+/// Wait until the confirmation votes change, or forever without them.
+async fn confirmation_changed(votes: &mut Option<tokio::sync::watch::Receiver<ConfirmationVotes>>) {
+    if let Some(receiver) = votes.as_mut()
+        && receiver.changed().await.is_ok()
+    {
+        return;
+    }
+    *votes = None;
+    std::future::pending::<()>().await;
 }
 
 /// Bounded finalized-frame acquisition used when a paused live processor's
@@ -4486,12 +4507,20 @@ impl SharedLiveRuntime {
                     .entry(processor.descriptor().id.to_string())
                     .or_default();
             }
+            let mut confirmation = self.config.confirmation_votes.clone();
+            let mut confirmed = None;
             loop {
                 let event = tokio::select! {
                     () = cancellation.cancelled() => break,
                     () = self.store.wait_for_delivery_capacity_change() => {
                         let _lane = self.lane_lock.lock().await;
                         Box::pin(self.drain_pending(&mut report)).await?;
+                        continue;
+                    }
+                    () = confirmation_changed(&mut confirmation) => {
+                        let _lane = self.lane_lock.lock().await;
+                        self.apply_confirmed(confirmation.as_ref(), &mut confirmed, &mut report)
+                            .await?;
                         continue;
                     }
                     event = events.next() => event,
@@ -4516,6 +4545,10 @@ impl SharedLiveRuntime {
                         Box::pin(self.commit_prepared(prepared, &mut report)).await?;
                         self.publish_committed(ChainEvent::Block(Box::new(committed)));
                         report.chain_blocks = report.chain_blocks.saturating_add(1);
+                        // Catch-up delivers attested blocks without an
+                        // attested event.
+                        self.apply_confirmed(confirmation.as_ref(), &mut confirmed, &mut report)
+                            .await?;
                     }
                     ChainEvent::Reorg { reverted, applied } => {
                         signal_readiness(readiness.as_ref(), true);
@@ -4527,11 +4560,16 @@ impl SharedLiveRuntime {
                             applied: committed_applied,
                         });
                         report.reorgs = report.reorgs.saturating_add(1);
+                        confirmed = None;
+                        self.apply_confirmed(confirmation.as_ref(), &mut confirmed, &mut report)
+                            .await?;
                     }
                     ChainEvent::Attested { through } => {
                         let _lane = self.lane_lock.lock().await;
                         self.apply_attested(through, &mut report).await?;
                         self.publish_committed(ChainEvent::Attested { through });
+                        self.apply_confirmed(confirmation.as_ref(), &mut confirmed, &mut report)
+                            .await?;
                     }
                     ChainEvent::Disconnected { reason } => {
                         signal_readiness(readiness.as_ref(), false);
@@ -6582,32 +6620,104 @@ impl SharedLiveRuntime {
             .await?;
         for processor in &self.processors {
             let descriptor = processor.descriptor();
-            let covered = if self
-                .store
-                .coverage_block_by_hash(descriptor, through.hash)
+            if let Some((number, hash)) = self
+                .promotion_point(descriptor, through.number, through.hash)
                 .await?
-                .is_some()
             {
-                Some((through.number, through.hash))
-            } else if let Some(cursor) = self.store.processor_cursor(descriptor).await?
-                && cursor.block_number < through.number
-                && self
-                    .store
-                    .canonical_block(chain_id, cursor.block_number)
-                    .await?
-                    .is_some_and(|(row, finality)| {
-                        row.hash == cursor.block_hash && finality >= Finality::Attested
-                    })
-            {
-                Some((cursor.block_number, cursor.block_hash))
-            } else {
-                None
-            };
-            if let Some((number, hash)) = covered {
                 self.store.mark_attested(descriptor, number, hash).await?;
             }
         }
         report.attestations = report.attestations.saturating_add(1);
+        Ok(())
+    }
+
+    /// Where a processor promotes for a promotion through `number` and
+    /// `hash`: that block when it covers it, else its cursor's block when
+    /// that is below it on the attested chain.
+    async fn promotion_point(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        number: BlockNumber,
+        hash: BlockHash,
+    ) -> Result<Option<(BlockNumber, BlockHash)>, RuntimeError> {
+        if self
+            .store
+            .coverage_block_by_hash(descriptor, hash)
+            .await?
+            .is_some()
+        {
+            return Ok(Some((number, hash)));
+        }
+        if let Some(cursor) = self.store.processor_cursor(descriptor).await?
+            && cursor.block_number < number
+            && self
+                .store
+                .canonical_block(self.source.descriptor().chain_id, cursor.block_number)
+                .await?
+                .is_some_and(|(row, finality)| {
+                    row.hash == cursor.block_hash && finality >= Finality::Attested
+                })
+        {
+            return Ok(Some((cursor.block_number, cursor.block_hash)));
+        }
+        Ok(None)
+    }
+
+    /// Promote the lane's blocks through the newest block `minimum_agreement`
+    /// votes confirm. A vote counts only while this lane holds its block
+    /// canonical and at least attested, so votes for another branch, or for
+    /// blocks it has not delivered yet, wait. `applied` is the block last
+    /// promoted, so a vote set promotes once.
+    async fn apply_confirmed(
+        &self,
+        votes: Option<&tokio::sync::watch::Receiver<ConfirmationVotes>>,
+        applied: &mut Option<(BlockNumber, BlockHash)>,
+        report: &mut SharedLiveReport,
+    ) -> Result<(), RuntimeError> {
+        let Some(votes) = votes.map(|votes| votes.borrow().clone()) else {
+            return Ok(());
+        };
+        let chain_id = self.source.descriptor().chain_id;
+        let mut canonical = Vec::with_capacity(votes.votes.len());
+        for vote in votes.votes {
+            if self
+                .store
+                .canonical_block(chain_id, vote.block_number)
+                .await?
+                .is_some_and(|(row, finality)| {
+                    row.hash == vote.block_hash && finality >= Finality::Attested
+                })
+            {
+                canonical.push((vote.block_number, vote.block_hash));
+            }
+        }
+        canonical.sort_by_key(|(number, _)| std::cmp::Reverse(*number));
+        let Some(&through) = votes
+            .minimum_agreement
+            .checked_sub(1)
+            .and_then(|index| canonical.get(index))
+        else {
+            return Ok(());
+        };
+        if *applied == Some(through)
+            || !self
+                .store
+                .mark_recent_confirmed(chain_id, through.0, through.1)
+                .await?
+        {
+            return Ok(());
+        }
+        for processor in &self.processors {
+            let descriptor = processor.descriptor();
+            if let Some((number, hash)) = self
+                .promotion_point(descriptor, through.0, through.1)
+                .await?
+            {
+                self.store.mark_confirmed(descriptor, number, hash).await?;
+            }
+        }
+        *applied = Some(through);
+        report.confirmations = report.confirmations.saturating_add(1);
         Ok(())
     }
 
@@ -6626,6 +6736,26 @@ impl SharedLiveRuntime {
             .map_or(Finality::Unattested, |(_, finality)| finality))
     }
 
+    /// Log and count a reorg that reverts a confirmed block. Levels fall
+    /// toward the tip, so the lowest reverted block tells.
+    async fn report_confirmed_reorg(
+        &self,
+        reverted: &[leani_primitives::BlockRef],
+        report: &mut SharedLiveReport,
+    ) -> Result<(), RuntimeError> {
+        if let Some(&lowest) = reverted.last()
+            && self.canonical_finality(lowest).await? == Finality::Confirmed
+        {
+            error!(
+                block = lowest.number.0,
+                "a reorg reverts a fast-confirmed block: the Fast Confirmation Rule's assumptions failed, or a confirmation endpoint misled this node"
+            );
+            report.confirmed_reorgs = report.confirmed_reorgs.saturating_add(1);
+            self.config.network_telemetry.record_confirmed_reorg();
+        }
+        Ok(())
+    }
+
     async fn apply_reorg(
         &self,
         reverted: &[leani_primitives::BlockRef],
@@ -6640,6 +6770,7 @@ impl SharedLiveRuntime {
             )));
         }
         self.verify_reorg_tip(reverted).await?;
+        self.report_confirmed_reorg(reverted, report).await?;
         let chain_id = self.source.descriptor().chain_id;
         let mut prepared = Vec::with_capacity(applied.len());
         for frame in applied {
@@ -7389,7 +7520,6 @@ impl std::fmt::Debug for FinalityRuntime {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FinalityReport {
     pub optimistic_events: u64,
-    pub safe_events: u64,
     pub finalized_events: u64,
     pub finalized_through: Option<BlockNumber>,
 }
@@ -7436,9 +7566,6 @@ impl FinalityRuntime {
             match event? {
                 FinalityEvent::Optimistic { .. } => {
                     report.optimistic_events = report.optimistic_events.saturating_add(1);
-                }
-                FinalityEvent::Safe { .. } => {
-                    report.safe_events = report.safe_events.saturating_add(1);
                 }
                 FinalityEvent::Finalized {
                     block_number,
@@ -7514,7 +7641,6 @@ impl Default for SharedFinalityRuntimeConfig {
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SharedFinalityReport {
     pub optimistic_events: u64,
-    pub safe_events: u64,
     pub finalized_events: u64,
     pub finalized_through: Option<BlockNumber>,
     pub deferred_finalized_anchor: Option<BlockHash>,
@@ -7765,9 +7891,6 @@ impl SharedFinalityRuntime {
                 FinalityEvent::Optimistic { .. } => {
                     report.optimistic_events = report.optimistic_events.saturating_add(1);
                 }
-                FinalityEvent::Safe { .. } => {
-                    report.safe_events = report.safe_events.saturating_add(1);
-                }
                 FinalityEvent::Finalized {
                     block_number,
                     block_hash,
@@ -7929,9 +8052,6 @@ impl SharedFinalityRuntime {
                 match event {
                     Some(Ok(FinalityEvent::Optimistic { .. })) => {
                         report.optimistic_events = report.optimistic_events.saturating_add(1);
-                    }
-                    Some(Ok(FinalityEvent::Safe { .. })) => {
-                        report.safe_events = report.safe_events.saturating_add(1);
                     }
                     Some(Ok(FinalityEvent::Finalized {
                         block_number,
@@ -16419,6 +16539,218 @@ mod tests {
         );
     }
 
+    /// Run a live lane over blocks 0 to 2, unattested, then an attested
+    /// event through block 1 and `then`, with `votes` from the confirmation
+    /// endpoints.
+    async fn run_with_votes(
+        name: &str,
+        votes: impl FnOnce(&[leani_primitives::BlockFrame]) -> ConfirmationVotes,
+        then: impl FnOnce(&[leani_primitives::BlockFrame]) -> Vec<LiveStep>,
+        processors: Vec<Arc<dyn Processor>>,
+    ) -> (tempfile::TempDir, SqliteStore, SharedLiveReport) {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let mut chain = Vec::new();
+        let mut parent = BlockHash::ZERO;
+        for number in 0..=2 {
+            let mut frame = live_fixture(number, parent);
+            frame.finality = Finality::Unattested;
+            parent = frame.block.hash;
+            chain.push(frame);
+        }
+        let (_votes, receiver) = tokio::sync::watch::channel(votes(&chain));
+        let mut steps = chain
+            .iter()
+            .cloned()
+            .map(|frame| LiveStep::Event(ChainEvent::Block(Box::new(frame))))
+            .collect::<Vec<_>>();
+        steps.push(LiveStep::Event(ChainEvent::Attested {
+            through: chain[1].block,
+        }));
+        steps.extend(then(&chain));
+        let (directory, store) = store().await;
+        let telemetry = NetworkTelemetry::default();
+        let report = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(e2e_descriptor(name, range), steps)),
+            processors,
+            SharedLiveRuntimeConfig {
+                confirmation_votes: Some(receiver),
+                network_telemetry: telemetry.clone(),
+                ..SharedLiveRuntimeConfig::default()
+            },
+        )
+        .expect("runtime")
+        .run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("run");
+        assert_eq!(
+            telemetry.snapshot().live_levels.confirmed_reorgs,
+            report.confirmed_reorgs
+        );
+        (directory, store, report)
+    }
+
+    fn vote(
+        frame: &leani_primitives::BlockFrame,
+        hash: BlockHash,
+    ) -> leani_source_api::AttestedHead {
+        leani_source_api::AttestedHead {
+            beacon_slot: frame.block.number.0,
+            beacon_block_root: [0; 32],
+            block_number: frame.block.number,
+            block_hash: hash,
+            sync_participants: 500,
+        }
+    }
+
+    async fn canonical_levels(store: &SqliteStore) -> Vec<Option<Finality>> {
+        let mut levels = Vec::new();
+        for number in 0..=2 {
+            levels.push(
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("row")
+                    .map(|(_, finality)| finality),
+            );
+        }
+        levels
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_vote_promotes_once_its_block_is_attested() {
+        let confirmed = Arc::new(
+            BlockLocalCounter::named("confirmed-publisher")
+                .with_publication(PublicationPolicy::Confirmed),
+        );
+        let lower = Arc::new(
+            BlockLocalCounter::named("confirmed-lower")
+                .with_publication(PublicationPolicy::Unattested),
+        );
+        let (_directory, store, report) = run_with_votes(
+            "confirmed-live",
+            |chain| ConfirmationVotes {
+                minimum_agreement: 1,
+                votes: vec![vote(&chain[1], chain[1].block.hash)],
+            },
+            |_| Vec::new(),
+            vec![confirmed.clone(), lower.clone()],
+        )
+        .await;
+        assert_eq!(report.confirmations, 1, "the vote waited for attestation");
+        assert_eq!(
+            canonical_levels(&store).await,
+            [
+                Some(Finality::Confirmed),
+                Some(Finality::Confirmed),
+                Some(Finality::Unattested),
+            ]
+        );
+        let operations = |changes: Vec<leani_store_sqlite::ChangeRecord>| {
+            changes
+                .into_iter()
+                .map(|change| (change.block.number.0, change.finality, change.direction))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            operations(
+                store
+                    .changes(confirmed.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("confirmed")
+            ),
+            vec![
+                (0, Finality::Confirmed, ChangeDirection::Apply),
+                (1, Finality::Confirmed, ChangeDirection::Apply),
+            ]
+        );
+        assert_eq!(
+            operations(
+                store
+                    .changes(lower.descriptor(), ChainId(1), 0, 100)
+                    .await
+                    .expect("lower")
+            )
+            .last(),
+            Some(&(1, Finality::Confirmed, ChangeDirection::Finalized))
+        );
+    }
+
+    #[tokio::test]
+    async fn votes_for_another_branch_or_below_agreement_never_promote() {
+        for (name, votes) in [
+            (
+                "confirmed-other-branch",
+                Box::new(|chain: &[leani_primitives::BlockFrame]| ConfirmationVotes {
+                    minimum_agreement: 1,
+                    votes: vec![vote(&chain[1], BlockHash::new([0xee; 32]))],
+                })
+                    as Box<dyn FnOnce(&[leani_primitives::BlockFrame]) -> ConfirmationVotes>,
+            ),
+            (
+                "confirmed-one-of-two",
+                Box::new(|chain: &[leani_primitives::BlockFrame]| ConfirmationVotes {
+                    minimum_agreement: 2,
+                    votes: vec![
+                        vote(&chain[1], chain[1].block.hash),
+                        vote(&chain[1], BlockHash::new([0xee; 32])),
+                    ],
+                }),
+            ),
+        ] {
+            let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::named(name));
+            let (_directory, store, report) =
+                run_with_votes(name, votes, |_| Vec::new(), vec![processor]).await;
+            assert_eq!(report.confirmations, 0, "{name}");
+            assert_eq!(
+                canonical_levels(&store).await,
+                [
+                    Some(Finality::Attested),
+                    Some(Finality::Attested),
+                    Some(Finality::Unattested),
+                ],
+                "{name}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_reorg_of_a_confirmed_block_is_counted_and_its_votes_stop_counting() {
+        let replacement = |chain: &[leani_primitives::BlockFrame]| {
+            let mut frame = live_fixture(1, chain[0].block.hash);
+            frame.block.hash = BlockHash::new([0x1f; 32]);
+            frame.finality = Finality::Unattested;
+            frame
+        };
+        let processor: Arc<dyn Processor> = Arc::new(BlockLocalCounter::named("confirmed-reorg"));
+        let (_directory, store, report) = run_with_votes(
+            "confirmed-reorg",
+            |chain| ConfirmationVotes {
+                minimum_agreement: 1,
+                votes: vec![vote(&chain[1], chain[1].block.hash)],
+            },
+            |chain| {
+                vec![LiveStep::Event(ChainEvent::Reorg {
+                    reverted: vec![chain[2].block, chain[1].block],
+                    applied: vec![replacement(chain)],
+                })]
+            },
+            vec![processor],
+        )
+        .await;
+        assert_eq!((report.confirmations, report.confirmed_reorgs), (1, 1));
+        // The vote names the reverted block 1: its replacement stays below
+        // confirmed, and block 0 keeps its level.
+        assert_eq!(
+            canonical_levels(&store).await,
+            [Some(Finality::Confirmed), Some(Finality::Unattested), None]
+        );
+    }
+
     #[tokio::test]
     async fn attestation_releases_what_a_paused_processor_parked() {
         // Review: a processor its delivery limit paused below the attested
@@ -23195,6 +23527,7 @@ mod tests {
             beacon_block_root: [0; 32],
             block_number: BlockNumber(100),
             block_hash: BlockHash::new([0x64; 32]),
+            sync_participants: 512,
         });
         // Room for three and a half frames: the three above the cutoff fit.
         let soft_bytes = retained_recent_bytes(&store).await / 6 * 7 / 2;

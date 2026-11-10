@@ -75,12 +75,43 @@ const SCHEMA_V26: &str = include_str!("../migrations/0026_unattested_indexes.sql
 const SCHEMA_V27: &str = include_str!("../migrations/0027_maintenance_indexes.sql");
 const SCHEMA_V28: &str = include_str!("../migrations/0028_settled_level.sql");
 const SCHEMA_V29: &str = include_str!("../migrations/0029_header_fee_recipients.sql");
+const SCHEMA_V30: &str = include_str!("../migrations/0030_confirmed_level.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 29;
+pub const CURRENT_SCHEMA_VERSION: u32 = 30;
+/// Each schema above 1 with the migration that reaches it, in order.
+const MIGRATIONS: [(u32, &str); 29] = [
+    (2, SCHEMA_V2),
+    (3, SCHEMA_V3),
+    (4, SCHEMA_V4),
+    (5, SCHEMA_V5),
+    (6, SCHEMA_V6),
+    (7, SCHEMA_V7),
+    (8, SCHEMA_V8),
+    (9, SCHEMA_V9),
+    (10, SCHEMA_V10),
+    (11, SCHEMA_V11),
+    (12, SCHEMA_V12),
+    (13, SCHEMA_V13),
+    (14, SCHEMA_V14),
+    (15, SCHEMA_V15),
+    (16, SCHEMA_V16),
+    (17, SCHEMA_V17),
+    (18, SCHEMA_V18),
+    (19, SCHEMA_V19),
+    (20, SCHEMA_V20),
+    (21, SCHEMA_V21),
+    (22, SCHEMA_V22),
+    (23, SCHEMA_V23),
+    (24, SCHEMA_V24),
+    (25, SCHEMA_V25),
+    (26, SCHEMA_V26),
+    (27, SCHEMA_V27),
+    (28, SCHEMA_V28),
+    (29, SCHEMA_V29),
+    (30, SCHEMA_V30),
+];
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
-/// The first schema whose change log holds settled changes.
-const SETTLED_SCHEMA_VERSION: u32 = 28;
 /// Schema whose recent frames carry each header's fee recipient, which its
 /// migration reads from the header RLP.
 const HEADER_FEE_RECIPIENT_SCHEMA_VERSION: u32 = 29;
@@ -583,19 +614,23 @@ pub enum ChangeDirection {
     ResetRequired,
 }
 
-/// The public operation of a change. The attested and settled watermarks
-/// are stored with direction `finalized` at their level (see `mark_attested`
-/// and `mark_settled`), and are published as `attested` and `settled`.
+/// The public operation of a change. The attested, confirmed and settled
+/// watermarks are stored with direction `finalized` at their level (see
+/// `mark_attested`, `mark_confirmed` and `mark_settled`), and are published
+/// by that level.
 #[must_use]
 pub fn change_operation(
     direction: ChangeDirection,
     finality: Finality,
     kind: &str,
 ) -> &'static str {
-    match (direction, finality) {
-        (ChangeDirection::Finalized, Finality::Attested) if kind == "system.finality" => "attested",
-        (ChangeDirection::Finalized, Finality::Settled) if kind == "system.finality" => "settled",
-        (direction, _) => direction.as_str(),
+    match direction {
+        ChangeDirection::Finalized
+            if finality != Finality::Finalized && kind == "system.finality" =>
+        {
+            finality.name()
+        }
+        direction => direction.as_str(),
     }
 }
 
@@ -2073,43 +2108,10 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
         return Err(older_schema_refusal(version));
     }
 
-    let migrations = [
-        (2, SCHEMA_V2),
-        (3, SCHEMA_V3),
-        (4, SCHEMA_V4),
-        (5, SCHEMA_V5),
-        (6, SCHEMA_V6),
-        (7, SCHEMA_V7),
-        (8, SCHEMA_V8),
-        (9, SCHEMA_V9),
-        (10, SCHEMA_V10),
-        (11, SCHEMA_V11),
-        (12, SCHEMA_V12),
-        (13, SCHEMA_V13),
-        (14, SCHEMA_V14),
-        (15, SCHEMA_V15),
-        (16, SCHEMA_V16),
-        (17, SCHEMA_V17),
-        (18, SCHEMA_V18),
-        (19, SCHEMA_V19),
-        (20, SCHEMA_V20),
-        (21, SCHEMA_V21),
-        (22, SCHEMA_V22),
-        (23, SCHEMA_V23),
-        (24, SCHEMA_V24),
-        (25, SCHEMA_V25),
-        (26, SCHEMA_V26),
-        (27, SCHEMA_V27),
-        (28, SCHEMA_V28),
-        (29, SCHEMA_V29),
-    ];
-    for (target, migration) in migrations {
+    for (target, migration) in MIGRATIONS {
         if target > version {
             sqlx::raw_sql(migration).execute(&mut *transaction).await?;
         }
-    }
-    if version < SETTLED_SCHEMA_VERSION {
-        widen_change_finality(&mut transaction).await?;
     }
     if version < NODE_SECRET_SCHEMA_VERSION {
         install_node_secret(&mut transaction).await?;
@@ -2120,54 +2122,6 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     transaction.commit().await?;
     if version <= 2 {
         rebuild_recent_transaction_locators(pool).await?;
-    }
-    Ok(())
-}
-
-/// Let `change_log` hold settled changes. Rebuilding the table would delete
-/// the sink outbox that cascades from it, so the CHECK constraint is edited
-/// in place, as SQLite documents for constraint changes: the stored rows all
-/// satisfy the wider constraint.
-async fn widen_change_finality(
-    transaction: &mut Transaction<'_, Sqlite>,
-) -> Result<(), StoreError> {
-    let schema_version: i64 = sqlx::query_scalar("PRAGMA schema_version")
-        .fetch_one(&mut **transaction)
-        .await?;
-    sqlx::query("PRAGMA writable_schema = ON")
-        .execute(&mut **transaction)
-        .await?;
-    let edited = sqlx::query(
-        "UPDATE sqlite_schema
-         SET sql = replace(sql, 'CHECK (finality BETWEEN 0 AND 2)', 'CHECK (finality BETWEEN 0 AND 3)')
-         WHERE type = 'table' AND name = 'change_log'
-           AND instr(sql, 'CHECK (finality BETWEEN 0 AND 2)') > 0",
-    )
-    .execute(&mut **transaction)
-    .await?
-    .rows_affected();
-    // An integer the database just returned: nothing to inject.
-    sqlx::query(sqlx::AssertSqlSafe(format!(
-        "PRAGMA schema_version = {}",
-        schema_version + 1
-    )))
-    .execute(&mut **transaction)
-    .await?;
-    sqlx::query("PRAGMA writable_schema = OFF")
-        .execute(&mut **transaction)
-        .await?;
-    if edited == 0 {
-        let widened: bool = sqlx::query_scalar(
-            "SELECT instr(sql, 'CHECK (finality BETWEEN 0 AND 3)') > 0
-             FROM sqlite_schema WHERE type = 'table' AND name = 'change_log'",
-        )
-        .fetch_one(&mut **transaction)
-        .await?;
-        if !widened {
-            return Err(StoreError::Invariant(
-                "change_log has no finality constraint to widen".to_owned(),
-            ));
-        }
     }
     Ok(())
 }
@@ -3458,8 +3412,8 @@ impl SqliteStore {
         }
         let batch = overlay.into_batch();
         // Instances whose consumers start above this block's level park its
-        // changes until mark_attested or mark_finalized promotes it. Their
-        // bytes are admitted against the delivery budget here, so backpressure
+        // changes until a promotion to that level releases them. Their bytes
+        // are admitted against the delivery budget here, so backpressure
         // behaves like any other processor's; the flush never re-checks
         // capacity.
         // The level its consumers see: a finalized block at or below the
@@ -3719,7 +3673,7 @@ impl SqliteStore {
         // A block at a level proves every older held block at least at that
         // level. Canonical ordering publishes those first, in block order, so
         // this block cannot overtake them; block-versioned output keeps
-        // waiting for mark_attested or mark_finalized.
+        // waiting for a promotion.
         let first_level = descriptor.publication.first_level();
         let released_held = if first_level > Finality::Unattested
             && descriptor.delivery_ordering == DeliveryOrdering::Canonical
@@ -5490,11 +5444,9 @@ impl SqliteStore {
             .execute(&mut *transaction)
             .await?;
         // Settled-only changes wait for mark_settled.
-        let flushed_deferred = if matches!(
-            descriptor.publication.first_level(),
-            Finality::Attested | Finality::Finalized
-        ) && descriptor.lifecycle.delivery.mode
-            != DeliveryPolicyMode::None
+        let flushed_deferred = if (Finality::Attested..=Finality::Finalized)
+            .contains(&descriptor.publication.first_level())
+            && descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None
         {
             release_deferred_changes(&mut transaction, &instance, through, Finality::Finalized)
                 .await?
@@ -5577,13 +5529,52 @@ impl SqliteStore {
     /// Returns [`StoreError::AttestedCoverageConflict`] when the coverage at
     /// `through` holds another hash, and an error when the height exceeds
     /// `SQLite`'s numeric range or the update fails.
-    #[allow(clippy::too_many_lines)]
     pub async fn mark_attested(
         &self,
         descriptor: &ProcessorDescriptor,
         through: BlockNumber,
         hash: BlockHash,
     ) -> Result<u64, StoreError> {
+        self.mark_live_level(descriptor, through, hash, Finality::Attested)
+            .await
+    }
+
+    /// Mark every block through `through` confirmed: the configured
+    /// endpoints confirmed `through`, an attested block, so its ancestors are
+    /// confirmed too. Rows below confirmed move to confirmed, and nothing is
+    /// republished.
+    /// - A `confirmed` instance's parked changes go out as confirmed applies.
+    /// - `unattested` and `attested` instances get one `system.finality`
+    ///   marker at the confirmed level.
+    ///
+    /// # Errors
+    ///
+    /// As [`SqliteStore::mark_attested`].
+    pub async fn mark_confirmed(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        through: BlockNumber,
+        hash: BlockHash,
+    ) -> Result<u64, StoreError> {
+        self.mark_live_level(descriptor, through, hash, Finality::Confirmed)
+            .await
+    }
+
+    /// Promote a processor's rows through `through` to `level`, attested or
+    /// confirmed; see [`SqliteStore::mark_attested`].
+    #[allow(clippy::too_many_lines)]
+    async fn mark_live_level(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        through: BlockNumber,
+        hash: BlockHash,
+        level: Finality,
+    ) -> Result<u64, StoreError> {
+        let (coverage_promotion, output_promotion) = if level == Finality::Confirmed {
+            (CONFIRMED_COVERAGE_PROMOTION, CONFIRMED_OUTPUT_PROMOTION)
+        } else {
+            (ATTESTED_COVERAGE_PROMOTION, ATTESTED_OUTPUT_PROMOTION)
+        };
         let instance = processor_instance(descriptor);
         let _guard = self.inner.writer.lock().await;
         let covered: Option<Vec<u8>> = sqlx::query_scalar(
@@ -5623,43 +5614,48 @@ impl SqliteStore {
             .transpose()?;
         let delivery_enabled = descriptor.lifecycle.delivery.mode != DeliveryPolicyMode::None;
         let mut transaction = self.inner.pool.begin().await?;
-        let promoted = sqlx::query(ATTESTED_COVERAGE_PROMOTION)
+        let promoted = sqlx::query(coverage_promotion)
             .bind(&instance)
             .bind(u64_i64(through.0, "block_number")?)
             .execute(&mut *transaction)
             .await?
             .rows_affected();
-        sqlx::query(ATTESTED_OUTPUT_PROMOTION)
+        sqlx::query(output_promotion)
             .bind(&instance)
             .bind(u64_i64(through.0, "block_number")?)
             .execute(&mut *transaction)
             .await?;
-        let flushed_deferred =
-            if descriptor.publication == PublicationPolicy::Attested && delivery_enabled {
-                release_deferred_changes(&mut transaction, &instance, through, Finality::Attested)
-                    .await?
-            } else {
-                false
-            };
-        if let Some(mut attested_cursor) = cursor.clone()
-            && attested_cursor.block_number <= through
-            && attested_cursor.finality < Finality::Attested
+        // A publication floor below `level` releases too: a crash between
+        // the canonical and this processor's earlier promotion leaves its
+        // changes parked.
+        let flushed_deferred = if (Finality::Attested..=level)
+            .contains(&descriptor.publication.first_level())
+            && delivery_enabled
         {
-            attested_cursor.finality = Finality::Attested;
-            let encoded = OpaqueCursor::encode(CursorKind::Processor, &attested_cursor)?;
+            release_deferred_changes(&mut transaction, &instance, through, level).await?
+        } else {
+            false
+        };
+        if let Some(mut promoted_cursor) = cursor.clone()
+            && promoted_cursor.block_number <= through
+            && promoted_cursor.finality < level
+        {
+            promoted_cursor.finality = level;
+            let encoded = OpaqueCursor::encode(CursorKind::Processor, &promoted_cursor)?;
             upsert_cursor(
                 &mut transaction,
                 &instance,
-                &attested_cursor,
+                &promoted_cursor,
                 encoded.expose(),
             )
             .await?;
         }
-        // ponytail: the marker reuses direction 'finalized', because the 0001
-        // CHECK allows only four directions. Its finality (attested) tells the
-        // levels apart, and the API and CLI render it as `attested`. Rebuild
-        // change_log if a marker ever needs a fifth direction.
-        if descriptor.publication == PublicationPolicy::Unattested
+        // The marker reuses direction 'finalized', because the 0001 CHECK
+        // allows only four directions. Its finality (attested or confirmed)
+        // tells the levels apart, and the API and CLI render it by
+        // that level. Rebuild change_log if a marker ever needs a fifth
+        // direction.
+        if descriptor.publication.first_level() < level
             && delivery_enabled
             && promoted > 0
             && let (Some(cursor), Some(context)) = (&cursor, marker_context)
@@ -5671,7 +5667,7 @@ impl SqliteStore {
                 &DeliveryOrigin::live(&instance),
                 cursor.chain_id,
                 context.block,
-                Finality::Attested,
+                level,
                 ChangeDirection::Finalized,
                 &[DomainChange {
                     kind: "system.finality".to_owned(),
@@ -8226,23 +8222,37 @@ impl SqliteStore {
         &self,
         chain_id: ChainId,
     ) -> Result<Option<BlockRef>, StoreError> {
+        self.canonical_head_at_least(chain_id, Finality::Finalized)
+            .await
+    }
+
+    /// The newest retained canonical block at `level` or above.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a failed read or corrupt row.
+    pub async fn canonical_head_at_least(
+        &self,
+        chain_id: ChainId,
+        level: Finality,
+    ) -> Result<Option<BlockRef>, StoreError> {
         let row: Option<(i64, Vec<u8>, Vec<u8>, i64)> = sqlx::query_as(
             "SELECT block_number, block_hash, parent_hash, timestamp
              FROM canonical_blocks
-             WHERE chain_id = ? AND finality = ?
+             WHERE chain_id = ? AND finality >= ?
              ORDER BY block_number DESC
              LIMIT 1",
         )
         .bind(u64_i64(chain_id.0, "chain_id")?)
-        .bind(finality_i64(Finality::Finalized))
+        .bind(finality_i64(level))
         .fetch_optional(&self.inner.pool)
         .await?;
         row.map(|(number, hash, parent_hash, timestamp)| {
             Ok(BlockRef {
-                number: BlockNumber(i64_u64(number, "finalized canonical block number")?),
+                number: BlockNumber(i64_u64(number, "canonical block number")?),
                 hash: decode_hash(hash)?,
                 parent_hash: decode_hash(parent_hash)?,
-                timestamp: i64_u64(timestamp, "finalized canonical block timestamp")?,
+                timestamp: i64_u64(timestamp, "canonical block timestamp")?,
             })
         })
         .transpose()
@@ -8445,6 +8455,44 @@ impl SqliteStore {
             .execute(&self.inner.pool)
             .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Mark canonical blocks through `through` confirmed when the block held
+    /// there is `hash` and at least attested: the endpoints confirmed the
+    /// chain it ends. Returns `false`, changing nothing, while the block is
+    /// not retained, is another block, or is not attested yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the height exceeds `SQLite`'s numeric range or
+    /// the update fails.
+    pub async fn mark_recent_confirmed(
+        &self,
+        chain_id: ChainId,
+        through: BlockNumber,
+        hash: BlockHash,
+    ) -> Result<bool, StoreError> {
+        let _guard = self.inner.writer.lock().await;
+        let stored: Option<(Vec<u8>, i64)> = sqlx::query_as(
+            "SELECT block_hash, finality FROM canonical_blocks
+             WHERE chain_id = ? AND block_number = ?",
+        )
+        .bind(u64_i64(chain_id.0, "chain_id")?)
+        .bind(u64_i64(through.0, "block_number")?)
+        .fetch_optional(&self.inner.pool)
+        .await?;
+        let Some((stored, finality)) = stored else {
+            return Ok(false);
+        };
+        if decode_hash(stored)? != hash || decode_finality(finality)? < Finality::Attested {
+            return Ok(false);
+        }
+        sqlx::query(CONFIRMED_CANONICAL_PROMOTION)
+            .bind(u64_i64(chain_id.0, "chain_id")?)
+            .bind(u64_i64(through.0, "confirmed block_number")?)
+            .execute(&self.inner.pool)
+            .await?;
+        Ok(true)
     }
 
     /// Mark a hash-bound canonical recent prefix finalized.
@@ -8800,16 +8848,18 @@ impl SqliteStore {
         normalize_ranges(coverage)
     }
 
-    /// Return the blocks of `requested` a processor covers at the unattested
-    /// level, merged into ranges. Unattested rows are never compacted.
+    /// Return the blocks of `requested` a processor covers at exactly
+    /// `level`, a level below finalized, merged into ranges. Rows below
+    /// finalized are never compacted.
     ///
     /// # Errors
     ///
     /// Returns an error for an out-of-range height or a failed query.
-    pub async fn unattested_coverage(
+    pub async fn unfinalized_coverage(
         &self,
         descriptor: &ProcessorDescriptor,
         requested: BlockRange,
+        level: Finality,
     ) -> Result<Vec<BlockRange>, StoreError> {
         let rows: Vec<i64> = sqlx::query_scalar(
             "SELECT block_number FROM processor_coverage
@@ -8817,7 +8867,7 @@ impl SqliteStore {
              ORDER BY block_number",
         )
         .bind(processor_instance(descriptor))
-        .bind(finality_i64(Finality::Unattested))
+        .bind(finality_i64(level))
         .bind(u64_i64(requested.start().0, "block_number")?)
         .bind(u64_i64(requested.end().0, "block_number")?)
         .fetch_all(&self.inner.pool)
@@ -17686,15 +17736,37 @@ const ATTESTED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality 
 const ATTESTED_CANONICAL_PROMOTION: &str = "UPDATE canonical_blocks SET finality = 1
      WHERE chain_id = ? AND block_number <= ? AND finality = 0";
 
+/// Promote a processor's coverage up to a block to confirmed, through the
+/// partial index of rows below confirmed, which the planner passes over for
+/// the primary key otherwise. A block-local processor can cover a block
+/// below a finalized one late, so no finalized row bounds the rows to promote.
+const CONFIRMED_COVERAGE_PROMOTION: &str =
+    "UPDATE processor_coverage INDEXED BY processor_coverage_unconfirmed SET finality = 2
+     WHERE instance = ? AND block_number <= ? AND finality < 2";
+/// Promote a processor's output up to a block to confirmed. `finality < 3`
+/// selects the partial index of unfinalized rows.
+const CONFIRMED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality = 2
+     WHERE instance = ? AND block_number <= ? AND finality < 3 AND finality < 2";
+/// Promote canonical blocks up to a block to confirmed. It walks only the
+/// rows above the highest finalized one at or below the block, which finality
+/// promoted together with every row below it. A confirmed row does not end
+/// the walk: one replayed confirmed above an attested row, as after a crash
+/// between promotions, leaves rows below it.
+const CONFIRMED_CANONICAL_PROMOTION: &str = "UPDATE canonical_blocks SET finality = 2
+     WHERE chain_id = ?1 AND block_number <= ?2 AND finality < 2
+       AND block_number > COALESCE((SELECT block_number FROM canonical_blocks
+             WHERE chain_id = ?1 AND block_number <= ?2 AND finality = 3
+             ORDER BY block_number DESC LIMIT 1), -1)";
+
 // Finalized promotions hold the writer, so each searches the partial index of
-// unfinalized rows instead of the whole retained window. The literal 2 is
+// unfinalized rows instead of the whole retained window. The literal 3 is
 // `finality_i64(Finality::Finalized)`.
 /// Mark a processor's unfinalized undo records at or below a block finalized.
 const FINALIZED_UNDO_PROMOTION: &str = "UPDATE undo_journal SET finalized = 1
      WHERE instance = ? AND block_number <= ? AND finalized = 0";
 /// Promote a processor's unfinalized output at or below a block.
-const FINALIZED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality = 2
-     WHERE instance = ? AND block_number <= ? AND finality < 2";
+const FINALIZED_OUTPUT_PROMOTION: &str = "UPDATE output_entity_meta SET finality = 3
+     WHERE instance = ? AND block_number <= ? AND finality < 3";
 
 // Delivery pruning runs every interval, and back to back while a stream is
 // over its limit, so no statement walks every change a stream retains.
@@ -17761,12 +17833,12 @@ const RECENT_FRAME_SIZES: &str = "SELECT block_number, block_hash, bytes
 // a single index search: exact and compact coverage are probed separately and
 // combined in Rust instead of scanning a UNION of both.
 
-/// Highest finalized exact coverage block. The literal 2 is
+/// Highest finalized exact coverage block. The literal 3 is
 /// `finality_i64(Finality::Finalized)`: the partial index
 /// `processor_coverage_finalized` is only usable for that literal, and it
 /// skips unfinalized rows, which grow without bound while finality is disabled.
 const FINALIZED_EXACT_COVERAGE_HEAD: &str = "SELECT block_number FROM processor_coverage
-     WHERE instance = ? AND finality = 2
+     WHERE instance = ? AND finality = 3
      ORDER BY block_number DESC LIMIT 1";
 /// Highest end of a compact finalized interval.
 const FINALIZED_COMPACT_COVERAGE_HEAD: &str = "SELECT end_block FROM finalized_coverage_intervals
@@ -18300,8 +18372,9 @@ fn processor_instance(descriptor: &ProcessorDescriptor) -> String {
 fn same_processor_identity(stored: &ProcessorDescriptor, configured: &ProcessorDescriptor) -> bool {
     let mut normalized = stored.clone();
     normalized.lifecycle = configured.lifecycle.clone();
-    // The two live levels store the same output and differ only in what a
-    // consumer sees first, so switching between them keeps the instance.
+    // The levels below finalized store the same output and differ only in
+    // what a consumer sees first, so switching between them keeps the
+    // instance.
     if stored.publication.publishes_unfinalized() && configured.publication.publishes_unfinalized()
     {
         normalized.publication = configured.publication;
@@ -19885,21 +19958,18 @@ fn decode_operation(value: i64) -> Result<ChangeOperation, StoreError> {
 /// A `canonical_blocks` row: number, hash, parent hash, timestamp, finality.
 type CanonicalRow = (i64, Vec<u8>, Vec<u8>, i64, i64);
 
+/// A level's stored integer is its rank, so SQL comparisons order levels.
 fn finality_i64(finality: Finality) -> i64 {
-    match finality {
-        Finality::Unattested => 0,
-        Finality::Attested => 1,
-        Finality::Finalized => 2,
-        Finality::Settled => 3,
-    }
+    i64::from(finality.rank())
 }
 
 fn decode_finality(value: i64) -> Result<Finality, StoreError> {
     match value {
         0 => Ok(Finality::Unattested),
         1 => Ok(Finality::Attested),
-        2 => Ok(Finality::Finalized),
-        3 => Ok(Finality::Settled),
+        2 => Ok(Finality::Confirmed),
+        3 => Ok(Finality::Finalized),
+        4 => Ok(Finality::Settled),
         _ => Err(StoreError::Invariant(format!(
             "invalid finality value {value}"
         ))),
@@ -22237,6 +22307,310 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_publication_parks_changes_until_confirmed() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Confirmed);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        let third = unattested(frame(3, second.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second, &third]).await;
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(3), third.block.hash)
+            .await
+            .expect("mark attested");
+        assert!(
+            change_summary(&store, &processor).await.is_empty(),
+            "attested blocks stay parked for a confirmed instance"
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 3);
+        assert_eq!(
+            store
+                .mark_confirmed(&processor.descriptor, BlockNumber(2), second.block.hash)
+                .await
+                .expect("mark confirmed"),
+            2
+        );
+        assert_eq!(
+            change_summary(&store, &processor).await,
+            vec![
+                (
+                    1,
+                    Finality::Confirmed,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+                (
+                    2,
+                    Finality::Confirmed,
+                    ChangeDirection::Apply,
+                    "fixture.counter".to_owned()
+                ),
+            ],
+            "a confirmed instance never saw lower rows, so it gets no marker"
+        );
+        assert_eq!(deferred_rows(&store, &processor).await, 1);
+        // A confirmed block is still undone, at its stored level.
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                BlockNumber(3),
+                third.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo parked block");
+        store
+            .undo(
+                &processor.descriptor,
+                ChainId(1),
+                BlockNumber(2),
+                second.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo confirmed block");
+        assert_eq!(
+            change_summary(&store, &processor)
+                .await
+                .last()
+                .map(|(number, finality, direction, _)| (*number, *finality, *direction)),
+            Some((2, Finality::Confirmed, ChangeDirection::Undo))
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_releases_changes_an_attested_promotion_missed() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        apply_unattested(&store, &processor, &[&first]).await;
+        store
+            .mark_confirmed(&processor.descriptor, BlockNumber(1), first.block.hash)
+            .await
+            .expect("mark confirmed");
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+        assert_eq!(
+            change_summary(&store, &processor)
+                .await
+                .into_iter()
+                .map(|(number, finality, direction, _)| (number, finality, direction))
+                .collect::<Vec<_>>(),
+            vec![
+                (1, Finality::Confirmed, ChangeDirection::Apply),
+                (1, Finality::Confirmed, ChangeDirection::Finalized),
+            ],
+            "the changes go out before the marker that covers them"
+        );
+    }
+
+    #[tokio::test]
+    async fn lower_publications_get_one_confirmed_marker() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second]).await;
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(2), second.block.hash)
+            .await
+            .expect("mark attested");
+        assert_eq!(
+            store
+                .mark_confirmed(&processor.descriptor, BlockNumber(2), second.block.hash)
+                .await
+                .expect("mark confirmed"),
+            2
+        );
+        let summary = change_summary(&store, &processor).await;
+        assert_eq!(
+            summary.last(),
+            Some(&(
+                2,
+                Finality::Confirmed,
+                ChangeDirection::Finalized,
+                "system.finality".to_owned()
+            ))
+        );
+        assert_eq!(
+            change_operation(
+                ChangeDirection::Finalized,
+                Finality::Confirmed,
+                "system.finality"
+            ),
+            "confirmed"
+        );
+        assert_eq!(
+            store
+                .mark_confirmed(&processor.descriptor, BlockNumber(2), second.block.hash)
+                .await
+                .expect("repeat"),
+            0
+        );
+        assert_eq!(
+            change_summary(&store, &processor).await.len(),
+            summary.len()
+        );
+        assert_eq!(
+            store
+                .processor_cursor(&processor.descriptor)
+                .await
+                .expect("cursor")
+                .map(|cursor| cursor.finality),
+            Some(Finality::Confirmed)
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmation_reaches_coverage_below_a_finalized_block() {
+        // A block-local processor can cover a block late, below one that is
+        // finalized already.
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Attested);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        let second = unattested(frame(2, first.block.hash));
+        let third = unattested(frame(3, second.block.hash));
+        apply_unattested(&store, &processor, &[&first, &second, &third]).await;
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(3), third.block.hash)
+            .await
+            .expect("mark attested");
+        sqlx::query("UPDATE processor_coverage SET finality = 3 WHERE block_number = 2")
+            .execute(&store.inner.pool)
+            .await
+            .expect("finalize the middle block");
+        assert_eq!(
+            store
+                .mark_confirmed(&processor.descriptor, BlockNumber(3), third.block.hash)
+                .await
+                .expect("mark confirmed"),
+            2
+        );
+        assert_eq!(
+            integers(
+                &store,
+                "SELECT finality FROM processor_coverage ORDER BY block_number"
+            )
+            .await,
+            [2, 3, 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn finality_releases_confirmed_publications_when_confirmation_stalls() {
+        let (_directory, store) = store().await;
+        let processor = processor_publishing(PublicationPolicy::Confirmed);
+        let first = unattested(frame(1, BlockHash::ZERO));
+        apply_unattested(&store, &processor, &[&first]).await;
+        store
+            .mark_attested(&processor.descriptor, BlockNumber(1), first.block.hash)
+            .await
+            .expect("mark attested");
+        store
+            .mark_finalized(&processor.descriptor, BlockNumber(1), first.block.hash)
+            .await
+            .expect("mark finalized");
+        assert_eq!(deferred_rows(&store, &processor).await, 0);
+        assert!(change_summary(&store, &processor).await.iter().any(
+            |(number, finality, direction, _)| (*number, *finality, *direction)
+                == (1, Finality::Finalized, ChangeDirection::Apply)
+        ));
+    }
+
+    #[tokio::test]
+    async fn recent_canonical_blocks_promote_to_confirmed_once_attested() {
+        let (_directory, store) = store().await;
+        let first = frame(1, BlockHash::ZERO).block;
+        let second = frame(2, first.hash).block;
+        let third = frame(3, second.hash).block;
+        let fourth = frame(4, third.hash).block;
+        for (block, finality) in [
+            (first, Finality::Finalized),
+            (second, Finality::Attested),
+            (third, Finality::Attested),
+            (fourth, Finality::Unattested),
+        ] {
+            store
+                .store_canonical_anchor(ChainId(1), block, finality)
+                .await
+                .expect("seed row");
+        }
+        for (number, hash) in [
+            (BlockNumber(3), BlockHash::new([9; 32])),
+            (BlockNumber(4), fourth.hash),
+            (BlockNumber(5), BlockHash::new([5; 32])),
+        ] {
+            assert!(
+                !store
+                    .mark_recent_confirmed(ChainId(1), number, hash)
+                    .await
+                    .expect("refused"),
+                "another, unattested, or unknown block is never confirmed"
+            );
+        }
+        assert!(
+            store
+                .mark_recent_confirmed(ChainId(1), BlockNumber(3), third.hash)
+                .await
+                .expect("promote")
+        );
+        let mut levels = Vec::new();
+        for number in 1..=4 {
+            levels.push(
+                store
+                    .canonical_block(ChainId(1), BlockNumber(number))
+                    .await
+                    .expect("row")
+                    .map(|(_, finality)| finality),
+            );
+        }
+        assert_eq!(
+            levels,
+            [
+                Some(Finality::Finalized),
+                Some(Finality::Confirmed),
+                Some(Finality::Confirmed),
+                Some(Finality::Unattested),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn confirmed_promotion_reaches_rows_below_a_replayed_confirmed_row() {
+        // A crash between the canonical and the processor promotion replays a
+        // block as confirmed above an attested one.
+        let (_directory, store) = store().await;
+        let mut parent = BlockHash::ZERO;
+        for (number, finality) in [
+            (1, Finality::Finalized),
+            (2, Finality::Attested),
+            (3, Finality::Confirmed),
+            (4, Finality::Attested),
+        ] {
+            let block = frame(number, parent).block;
+            parent = block.hash;
+            store
+                .store_canonical_anchor(ChainId(1), block, finality)
+                .await
+                .expect("seed row");
+        }
+        assert!(
+            store
+                .mark_recent_confirmed(ChainId(1), BlockNumber(4), parent)
+                .await
+                .expect("promote")
+        );
+        assert_eq!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(2))
+                .await
+                .expect("row")
+                .map(|(_, finality)| finality),
+            Some(Finality::Confirmed)
+        );
+    }
+
+    #[tokio::test]
     async fn restart_reverts_unattested_rows() {
         let (_directory, store) = store().await;
         let anchor = frame(10, BlockHash::ZERO).block;
@@ -22673,7 +23047,7 @@ mod tests {
         .await
         .expect("schema");
         assert!(
-            table.contains("CHECK (finality BETWEEN 0 AND 3)"),
+            table.contains("CHECK (finality BETWEEN 0 AND 4)"),
             "{table}"
         );
         let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
@@ -29775,6 +30149,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn confirmed_promotions_search_only_unfinalized_rows() {
+        let (_directory, store) = store().await;
+        for (statement, index) in [
+            (
+                CONFIRMED_COVERAGE_PROMOTION,
+                "processor_coverage_unconfirmed",
+            ),
+            (CONFIRMED_OUTPUT_PROMOTION, "output_entity_meta_unfinalized"),
+            (CONFIRMED_CANONICAL_PROMOTION, "PRIMARY KEY"),
+        ] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter()
+                    .any(|step| step.starts_with("SEARCH") && step.contains(index))
+                    && !plan.iter().any(|step| step.starts_with("SCAN")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn finalized_promotions_search_only_unfinalized_rows() {
         let (_directory, store) = store().await;
         for (statement, index) in [
@@ -30094,7 +30489,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -30133,6 +30528,229 @@ mod tests {
                 .map(|cursor| cursor.block_number),
             Some(BlockNumber(1))
         );
+    }
+
+    async fn integers(store: &SqliteStore, sql: &'static str) -> Vec<i64> {
+        sqlx::query_scalar(sql)
+            .fetch_all(&store.inner.pool)
+            .await
+            .expect(sql)
+    }
+
+    /// A new store file at `path` taken to `schema` by the migrations
+    /// alone, holding the processor instance `fixture`.
+    async fn store_file_at_schema(path: &Path, schema: u32) -> SqliteConnection {
+        let mut connection = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .foreign_keys(true)
+            .connect()
+            .await
+            .expect("connect");
+        sqlx::raw_sql(SCHEMA_V1)
+            .execute(&mut connection)
+            .await
+            .expect("schema 1");
+        for &(_, migration) in MIGRATIONS.iter().filter(|(target, _)| *target <= schema) {
+            sqlx::raw_sql(migration)
+                .execute(&mut connection)
+                .await
+                .expect("migration");
+        }
+        sqlx::raw_sql(
+            "INSERT INTO processor_instances(instance, processor_id, processor_version,
+                 code_hash, config_hash, descriptor_json, created_at_unix_ms)
+             VALUES ('fixture', 'fixture', '1.0.0', zeroblob(32), zeroblob(32), '{}', 0);",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("instance");
+        let mut transaction = Connection::begin(&mut connection).await.expect("begin");
+        install_node_secret(&mut transaction)
+            .await
+            .expect("node secret");
+        transaction.commit().await.expect("commit");
+        connection
+    }
+
+    #[tokio::test]
+    async fn schema_29_stores_renumber_settled_changes_to_their_rank() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let mut connection = store_file_at_schema(&path, 29).await;
+        // Schema 28 and 29 binaries edited the change log's constraint in
+        // place to admit settled as 3; the migrations alone leave it at 0 to 2.
+        sqlx::raw_sql(
+            "PRAGMA ignore_check_constraints = ON;
+             INSERT INTO change_log(chain_id, instance, block_number, block_hash, direction,
+                 kind, entity_key, operation, payload, created_at_unix_ms, finality, stream_id,
+                 stream_sequence)
+             VALUES (1, 'fixture', 10, zeroblob(32), 'finalized', 'system.finality', X'01', 0,
+                         X'', 0, 3, 's', 1),
+                    (1, 'fixture', 11, zeroblob(32), 'apply', 'k', X'02', 0, X'', 0, 2, 's', 2);",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("schema 29 rows");
+        connection.close().await.expect("close");
+
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("schema 29 upgrades in place");
+        assert_eq!(
+            integers(
+                &store,
+                "SELECT finality FROM change_log ORDER BY stream_sequence"
+            )
+            .await,
+            [
+                finality_i64(Finality::Settled),
+                finality_i64(Finality::Finalized)
+            ]
+        );
+        sqlx::query("UPDATE change_log SET finality = 5")
+            .execute(&store.inner.pool)
+            .await
+            .expect_err("5 is no level");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn schema_27_stores_renumber_finalized_rows_to_their_rank() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let mut connection = store_file_at_schema(&path, 27).await;
+        // Levels as schema 27 stored them: unattested 0, attested 1,
+        // finalized 2. Pruning left the sequence counter above the last change.
+        sqlx::raw_sql(
+            "INSERT INTO change_log(sequence, chain_id, instance, block_number, block_hash,
+                 direction, kind, entity_key, operation, payload, created_at_unix_ms,
+                 finality, stream_id, stream_sequence)
+             VALUES (5, 1, 'fixture', 10, zeroblob(32), 'apply', 'k', X'01', 0, X'', 0, 2, 's', 1),
+                    (6, 1, 'fixture', 11, zeroblob(32), 'apply', 'k', X'02', 0, X'', 0, 1, 's', 2),
+                    (7, 1, 'fixture', 12, zeroblob(32), 'apply', 'k', X'03', 0, X'', 0, 0, 's', 3);
+             UPDATE sqlite_sequence SET seq = 99 WHERE name = 'change_log';
+             INSERT INTO sink_outbox(sink_id, change_sequence) VALUES ('sink', 6);
+             INSERT INTO entities VALUES ('fixture', 'c', X'01', X''), ('fixture', 'c', X'02', X'');
+             INSERT INTO output_entity_meta VALUES
+                 ('fixture', 'c', X'01', 10, 0, 2, 0, 0), ('fixture', 'c', X'02', 11, 0, 1, 0, 0);
+             INSERT INTO query_snapshots(snapshot_id, instance, collection, boundary_sequence,
+                 row_count, value_bytes, created_at_unix_ms, expires_at_unix_ms)
+             VALUES (zeroblob(16), 'fixture', 'c', 0, 1, 0, 0, 0);
+             INSERT INTO query_snapshot_entities VALUES (zeroblob(16), 0, X'01', X'', 10, 0, 2);
+             INSERT INTO canonical_blocks VALUES
+                 (1, 10, zeroblob(32), zeroblob(32), 0, 2), (1, 11, zeroblob(32), zeroblob(32), 0, 1);
+             INSERT INTO processor_coverage(instance, block_number, block_hash, finality) VALUES
+                 ('fixture', 10, zeroblob(32), 2), ('fixture', 11, zeroblob(32), 0);
+             INSERT INTO processor_cursors VALUES ('fixture', 'cursor', 10, zeroblob(32), 2, 0);",
+        )
+        .execute(&mut connection)
+        .await
+        .expect("schema 27 rows");
+        connection.close().await.expect("close");
+
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("schema 27 upgrades in place");
+        assert_eq!(schema_on_disk(&path).await, CURRENT_SCHEMA_VERSION);
+        for (sql, expected) in [
+            (
+                "SELECT finality FROM change_log ORDER BY sequence",
+                vec![3, 1, 0],
+            ),
+            (
+                "SELECT finality FROM output_entity_meta ORDER BY entity_key",
+                vec![3, 1],
+            ),
+            ("SELECT finality FROM query_snapshot_entities", vec![3]),
+            (
+                "SELECT finality FROM canonical_blocks ORDER BY block_number",
+                vec![3, 1],
+            ),
+            (
+                "SELECT finality FROM processor_coverage ORDER BY block_number",
+                vec![3, 0],
+            ),
+            ("SELECT finality FROM processor_cursors", vec![3]),
+            ("SELECT change_sequence FROM sink_outbox", vec![6]),
+            (
+                "SELECT seq FROM sqlite_sequence WHERE name = 'change_log'",
+                vec![99],
+            ),
+        ] {
+            assert_eq!(integers(&store, sql).await, expected, "{sql}");
+        }
+        assert_eq!(
+            store
+                .canonical_block(ChainId(1), BlockNumber(10))
+                .await
+                .expect("block")
+                .map(|(_, finality)| finality),
+            Some(Finality::Finalized)
+        );
+        for (confirmed, invalid) in [
+            (
+                "UPDATE change_log SET finality = 2",
+                "UPDATE change_log SET finality = 5",
+            ),
+            (
+                "UPDATE output_entity_meta SET finality = 2",
+                "UPDATE output_entity_meta SET finality = 4",
+            ),
+            (
+                "UPDATE query_snapshot_entities SET finality = 2",
+                "UPDATE query_snapshot_entities SET finality = 4",
+            ),
+        ] {
+            sqlx::query(confirmed)
+                .execute(&store.inner.pool)
+                .await
+                .expect("confirmed is a stored level");
+            sqlx::query(invalid)
+                .execute(&store.inner.pool)
+                .await
+                .expect_err("no such level");
+        }
+        let partial: Vec<String> = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master
+             WHERE name IN ('output_entity_meta_unfinalized', 'processor_coverage_finalized',
+                            'processor_coverage_unconfirmed')
+             ORDER BY name",
+        )
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("partial indexes");
+        assert!(partial[0].ends_with("WHERE finality < 3"), "{}", partial[0]);
+        assert!(partial[1].ends_with("WHERE finality = 3"), "{}", partial[1]);
+        assert!(partial[2].ends_with("WHERE finality < 2"), "{}", partial[2]);
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master
+             WHERE type = 'index' AND tbl_name IN ('change_log', 'output_entity_meta')
+             ORDER BY name",
+        )
+        .fetch_all(&store.inner.pool)
+        .await
+        .expect("indexes");
+        assert_eq!(
+            indexes,
+            [
+                "change_log_backfill_completion",
+                "change_log_instance_sequence",
+                "change_log_stream_block",
+                "change_log_stream_created",
+                "change_log_stream_origin_sequence",
+                "change_log_stream_sequence_unique",
+                "output_entity_meta_by_block",
+                "output_entity_meta_unattested",
+                "output_entity_meta_unfinalized",
+            ]
+        );
+        let violations: Vec<String> =
+            sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
+                .fetch_all(&store.inner.pool)
+                .await
+                .expect("foreign key check");
+        assert!(violations.is_empty(), "{violations:?}");
     }
 
     /// The blobs processor of the container profile under `instance`, at
@@ -30310,10 +30928,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001e' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'0000001f' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 30");
+            .expect("schema 31");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -30323,7 +30941,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 30);
+        assert_eq!(schema_on_disk(&newer).await, 31);
     }
 
     /// Store `current` as a recent frame in schema 1 frame encoding, then
@@ -30509,7 +31127,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 29);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION

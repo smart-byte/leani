@@ -19,13 +19,14 @@ are related but deliberately not collapsed into one boolean.
 ## Finality levels and publish modes
 
 Every record carries one level. A block only ever rises: unattested,
-attested, finalized, and on a rollup settled. It is never published twice;
-each rise is a marker.
+attested, confirmed, finalized, and on a rollup settled. It is never
+published twice; each rise is a marker.
 
 | Level | Evidence | Typical delay after the slot starts | Can be undone |
 |---|---|---|---|
 | `unattested` | At least two execution peers served the same header, it passes Leani's header rules (base fee, gas limit, blob gas, slot timing, fork fields), and it extends the delivered chain within two slots of the newest attested head | ~2–5 s today; ~5–14 s after Glamsterdam | Yes: by a reorg, by an attested head on another block, or after 60 s without an attestation |
 | `attested` | At least 342 of 512 sync-committee members signed it (or a descendant), verified locally from a light-client update. After Glamsterdam the committee signs the next beacon block, which builds on this payload | ~15 s today; ~25–29 s after Glamsterdam | Yes, by a reorg |
+| `confirmed` | Attested, and the `[confirmation]` endpoints report that Ethereum's Fast Confirmation Rule confirmed it or a descendant. Only blocks this node verified as attested with at least 384 of 512 signers count. It rests on those endpoints, not on Leani's own verification | With `attested` for most blocks: ~15 s today; ~25–29 s after Glamsterdam. A slot or more later when the rule holds a block back, as after a missed slot | Only if the rule's assumptions fail: more than a quarter of stake adversarial, or attestations delayed past their slot |
 | `finalized` | Casper FFG finality, verified from a light-client finality update | ~13–19 min | No |
 
 On a rollup, `attested` is the sequencer's signature on the block, and the
@@ -51,14 +52,25 @@ is the one the sequencer signed on its feed. Ethereum's own blocks end at
 
 | `publish` | First level | Markers | Query-then-follow |
 |---|---|---|---|
-| `unattested` (default) | `unattested` | `attested`, then `finalized` | Yes |
-| `attested` | `attested` | `finalized` | No: its state holds unpublished unattested blocks |
+| `unattested` (default) | `unattested` | `attested`, `confirmed`, then `finalized` | Yes |
+| `attested` | `attested` | `confirmed`, then `finalized` | No: its state holds unpublished unattested blocks |
+| `confirmed` | `confirmed` | `finalized` | No: its state holds unpublished lower blocks |
 | `finalized` | `finalized` | `settled`, on a rollup | No |
 | `settled` | `settled`, on a rollup with an L1 anchor | none | No |
 
 An Ethereum RPC's `latest` corresponds to `unattested`; Leani's JSON-RPC
-`latest` is the delivered tip at any level, and `safe` and `finalized` name
-the finalized head.
+`latest` is the delivered tip at any level, `safe` names the newest confirmed
+block, or the finalized head without `[confirmation]`, and `finalized` the
+finalized head.
+
+`confirmed` needs `[confirmation]` endpoints: consensus nodes with Fast
+Confirmation enabled (Lighthouse `--enable-fast-confirmation`, Lodestar
+`--chain.fastConfirmation`), whose `fast_confirmation` events name confirmed
+blocks. Ethereum Mainnet's defaults name ChainSafe's public Lodestar node; run
+your own for production. `minimum_agreement` endpoints must agree, and each
+endpoint's vote counts only while the node holds its block canonical. When
+the endpoints stall or reset, nothing new is confirmed and blocks wait for
+`finalized`; a block's level never drops. `endpoints = []` disables it.
 
 Choose `attested` when a consumer must never act on a block that is later
 undone for want of an attestation. Late blocks — first served more than 7 s
@@ -139,8 +151,8 @@ only what it did not fill; see
 
 ## Reorgs are delivery events
 
-For attested publication (`publish = "attested"`), downstream
-consumers can see `apply`, `undo`, and
+For attested or confirmed publication (`publish = "attested"` or
+`"confirmed"`), downstream consumers can see `apply`, `undo`, and
 later `finalized` changes. Processor state, undo records, and published changes
 commit together. A consumer must implement these operations idempotently and
 must not infer finality from age alone.

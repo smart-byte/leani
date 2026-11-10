@@ -182,13 +182,16 @@ struct NetworkTelemetryInner {
     preferred_peer_slots: AtomicU64,
     max_outbound_peer_slots: AtomicU64,
     max_concurrent_dials: AtomicU64,
-    /// Blocks the live lane delivered, by finality code.
+    /// Blocks the live lane delivered, by position in
+    /// [`LIVE_DELIVERY_LEVELS`].
     live_blocks: [AtomicU64; 3],
-    /// Their summed delay after their slot started, by finality code.
+    /// Their summed delay after their slot started, by the same position.
     live_delay_ms: [AtomicU64; 3],
     /// Unattested blocks undone, by [`UnattestedUndo`].
     unattested_undone: [AtomicU64; 3],
     unattested_held: AtomicU64,
+    confirmed_reorgs: AtomicU64,
+    confirmation: RwLock<Option<NetworkConfirmationSnapshot>>,
     disconnect_reasons: RwLock<BTreeMap<NetworkDisconnectReason, u64>>,
     peer_origins: RwLock<BTreeMap<NetworkPeerOrigin, PeerOriginRecord>>,
     sessions: RwLock<BTreeMap<u64, SessionRecord>>,
@@ -224,6 +227,8 @@ impl Default for NetworkTelemetry {
                 live_delay_ms: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 unattested_undone: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
                 unattested_held: AtomicU64::new(0),
+                confirmed_reorgs: AtomicU64::new(0),
+                confirmation: RwLock::new(None),
                 disconnect_reasons: RwLock::new(BTreeMap::new()),
                 peer_origins: RwLock::new(BTreeMap::new()),
                 sessions: RwLock::new(BTreeMap::new()),
@@ -244,16 +249,14 @@ impl NetworkTelemetry {
     /// Count a block the live lane delivered at `level`, `delay` after its
     /// slot started.
     pub fn record_live_block(&self, level: Finality, delay: Duration) {
-        // The live lane delivers blocks up to finalized; settlement comes later.
-        let index = usize::from(level as u8);
-        let (Some(blocks), Some(delays)) = (
-            self.inner.live_blocks.get(index),
-            self.inner.live_delay_ms.get(index),
-        ) else {
+        let Some(index) = LIVE_DELIVERY_LEVELS
+            .iter()
+            .position(|delivered| *delivered == level)
+        else {
             return;
         };
-        blocks.fetch_add(1, Ordering::Relaxed);
-        delays.fetch_add(
+        self.inner.live_blocks[index].fetch_add(1, Ordering::Relaxed);
+        self.inner.live_delay_ms[index].fetch_add(
             u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
@@ -267,6 +270,17 @@ impl NetworkTelemetry {
     /// Count a late block the live lane held for its child.
     pub fn record_unattested_held(&self) {
         self.inner.unattested_held.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Count a reorg that reverted a confirmed block.
+    pub fn record_confirmed_reorg(&self) {
+        self.inner.confirmed_reorgs.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Publish what backs the `confirmed` level, or `None` while no
+    /// `[confirmation]` endpoint is followed.
+    pub fn set_confirmation(&self, confirmation: Option<NetworkConfirmationSnapshot>) {
+        *write_lock(&self.inner.confirmation) = confirmation;
     }
 
     /// Publish execution peer availability and pool targets.
@@ -569,6 +583,7 @@ impl NetworkTelemetry {
             },
             sessions,
             live_levels: self.live_levels(),
+            confirmation: read_lock(&self.inner.confirmation).clone(),
         }
     }
 
@@ -583,6 +598,7 @@ impl NetworkTelemetry {
             delay_milliseconds: load(&self.inner.live_delay_ms),
             unattested_undone: load(&self.inner.unattested_undone),
             unattested_held: self.inner.unattested_held.load(Ordering::Relaxed),
+            confirmed_reorgs: self.inner.confirmed_reorgs.load(Ordering::Relaxed),
         }
     }
 }
@@ -717,13 +733,75 @@ pub struct NetworkTelemetrySnapshot {
     pub supervisor: NetworkSupervisorSnapshot,
     pub sessions: Vec<NetworkSessionSnapshot>,
     pub live_levels: NetworkLiveLevelsSnapshot,
+    /// What backs the `confirmed` level; `None` while no `[confirmation]`
+    /// endpoint is followed.
+    pub confirmation: Option<NetworkConfirmationSnapshot>,
 }
+
+/// The `[confirmation]` endpoints and what they agree on. `confirmed` rests
+/// on these endpoints, not on this node's own verification.
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkConfirmationSnapshot {
+    pub minimum_agreement: usize,
+    /// The head enough fresh endpoints last agreed on. The live lane
+    /// confirms through it once it holds every counted vote canonical.
+    pub agreed_head: Option<NetworkConfirmationHeadSnapshot>,
+    /// Beacon slots from that head to now. It grows while the endpoints
+    /// stall.
+    pub lag_slots: Option<u64>,
+    pub endpoints: Vec<NetworkConfirmationEndpointSnapshot>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkConfirmationHeadSnapshot {
+    pub beacon_slot: u64,
+    pub block_number: u64,
+    pub block_hash: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetworkConfirmationEndpointSnapshot {
+    /// The endpoint without credentials.
+    pub endpoint: String,
+    pub state: NetworkConfirmationEndpointState,
+    /// Beacon slot of the block its newest event named.
+    pub last_event_slot: Option<u64>,
+    /// Local beacon slot its newest event arrived in.
+    pub last_event_received_slot: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkConfirmationEndpointState {
+    /// No event yet.
+    #[default]
+    Connecting,
+    Connected,
+    /// No event in the last three slots.
+    Stale,
+    /// Its newest confirmation is older than its previous one: the rule fell
+    /// back to finality. Nothing is demoted.
+    Reset,
+    /// Its stream failed; it reconnects.
+    Error,
+}
+
+/// The levels a live lane delivers blocks at. A block rises to `confirmed`
+/// only after delivery.
+pub const LIVE_DELIVERY_LEVELS: [Finality; 3] = [
+    Finality::Unattested,
+    Finality::Attested,
+    Finality::Finalized,
+];
 
 /// Blocks the live lane delivered, by level, and the unattested ones it undid.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkLiveLevelsSnapshot {
-    /// Blocks delivered at `unattested`, `attested` and `finalized`.
+    /// Blocks delivered at each of [`LIVE_DELIVERY_LEVELS`].
     pub blocks: [u64; 3],
     /// Their summed delay after their slot started, in milliseconds.
     pub delay_milliseconds: [u64; 3],
@@ -732,6 +810,8 @@ pub struct NetworkLiveLevelsSnapshot {
     pub unattested_undone: [u64; 3],
     /// Late blocks held for their child.
     pub unattested_held: u64,
+    /// Reorgs that reverted a confirmed block.
+    pub confirmed_reorgs: u64,
 }
 
 /// Why the live lane undid unattested blocks.

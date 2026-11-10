@@ -279,11 +279,13 @@ pub const fn slot_at(timestamp: u64) -> u64 {
     timestamp.saturating_sub(MAINNET_GENESIS_TIME) / SLOT_SECONDS
 }
 
-/// Chain-confidence level of a block. Ordering is intentional.
+/// Chain-confidence level of a block, ordered by [`Finality::rank`].
 ///
 /// The serde names are the storage names of 0.1.0-rc.6: stored descriptors
 /// and their hashes contain them. Public JSON uses [`Finality::name`].
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+/// Durable postcard records store the variant index, so a new level is
+/// appended and the order comes from the rank, not the declaration.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[repr(u8)]
 pub enum Finality {
     /// At least two peers served the block, it passed the header rules, and
@@ -302,12 +304,49 @@ pub enum Finality {
     /// the block, so withdrawals from it can complete. Ethereum's own blocks
     /// never reach it.
     Settled = 3,
+    /// Attested, and the operator's `[confirmation]` endpoints report that
+    /// Ethereum's Fast Confirmation Rule confirmed it or a descendant. A
+    /// reorg removes it only if the rule's synchrony or honesty assumptions
+    /// fail.
+    Confirmed = 4,
 }
 
 impl Finality {
+    /// Every level, lowest first.
+    pub const ALL: [Self; 5] = [
+        Self::Unattested,
+        Self::Attested,
+        Self::Confirmed,
+        Self::Finalized,
+        Self::Settled,
+    ];
+
+    /// The levels a block and its output hold, lowest first. Settled is not
+    /// one: a settled block stays finalized, at or below its chain's settled
+    /// head.
+    pub const BLOCK_LEVELS: [Self; 4] = [
+        Self::Unattested,
+        Self::Attested,
+        Self::Confirmed,
+        Self::Finalized,
+    ];
+
+    /// Position in the order unattested < attested < confirmed < finalized
+    /// < settled.
+    #[must_use]
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::Unattested => 0,
+            Self::Attested => 1,
+            Self::Confirmed => 2,
+            Self::Finalized => 3,
+            Self::Settled => 4,
+        }
+    }
+
     #[must_use]
     pub const fn satisfies(self, required: Self) -> bool {
-        self as u8 >= required as u8
+        self.rank() >= required.rank()
     }
 
     /// Lowercase wire name used by every public JSON surface.
@@ -316,9 +355,22 @@ impl Finality {
         match self {
             Self::Unattested => "unattested",
             Self::Attested => "attested",
+            Self::Confirmed => "confirmed",
             Self::Finalized => "finalized",
             Self::Settled => "settled",
         }
+    }
+}
+
+impl Ord for Finality {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.rank().cmp(&other.rank())
+    }
+}
+
+impl PartialOrd for Finality {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -399,6 +451,46 @@ mod tests {
             postcard::to_allocvec(&Finality::Settled).expect("encodes"),
             [3]
         );
+    }
+
+    #[test]
+    fn confirmed_ranks_between_attested_and_finalized() {
+        let (unattested, attested, confirmed, finalized) = (
+            Finality::Unattested,
+            Finality::Attested,
+            Finality::Confirmed,
+            Finality::Finalized,
+        );
+        assert!(unattested < attested && attested < confirmed && confirmed < finalized);
+        assert!(confirmed.satisfies(attested));
+        assert!(!confirmed.satisfies(finalized));
+        assert!(finalized.satisfies(confirmed));
+        assert!(!attested.satisfies(confirmed));
+        assert_eq!(attested.max(confirmed), confirmed);
+        assert_eq!(finalized.min(confirmed), confirmed);
+        let mut levels = vec![finalized, unattested, confirmed, attested];
+        levels.sort();
+        assert_eq!(levels, vec![unattested, attested, confirmed, finalized]);
+        assert_eq!(confirmed.name(), "confirmed");
+        assert!(finalized < Finality::Settled);
+        assert!(Finality::ALL.is_sorted());
+    }
+
+    #[test]
+    fn durable_finality_bytes_keep_their_meaning() {
+        assert_eq!(
+            postcard::to_allocvec(&Finality::Finalized).expect("encode"),
+            [2]
+        );
+        assert_eq!(
+            postcard::to_allocvec(&Finality::Confirmed).expect("encode"),
+            [4]
+        );
+        assert_eq!(
+            postcard::from_bytes::<Finality>(&[2]).expect("decode"),
+            Finality::Finalized
+        );
+        assert_eq!(Finality::Finalized as u8, 2);
     }
 
     #[test]
