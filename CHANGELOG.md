@@ -417,6 +417,10 @@ record, and documented RPC contracts.
   then reached that server. The `weth-transfers` example's API moves from
   port 8081, a common dev port, to 18081.
 
+### Security
+
+- Updated rustix to 1.1.6 for RUSTSEC-2026-0486.
+
 ## [0.1.1] - 2026-10-29
 
 ### Changed
