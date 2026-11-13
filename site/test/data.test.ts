@@ -4,6 +4,7 @@ import followExamples from '../src/data/follow-examples.json';
 import followSession from '../src/data/follow-session.json';
 import handoffSession from '../src/data/handoff-session.json';
 import costs from '../src/data/costs.json';
+import demos from '../src/data/demos.json';
 import processorCatalog from '../../docs/reference/generated/processor-catalog.json';
 import { blockRowHtml } from '../src/lib/block-row';
 
@@ -126,6 +127,24 @@ describe('canned data', () => {
     expect(showcaseSource).toContain("exampleSource('custom-query-client')");
     expect(quickstartSource).toContain("exampleSource('live-block-first-run')");
     expect(quickstartSource).toContain("exampleSource('live-block-node')");
+  });
+
+  test('the production excerpts are dated, ranked, and drawable', () => {
+    expect(demos.recordedAt).toMatch(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
+    const blobs = demos.blobs.rows.map((row) => row.blobs);
+    expect(blobs).toEqual([...blobs].sort((a, b) => b - a));
+    expect(blobs.reduce((sum, count) => sum + count, 0)).toBeLessThanOrEqual(demos.blobs.blobs);
+    // A cell names its poster's row, or the first index past the rows for anyone else.
+    const { recent } = demos.blobs;
+    expect(recent.cells).toHaveLength(recent.to - recent.from + 1);
+    for (const column of recent.cells) {
+      expect(column.length).toBeLessThanOrEqual(recent.max);
+      expect(column).toMatch(new RegExp(`^[0-${demos.blobs.rows.length}]*$`));
+    }
+    for (const row of demos.ticker.rows) {
+      expect(row.price).toMatch(/^\$[\d,]+\.\d\d$/);
+      expect(row.week.length).toBeGreaterThan(24);
+    }
   });
 
   test('storage table has 4 lifecycle profiles and evidence notes', () => {

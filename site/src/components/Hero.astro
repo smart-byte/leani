@@ -1,20 +1,13 @@
 ---
 import EngineWorld from './EngineWorld.astro';
 import { HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
-
-// The chain entries the node bundles; testnets are not counted.
-const chainEntries = Object.values(
-  import.meta.glob<string>('../../../config/chains/*.toml', { query: '?raw', import: 'default', eager: true }),
-);
-const rollups = chainEntries.filter(
-  (entry) => !/^family = "ethereum"/m.test(entry) && !/^name = "[^"]*-(sepolia|hoodi)"/m.test(entry),
-).length;
+import { ROLLUP_COUNT } from '../lib/chains';
 
 // Measured or registry-backed facts; the storage figure is the externalized
 // profile's evidence row in data/costs.json, footnoted there as workload-specific.
 const stats = [
   ['0 API keys', 'public datasets and peer-to-peer'],
-  [`Ethereum + ${rollups} rollups`, 'OP Mainnet, Base, Arbitrum One, and more'],
+  [`Ethereum + ${ROLLUP_COUNT} rollups`, 'OP Mainnet, Base, Arbitrum One, and more'],
   ['1M blocks → 9.5 MB', 'on disk when your database keeps the results'],
   ['MIT-licensed', 'Rust library and standalone node'],
 ];
@@ -28,13 +21,14 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
       <a class="eyebrow mono" href={LIMITATIONS_URL}>Stable release</a>
       <h1>Ethereum data without the RPC bill.</h1>
       <p class="sub">
-        An indexing node you run yourself. It backfills history from public
-        datasets, follows Ethereum and its rollups live, and serves your app's
-        data over JSON-RPC, HTTP, and a TypeScript SDK.
+        An indexing node you run next to your app. It backfills history from
+        public datasets, follows Ethereum and its rollups live, and serves
+        the data your app needs, every block labelled with how final it is,
+        over JSON-RPC, HTTP, and a TypeScript SDK.
       </p>
       <div class="cta">
         <a class="btn btn-primary" href="#quickstart">Quickstart</a>
-        <a class="btn btn-ghost" href="#demos">Live demos</a>
+        <a class="btn btn-ghost" href="#demos">See it in production</a>
       </div>
     </div>
 

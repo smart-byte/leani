@@ -1,41 +1,107 @@
 ---
+import processorReference from '../generated/processors-reference.json';
+
 const steps = [
   ['Backfill', 'History comes from public datasets or from peers, so there is no full node to sync.'],
   ['Follow', 'New blocks arrive live: Ethereum’s over its peer-to-peer network, rollups’ over their gossip, sequencer feed, or JSON-RPC.'],
   ['Process', 'Your processors turn each block into your app’s data, and leani keeps only their results.'],
   ['Serve', 'Query it over HTTP, JSON-RPC, or the TypeScript SDK, and stream every change, reorgs included.'],
 ] as const;
+const inside = [
+  ['Processors do the work', `${processorReference.processors.length} built in, or your own in Rust or Wasm.`, '/inside/#processors'],
+  ['Storage is a policy', 'A million blocks fit in 9.5 MB when your database keeps the results.', '/inside/#storage'],
+  ['An exact RPC subset', 'Which methods a node answers, and which it refuses.', '/inside/#rpc'],
+] as const;
+
+const BLOCK = 12, FLOOR = 40;
+const row = (n: number, pitch: number, from = 0) => Array.from({ length: n }, (_, i) => from + i * pitch);
+const backfill = row(15, 16);
+const follow = row(6, 34, 40);
+const process = row(13, 16);
+const KEPT = new Set([3, 9]);
 ---
 <section id="how" class="section" aria-labelledby="how-h">
   <div class="wrap">
     <h2 id="how-h"><span class="mono"># </span>How it works</h2>
     <p class="lede">
       History and the live chain take the same four steps and meet without a
-      gap. <a href="/docs/concepts/how-leani-works/">How leani works</a>
+      gap. <a class="more" href="/docs/concepts/how-leani-works/">How leani works</a>
     </p>
     <ol class="steps">
-      {steps.map(([name, text]) => (
+      {steps.map(([name, text], step) => (
         <li>
+          <svg class="shelf" viewBox="0 0 240 48" aria-hidden="true">
+            <path d={`M0 ${FLOOR + 0.5}H240`} class="floor" />
+            {step === 0 && backfill.map((x, i) => (
+              <rect x={x} y={FLOOR - BLOCK} width={BLOCK} height={BLOCK} rx="1.5" class={i < 11 ? 'old' : 'loading'} style={`opacity: ${i < 11 ? 0.25 + (i / 10) * 0.75 : 1}`} />
+            ))}
+            {step === 1 && (
+              <Fragment>
+                {follow.map((x, i) => <rect x={x} y={FLOOR - BLOCK} width={BLOCK} height={BLOCK} rx="1.5" class={i === follow.length - 1 ? 'new' : 'live'} />)}
+                <path d={`M${follow.at(-1)! + BLOCK + 9} 6V${FLOOR}`} class="now" />
+                <text x={follow.at(-1)! + BLOCK + 15} y="13" class="label">now</text>
+              </Fragment>
+            )}
+            {step === 2 && process.map((x, i) => (KEPT.has(i)
+              ? <rect x={x} y={FLOOR - BLOCK} width={BLOCK} height={BLOCK} rx="1.5" class="kept" />
+              : <rect x={x + 4} y={FLOOR - 4} width="4" height="4" rx="1" class="dropped" />
+            ))}
+            {step === 3 && (
+              <Fragment>
+                <rect x="0" y={FLOOR - BLOCK} width={BLOCK} height={BLOCK} rx="1.5" class="kept" />
+                {[['HTTP', 10], ['JSON-RPC', 24], ['SDK', 38]].map(([label, y]) => (
+                  <Fragment>
+                    <path d={`M${BLOCK + 4} ${FLOOR - BLOCK / 2}C52 ${FLOOR - BLOCK / 2} 44 ${y} 86 ${y}`} class="wire" />
+                    <text x="92" y={Number(y) + 3.5} class="label out">{label}</text>
+                  </Fragment>
+                ))}
+              </Fragment>
+            )}
+          </svg>
           <h3 class="mono">{name}</h3>
           <p>{text}</p>
         </li>
       ))}
     </ol>
+    <ul class="inside">
+      {inside.map(([title, text, href]) => (
+        <li><a href={href}>{title}</a> <span>{text}</span></li>
+      ))}
+    </ul>
   </div>
 </section>
 
 <style>
   #how { background: color-mix(in srgb, var(--panel) 55%, var(--bg)); border-block: 1px solid var(--panel-edge); }
-  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
   .steps {
-    list-style: none; padding: 1.25rem 0 0; margin-top: 2.25rem; counter-reset: step;
-    border-top: 1px solid var(--panel-edge);
+    list-style: none; padding: 0; margin-top: 2.5rem; counter-reset: step;
     display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.75rem;
   }
   .steps li { counter-increment: step; }
+  .shelf { display: block; width: 100%; max-width: 17rem; height: auto; overflow: visible; margin-bottom: 0.9rem; }
+  .floor { stroke: var(--panel-edge); stroke-width: 1; vector-effect: non-scaling-stroke; }
+  .more { white-space: nowrap; }
+  .old { fill: var(--ink-dim); }
+  .loading { fill: none; stroke: var(--ink-dim); stroke-width: 1; stroke-dasharray: 2 2; }
+  .live { fill: none; stroke: var(--ink-dim); stroke-width: 1.2; }
+  .new { fill: var(--ink); animation: arrive 2.4s ease-in-out infinite; }
+  @keyframes arrive { 50% { opacity: 0.3; } }
+  @media (prefers-reduced-motion: reduce) { .new { animation: none; } }
+  .now { stroke: var(--ink-dim); stroke-width: 1; stroke-dasharray: 2 3; fill: none; }
+  .kept { fill: var(--accent); }
+  .dropped { fill: var(--ink-dim); opacity: 0.45; }
+  .wire { fill: none; stroke: var(--accent-dim); stroke-width: 1.2; }
+  .label { font-family: var(--font-mono); font-size: 9px; fill: var(--ink-dim); }
+  .label.out { fill: var(--ink); }
   h3 { font-size: 0.95rem; font-weight: 700; }
   h3::before { content: counter(step, decimal-leading-zero) ' '; color: var(--accent); }
   .steps p { color: var(--ink-dim); font-size: 0.92rem; margin-top: 0.4rem; }
-  @media (max-width: 860px) { .steps { grid-template-columns: 1fr 1fr; } }
+  .inside {
+    list-style: none; padding: 1.25rem 0 0; margin-top: 2.5rem; border-top: 1px solid var(--panel-edge);
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.9rem 1.75rem; font-size: 0.92rem;
+  }
+  .inside a { display: block; font-weight: 600; }
+  .inside span { color: var(--ink-dim); }
+  @media (max-width: 860px) { .steps { grid-template-columns: 1fr 1fr; } .inside { grid-template-columns: 1fr; } }
   @media (max-width: 480px) { .steps { grid-template-columns: 1fr; } }
 </style>

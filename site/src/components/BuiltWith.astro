@@ -1,46 +1,157 @@
 ---
-import { Image } from 'astro:assets';
-import ticker from '../assets/landing/ticker.webp';
+import demos from '../data/demos.json';
 import { BLOBS_MONEY_URL, TICKER_URL } from '../config';
+
+const count = (value: number) => value.toLocaleString('en-US');
+const recorded = new Date(demos.recordedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric', timeZone: 'UTC' });
+const change = (value: number) => (value === 0 ? '0.00%' : `${value > 0 ? '▲' : '▼'} ${Math.abs(value).toFixed(2)}%`);
+
+const POSTER_COLORS: Record<string, string> = {
+  Base: '#3d7bff', Optimism: '#ff4d5e', 'Robinhood Chain': '#c8f53a', Arbitrum: '#2fa8f5', Aztec: '#b08cff',
+};
+const SPARE_COLORS = ['#9db8a8', '#e0a458', '#7ad1c2', '#d98cc4', '#c9b458'];
+let spare = 0;
+const posters = demos.blobs.rows.map((row) => ({ ...row, color: POSTER_COLORS[row.name] ?? SPARE_COLORS[spare++ % SPARE_COLORS.length] }));
+const { recent } = demos.blobs;
+const PITCH = 14, CELL_W = 11, CELL_H = 4, STEP = CELL_H + 1;
+const blobsW = recent.cells.length * PITCH, blobsH = recent.max * STEP + 8;
+const cellPaths = Array.from({ length: posters.length + 1 }, () => '');
+recent.cells.forEach((column, x) => [...column].forEach((poster, y) => {
+  cellPaths[Number(poster)] += `M${x * PITCH + 1.5} ${blobsH - (y + 1) * STEP}h${CELL_W}v${CELL_H}h-${CELL_W}z`;
+}));
+const targetY = blobsH - recent.target * STEP - 0.5;
+const topShare = Math.max(...posters.map((row) => row.share));
+
+function points(values: number[], width: number, height: number, pad: number) {
+  const low = Math.min(...values), span = Math.max(...values) - low || 1;
+  return values.map((value, i) => `${((i / (values.length - 1)) * width).toFixed(1)},${(pad + (1 - (value - low) / span) * (height - 2 * pad)).toFixed(1)}`);
+}
+const moved = (values: number[]) => ((values[values.length - 1] ?? 0) / (values[0] ?? 1) - 1) * 100;
+const ETH_W = 700, ETH_H = 113;
+const ethLine = points(demos.ticker.eth, ETH_W, ETH_H, 14);
+const assets = demos.ticker.rows.map((row) => ({ ...row, line: points(row.week, 84, 22, 3).join(' '), rose: moved(row.week) >= 0 }));
 ---
 <section id="demos" class="wrap section" aria-labelledby="demos-h">
-  <h2 id="demos-h"><span class="mono"># </span>Built with leani</h2>
-  <div class="exhibit">
-    <a class="shot" href={TICKER_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="ticker">
-      <Image
-        src={ticker}
-        alt="Leani Ticker: the ETH price, swaps indexed, and a table of assets with prices, changes, and volume."
-        width={1280}
-        widths={[640, 1280]}
-        sizes="(min-width: 56rem) 39rem, calc(100vw - 2.5rem)"
-      />
-    </a>
-    <div class="text">
-      <h3>Ticker</h3>
-      <p>
-        Onchain prices and trades on Ethereum: hundreds of tokens, tokenized
-        stocks, and stablecoins, priced from swaps on dozens of exchanges as
-        each block lands. It runs on leani.
-      </p>
-      <a class="mono" href={TICKER_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="ticker">ticker.leani.dev ↗</a>
-    </div>
-  </div>
-  <p class="also">
-    <a href={BLOBS_MONEY_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="blobs.money">blobs.money</a> runs on leani too: Ethereum’s blob economy, live in 3D.
+  <h2 id="demos-h"><span class="mono"># </span>Running in production</h2>
+  <p class="lede">
+    Two public apps run on a leani node today. The numbers and charts below
+    are theirs, recorded on {recorded} at Ethereum block {count(demos.block)}.
   </p>
+  <div class="cases">
+    <article class="case">
+      <div class="cover">
+        <svg viewBox={`0 0 ${blobsW} ${blobsH}`} preserveAspectRatio="none" role="img" aria-label={`The blobs in each of the last ${recent.cells.length} Ethereum blocks, colored by who posted them.`}>
+          <path d={`M0 ${targetY}H${blobsW}`} class="target" />
+          {cellPaths.map((d, i) => d && <path d={d} fill={posters[i]?.color ?? '#33453c'} />)}
+        </svg>
+        <span class="tag mono">the last {recent.cells.length} blocks and their blobs</span>
+        <span class="tag mono right" style={`top: ${(targetY / blobsH) * 100}%`}>target {recent.target}</span>
+      </div>
+      <header>
+        <h3>blobs.money</h3>
+        <a class="mono" href={BLOBS_MONEY_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="blobs.money">blobs.money ↗</a>
+      </header>
+      <p class="what">Ethereum’s blob economy: who posts blobs, what they pay, and what Ethereum burns.</p>
+      <p class="how">
+        One node follows Ethereum over peer-to-peer and backfills from public
+        datasets. Its <a href="/docs/reference/processors/#blobs-money">blobs-money</a> processor
+        keeps every blob transaction, and the app’s PostgreSQL stores the results.
+      </p>
+      <table>
+        <caption class="mono">blob posters, last 24 hours</caption>
+        <thead>
+          <tr><th scope="col">poster</th><th scope="col" class="num">blobs</th><th scope="col" class="num">share</th><th scope="col" class="num">ETH burned</th></tr>
+        </thead>
+        <tbody>
+          {posters.map((row) => (
+            <tr>
+              <th scope="row"><i class="chip" style={`background: ${row.color}`}></i>{row.name}</th>
+              <td class="num">{count(row.blobs)}</td>
+              <td class="num share" style={`--share: ${(row.share / topShare) * 100}%; --color: ${row.color}`}>{row.share.toFixed(1)}%</td>
+              <td class="num">{row.burned}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p class="sum mono">{count(demos.blobs.blobs)} blobs in {count(demos.blobs.blocks)} blocks, from {demos.blobs.posters} posters</p>
+    </article>
+    <article class="case">
+      <div class="cover">
+        <svg viewBox={`0 0 ${ETH_W} ${ETH_H}`} preserveAspectRatio="none" role="img" aria-label="The price of ETH over the last seven days, hour by hour.">
+          <defs>
+            <linearGradient id="eth-fill" x1="0" y1="0" x2="0" y2="1">
+              <stop offset="0" stop-color="#3ee07f" stop-opacity="0.22" /><stop offset="1" stop-color="#3ee07f" stop-opacity="0" />
+            </linearGradient>
+          </defs>
+          <polygon points={`0,${ETH_H} ${ethLine.join(' ')} ${ETH_W},${ETH_H}`} fill="url(#eth-fill)" />
+          <polyline points={ethLine.join(' ')} class="price" />
+        </svg>
+        <span class="tag mono">ETH, hour by hour for 7 days</span>
+        <span class="tag mono right">{change(moved(demos.ticker.eth))}</span>
+      </div>
+      <header>
+        <h3>Ticker</h3>
+        <a class="mono" href={TICKER_URL} data-umami-event="outbound" data-umami-event-place="demos" data-umami-event-to="ticker">ticker.leani.dev ↗</a>
+      </header>
+      <p class="what">Onchain prices on Ethereum: tokens, stablecoins, gold, and tokenized stocks, priced from every swap as its block lands.</p>
+      <p class="how">
+        One node decodes the swap events of {demos.ticker.venues} exchanges and marketplaces with the
+        built-in <a href="/docs/reference/processors/#evm-events">evm-events</a> processor.
+        No oracle, no market-data provider, no custom processor.
+      </p>
+      <table>
+        <caption class="mono">prices from swaps</caption>
+        <thead>
+          <tr><th scope="col">asset</th><th scope="col" class="week">7 days</th><th scope="col" class="num">price</th><th scope="col" class="num">24 h</th></tr>
+        </thead>
+        <tbody>
+          {assets.map((row) => (
+            <tr>
+              <th scope="row">{row.symbol} <span class="name">{row.name}</span></th>
+              <td class="week"><svg viewBox="0 0 84 22" aria-hidden="true"><polyline points={row.line} class:list={['spark', row.rose ? 'up' : 'down']} /></svg></td>
+              <td class="num">{row.price}</td>
+              <td class:list={['num', row.change > 0 && 'up', row.change < 0 && 'down']}>{change(row.change)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p class="sum mono">{count(demos.ticker.assets)} assets tracked, {demos.ticker.volume24h} traded in 24 hours</p>
+    </article>
+  </div>
 </section>
 
 <style>
-  .exhibit {
-    display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: 2.5rem;
-    align-items: center; margin-top: 2.25rem;
-  }
-  .shot { display: block; border: 1px solid var(--panel-edge); border-radius: 8px; overflow: hidden; }
-  .shot:hover { border-color: var(--accent-dim); }
-  .shot img { display: block; width: 100%; height: auto; }
+  .cases { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; margin-top: 2.25rem; }
+  .case { min-width: 0; background: var(--panel); border: 1px solid var(--panel-edge); border-radius: 10px; padding: 1.5rem; display: flex; flex-direction: column; overflow: hidden; }
+  .cover { position: relative; height: 7.5rem; margin: -1.5rem -1.5rem 1.4rem; background: var(--bg); border-bottom: 1px solid var(--panel-edge); }
+  .cover svg { display: block; width: 100%; height: 100%; }
+  .target { fill: none; stroke: var(--ink-dim); stroke-width: 1; stroke-dasharray: 3 5; vector-effect: non-scaling-stroke; opacity: 0.55; }
+  .price { fill: none; stroke: var(--accent); stroke-width: 1.5; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .tag { position: absolute; top: 0.6rem; left: 0.9rem; font-size: 0.7rem; color: var(--ink-dim); background: color-mix(in srgb, var(--bg) 78%, transparent); padding: 0.05rem 0.35rem; border-radius: 4px; }
+  .tag.right { left: auto; right: 0.9rem; }
+  .cover .tag.right[style] { translate: 0 -120%; }
+  header { display: flex; align-items: baseline; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
   h3 { font-size: 1.3rem; }
-  .text p { color: var(--ink-dim); margin-block: 0.6rem 1rem; max-width: 40ch; }
-  .text a { font-size: 0.9rem; }
-  .also { color: var(--ink-dim); margin-top: 2rem; }
-  @media (max-width: 56rem) { .exhibit { grid-template-columns: 1fr; gap: 1.5rem; } }
+  header a { font-size: 0.85rem; }
+  .what { margin-top: 0.6rem; }
+  .how { color: var(--ink-dim); font-size: 0.92rem; margin-top: 0.6rem; }
+  table { width: 100%; border-collapse: collapse; margin-top: auto; font-family: var(--font-mono); font-size: 0.82rem; }
+  caption { text-align: left; color: var(--ink-dim); font-size: 0.75rem; padding-block: 1.4rem 0.5rem; }
+  th, td { text-align: left; padding: 0.5rem 0; border-top: 1px solid var(--panel-edge); font-weight: 400; }
+  thead th { color: var(--ink-dim); font-size: 0.75rem; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; padding-left: 0.75rem; white-space: nowrap; }
+  .chip { display: inline-block; width: 0.55rem; height: 0.55rem; border-radius: 2px; margin-right: 0.6rem; }
+  /* The share again as a bar under its number, the largest poster's the full width. */
+  .share { background: linear-gradient(var(--color), var(--color)) right bottom 0.3rem / calc(var(--share) * 0.62) 2px no-repeat; }
+  .week { width: 6rem; padding-left: 0.75rem; }
+  .week svg { display: block; width: 5.25rem; height: 1.4rem; }
+  .spark { fill: none; stroke-width: 1.4; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+  .spark.up { stroke: var(--accent); }
+  .spark.down { stroke: #ff7a85; }
+  .name { color: var(--ink-dim); font-family: var(--font-sans); margin-left: 0.4rem; }
+  .up { color: var(--accent); }
+  .down { color: #ff7a85; }
+  .sum { color: var(--ink-dim); font-size: 0.75rem; padding-top: 0.75rem; border-top: 1px solid var(--panel-edge); }
+  @media (max-width: 860px) { .cases { grid-template-columns: 1fr; } }
+  @media (max-width: 480px) { .name, .week { display: none; } }
 </style>

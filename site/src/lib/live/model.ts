@@ -77,7 +77,7 @@ export const STAGES: Record<Family, Stage[]> = {
       level: 'confirmed',
       name: 'Confirmed',
       evidence:
-        'The fast confirmation rule: enough of the slot’s attestations back the block that no reorg removes it while the network is synchronous. The page reads it from a public beacon node’s fast_confirmation stream, the source leani’s confirmed level will read.',
+        'The fast confirmation rule: enough of the slot’s attestations back the block that no reorg removes it while the network is synchronous. Leani takes it from the consensus nodes you name and counts it only for blocks it verified as attested, so its confirmed level lands with attested. The page reads the rule’s own stream, a moment earlier.',
       undo: 'Only a reorg during a long network partition.',
       typical: '~13 s',
     },

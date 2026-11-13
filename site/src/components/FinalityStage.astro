@@ -1,0 +1,93 @@
+---
+import { Image } from 'astro:assets';
+import still from '../assets/landing/finality.webp';
+
+interface Props {
+  /** Show a still and start the picture only as it nears the viewport; without it the page mounts the stage itself. */
+  lazy?: boolean;
+}
+const { lazy = false } = Astro.props;
+---
+<div class="stage-wrap" data-stage data-lazy={lazy ? '' : undefined}>
+  <div class="legend wrap mono">
+    <span><i class="swatch block"></i>a rollup block, faint until signed</span>
+    <span><i class="swatch batch"></i>a batch, threaded to its Ethereum block</span>
+    <span><i class="swatch slab"><i></i><i></i><i></i></i>an Ethereum block and its blobs:</span>
+    <span><i class="swatch slab seen"></i>seen</span>
+    <span><i class="swatch slab attested"></i>attested</span>
+    <span><i class="swatch slab confirmed"></i>confirmed, fast confirmation rule</span>
+    <span><i class="swatch slab final"></i>finalized</span>
+    <span><i class="swatch reorg"></i>reorg</span>
+    <span class="buttons">
+      <button type="button" class="toggle" data-expand aria-pressed="false" hidden>days of settlement ▸</button>
+    </span>
+  </div>
+  <div class="stage">
+    {lazy && (
+      <Image
+        class="poster"
+        src={still}
+        alt="Blocks from OP Mainnet, Base, Arbitrum One, and Robinhood Chain flowing into Ethereum blocks, which turn final about 20 minutes later."
+        width={1600}
+        widths={[800, 1600]}
+        sizes="100vw"
+      />
+    )}
+    <canvas data-canvas aria-hidden="true"></canvas>
+    <div class="tip mono" data-tip hidden></div>
+  </div>
+  <div class="follow wrap mono" data-follow hidden aria-live="polite">
+    <b data-follow-title></b>
+    <ol data-follow-stages></ol>
+  </div>
+</div>
+
+<style>
+  .stage-wrap { border-block: 1px solid var(--panel-edge); background: #0b0f0d; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; padding-block: 0.8rem; font-size: 0.74rem; color: var(--ink-dim); align-items: center; }
+  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
+  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; }
+  .swatch.block { background: #ff4d5e; width: 8px; height: 8px; border-radius: 1px; }
+  .swatch.batch { width: 18px; height: 4px; border-radius: 1px; background: #ff4d5e; opacity: 0.7; }
+  .swatch.slab { width: 26px; height: 10px; border: 1.2px solid #9aa8ff; background: #9aa8ff2a; display: inline-flex; gap: 2px; padding: 1.5px; }
+  .swatch.slab i { width: 3px; background: #3d7bff; }
+  .swatch.slab i:first-child { background: #ff4d5e; }
+  .swatch.slab.seen { width: 18px; background: #9aa8ff10; }
+  .swatch.slab.attested { width: 18px; }
+  .swatch.slab.confirmed { width: 18px; background: #9aa8ff4d; border: 1.6px solid #d6dbff; }
+  .swatch.slab.final { width: 18px; background: #2b3c33; border-color: var(--accent); }
+  .swatch.reorg { background: #ff5c5c; transform: rotate(45deg) scale(0.75); }
+  .buttons { margin-left: auto; display: inline-flex; gap: 0.5rem; }
+  .toggle { font: inherit; color: var(--accent); background: none; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
+  .stage { position: relative; max-width: 96rem; margin-inline: auto; }
+  canvas { display: block; width: 100%; height: 530px; cursor: crosshair; }
+  /* The still stands in until the picture runs, and stays for readers without scripts. */
+  .poster { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; transition: opacity 0.4s; }
+  [data-live] .poster { opacity: 0; pointer-events: none; }
+  .tip { position: absolute; top: 0; left: 0; pointer-events: none; background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--panel-edge); border-radius: 8px; padding: 0.45rem 0.6rem; font-size: 0.72rem; line-height: 1.45; color: var(--ink); min-width: 200px; max-width: 300px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.45); }
+  .follow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 1.2rem; padding-block: 0.6rem 0.9rem; font-size: 0.76rem; }
+  .follow[hidden] { display: none; }
+  .follow ol { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 0.3rem 0.6rem; }
+  .follow :global(li + li)::before { content: '→'; color: #536b5e; margin-right: 0.6rem; }
+  .follow :global(li.pending) { color: #536b5e; }
+  .follow :global(li b) { font-weight: 600; color: var(--accent); }
+  .follow :global(li em) { font-style: normal; color: var(--ink-dim); }
+  @media (max-width: 639px) {
+    .legend { gap: 0.35rem 0.8rem; font-size: 0.68rem; }
+    canvas { height: 478px; }
+  }
+</style>
+
+<script>
+  const root = document.querySelector<HTMLElement>('[data-stage][data-lazy]');
+  if (root) {
+    const observer = new IntersectionObserver(async ([entry]) => {
+      if (!entry!.isIntersecting) return;
+      observer.disconnect();
+      const { mountStage } = await import('../lib/live/stage');
+      await mountStage(root);
+      root.dataset.live = '';
+    }, { rootMargin: '500px' });
+    observer.observe(root);
+  }
+</script>

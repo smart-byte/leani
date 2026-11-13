@@ -1,63 +1,132 @@
 ---
-import { Image } from 'astro:assets';
-import still from '../assets/landing/finality.webp';
+import FinalityStage from './FinalityStage.astro';
+import { ROLLUP_COUNT } from '../lib/chains';
 
+// Typical times: the finality docs' level table for Ethereum, the /finality stages for rollups.
 const levels = [
-  ['attested', 'signed by the chain’s sequencer', 'seconds'],
-  ['finalized', 'its batch is in a finalized Ethereum block', '15–30 min'],
-  ['settled', 'Ethereum accepted a claim covering it, so withdrawals can complete', '5–7 days'],
+  { id: 'attested', ethereum: 'The sync committee signed it, ~15\u00a0s.', rollup: 'Its sequencer signed it, ~1\u00a0s.' },
+  {
+    id: 'confirmed', ethereum: 'The fast confirmation rule confirmed it, as the consensus nodes you name report, ~15\u00a0s.', rollup: null,
+    milestone: 'Not a level leani reports. Its batch reaches a confirmed Ethereum block 30\u00a0s to 4\u00a0min after the block, dashed above.',
+  },
+  { id: 'finalized', ethereum: 'Its consensus finalized it, ~15\u00a0min.', rollup: 'Its batch is in a finalized Ethereum block, 15–30\u00a0min.' },
+  { id: 'settled', ethereum: null, rollup: 'Ethereum accepted a claim covering it, so withdrawals can complete, 5–7\u00a0days.' },
 ] as const;
+
+const MIN = 60, DAY = 86400, FROM = 0.4, TO = 30 * DAY;
+const at = (seconds: number) => `${((Math.log(seconds / FROM) / Math.log(TO / FROM)) * 100).toFixed(2)}%`;
+const ticks = [[1, '1 s'], [15, '15 s'], [MIN, '1 min', 'wide'], [15 * MIN, '15 min'], [60 * MIN, '1 h', 'wide'], [DAY, '1 d'], [7 * DAY, '7 d']] as const;
+// A level's range of typical times shows as a blend from the level before it.
+const ethereum = `linear-gradient(to right, var(--none) ${at(15)}, var(--confirmed) ${at(15)} ${at(13 * MIN)}, var(--finalized) ${at(19 * MIN)})`;
+const rollup = `linear-gradient(to right, var(--none) ${at(1)}, var(--attested) ${at(1)} ${at(15 * MIN)}, var(--finalized) ${at(30 * MIN)} ${at(5 * DAY)}, var(--settled) ${at(7 * DAY)})`;
+const marks = {
+  ethereum: [['attested + confirmed', 15, 15 * MIN, 'confirmed'], ['finalized', 15 * MIN, TO, 'finalized']],
+  rollup: [['attested', 1, 20 * MIN, 'attested'], ['finalized', 20 * MIN, 6 * DAY, 'finalized'], ['settled', 6 * DAY, TO, 'settled']],
+} as const;
+const span = (from: number, to: number) => `left: ${at(from)}; width: calc(${at(to)} - ${at(from)})`;
+// When a rollup block's batch reaches a confirmed Ethereum block, in the /finality recording: a milestone, not a level.
+const BATCH_CONFIRMED = [30, 4 * MIN] as const;
 ---
-<section id="rollups" class="wrap section" aria-labelledby="rollups-h">
-  <h2 id="rollups-h"><span class="mono"># </span>Rollups, final in minutes</h2>
-  <p class="lede">
-    OP Mainnet, Base, Arbitrum One, and the other bundled rollups run on the
-    same node and processors. Every block says how final it is, so your app
-    waits only as long as it needs to.
-  </p>
-  <dl class="levels">
-    {levels.map(([level, meaning, typical]) => (
-      <div class="level">
-        <dt class="mono">{level}</dt>
-        <dd>{meaning}</dd>
-        <dd class="typical mono">{typical}</dd>
+<section id="rollups" class="section" aria-labelledby="rollups-h">
+  <div class="wrap">
+    <h2 id="rollups-h"><span class="mono"># </span>Every block says how final it is</h2>
+    <p class="lede">
+      Leani follows OP Mainnet, Base, Arbitrum One, and {ROLLUP_COUNT - 3} more rollups
+      with the same processors, API, and SDK as Ethereum: one node per chain,
+      picked by name. It labels each block with the level it has reached, so
+      your app waits only as long as it needs to.
+    </p>
+    <div class="ladder" role="img" aria-label="How long after a block each level typically arrives. Ethereum: attested and confirmed after about 15 seconds, finalized after about 15 minutes. A rollup: attested after about a second, finalized after 15 to 30 minutes, settled after 5 to 7 days. Its batch reaches a confirmed Ethereum block after 30 seconds to 4 minutes, which is a milestone, not a level.">
+      <div class="marks top">
+        {marks.ethereum.map(([label, from, to, level]) => <span class={level} style={span(from, to)}>{label}</span>)}
       </div>
-    ))}
-  </dl>
-  <figure>
-    <a class="still" href="/finality/">
-      <Image
-        src={still}
-        alt="Blocks from OP Mainnet, Base, Arbitrum One, and Robinhood Chain flowing into Ethereum blocks, which turn final about 20 minutes later."
-        width={1600}
-        widths={[800, 1600]}
-        sizes="(min-width: 72rem) 69.5rem, calc(100vw - 2.5rem)"
-      />
-    </a>
-    <figcaption>
-      Each rollup’s blocks drop into the Ethereum block that carries their
-      batch and turn green when it is final. <a href="/finality/">See how each rollup settles</a>
-    </figcaption>
-  </figure>
+      <span class="who mono">Ethereum</span>
+      <div class="bar" style={`background: ${ethereum}`}></div>
+      <span class="who mono since">since the block</span>
+      <div class="axis mono">
+        {ticks.map(([seconds, label, only]) => <span class={only} style={`left: ${at(seconds)}`}>{label}</span>)}
+      </div>
+      <span class="who mono">a rollup</span>
+      <div class="bar" style={`background: ${rollup}`}><i class="batch" style={span(...BATCH_CONFIRMED)}></i></div>
+      <div class="marks">
+        {marks.rollup.map(([label, from, to, level]) => <span class={level} style={span(from, to)}>{label}</span>)}
+        <span class="milestone" style={span(BATCH_CONFIRMED[0], 20 * MIN)}>batch confirmed on Ethereum</span>
+      </div>
+    </div>
+    <dl class="levels">
+      {levels.map((level) => (
+        <div>
+          <dt class="mono"><i class={level.id}></i>{level.id}</dt>
+          {level.ethereum && <dd><span class="mono">Ethereum</span> {level.ethereum}</dd>}
+          {level.rollup && <dd><span class="mono">rollups</span> {level.rollup}</dd>}
+          {'milestone' in level && <dd class="milestone"><span class="mono">rollups</span> {level.milestone}</dd>}
+        </div>
+      ))}
+    </dl>
+    <p class="watch">
+      Below, five leani nodes follow four rollups and Ethereum at once.
+      <span class="status mono" role="status"><span class="dot" data-status-dot></span><span data-status>a recording, starting as you scroll here</span></span>
+    </p>
+  </div>
+  <FinalityStage lazy />
+  <p class="wrap caption">
+    Each rollup’s blocks drop into the Ethereum block that carries their batch and turn green when it is final. Hover a block for its details, or click one to follow it. <a href="/finality/">Open the full view</a>
+  </p>
 </section>
 
 <style>
-  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
-  .levels { margin-top: 2rem; border-top: 1px solid var(--panel-edge); max-width: 46rem; }
-  .level {
-    display: grid; grid-template-columns: 6.5rem minmax(0, 1fr) auto; gap: 1.25rem;
-    padding-block: 0.7rem; border-bottom: 1px solid var(--panel-edge); align-items: baseline;
+  #rollups {
+    --none: color-mix(in srgb, var(--ink-dim) 16%, transparent);
+    --attested: color-mix(in srgb, var(--ink-dim) 62%, var(--bg));
+    --confirmed: #d6dbff; --finalized: var(--accent); --settled: #bdf5d3;
   }
-  dt { color: var(--accent); font-size: 0.85rem; }
-  dd { margin: 0; }
-  .typical { color: var(--ink-dim); font-size: 0.85rem; white-space: nowrap; }
-  figure { margin-top: 2.5rem; }
-  .still { display: block; border: 1px solid var(--panel-edge); border-radius: 8px; overflow: hidden; }
-  .still:hover { border-color: var(--accent-dim); }
-  .still img { display: block; width: 100%; height: auto; }
-  figcaption { color: var(--ink-dim); font-size: 0.9rem; margin-top: 0.85rem; max-width: 62ch; }
-  @media (max-width: 560px) {
-    .level { grid-template-columns: 1fr auto; gap: 0.2rem 1rem; }
-    .level dd:not(.typical) { grid-column: 1 / -1; grid-row: 2; }
+  .ladder { display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); align-items: center; gap: 0.3rem 0; margin-top: 2.75rem; }
+  .who { font-size: 0.8rem; color: var(--ink); }
+  .since { color: var(--ink-dim); font-size: 0.72rem; }
+  .bar { height: 1.15rem; border-radius: 3px; position: relative; }
+  .batch { position: absolute; inset-block: -4px; border: 1.5px dashed var(--confirmed); border-radius: 4px; }
+  .marks, .axis { grid-column: 2; position: relative; font-family: var(--font-mono); font-size: 0.78rem; }
+  .marks { height: 1.5rem; }
+  .marks span { position: absolute; top: 0.2rem; padding-left: 0.5rem; border-left: 1px solid currentColor; line-height: 1.25; }
+  .marks.top span { top: auto; bottom: 0.2rem; }
+  .marks .attested { color: var(--ink-dim); }
+  .marks .confirmed { color: var(--confirmed); }
+  .marks .finalized { color: var(--finalized); }
+  .marks .settled { color: var(--settled); }
+  .marks .milestone { color: var(--confirmed); border-left-style: dashed; }
+  .axis { height: 1.9rem; color: var(--ink-dim); font-size: 0.72rem; }
+  .axis span { position: absolute; top: 50%; translate: -50% -50%; white-space: nowrap; }
+  .axis span::before, .axis span::after { content: ''; position: absolute; left: 50%; width: 1px; height: 0.3rem; background: var(--panel-edge); }
+  .axis span::before { bottom: 100%; }
+  .axis span::after { top: 100%; }
+
+  .levels { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1.5rem 1.75rem; margin-top: 2.25rem; padding-top: 1.5rem; border-top: 1px solid var(--panel-edge); }
+  dt { font-size: 0.9rem; font-weight: 700; display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.45rem; }
+  dt i { width: 0.65rem; height: 0.65rem; border-radius: 2px; }
+  i.attested { background: var(--attested); }
+  i.confirmed { background: var(--confirmed); }
+  i.finalized { background: var(--finalized); }
+  i.settled { background: var(--settled); }
+  dd { margin: 0 0 0.35rem; color: var(--ink-dim); font-size: 0.92rem; text-wrap: pretty; }
+  dd span { color: var(--ink); font-size: 0.78rem; margin-right: 0.3rem; }
+  dd.milestone { margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px dashed var(--confirmed); }
+
+  .watch { color: var(--ink-dim); margin-block: 3rem 1.25rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; }
+  .status { display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #536b5e; }
+  .dot:global(.on) { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .caption { color: var(--ink-dim); font-size: 0.9rem; margin-top: 1rem; }
+  @media (max-width: 860px) { .levels { grid-template-columns: 1fr 1fr; } }
+  @media (max-width: 640px) {
+    .ladder { grid-template-columns: minmax(0, 1fr); }
+    .marks, .axis { grid-column: 1; }
+    .marks { height: 2.6rem; font-size: 0.72rem; }
+    .who { margin-top: 0.5rem; }
+    .since { display: none; }
+    .marks.top { order: 1; } .ladder > :nth-child(2) { order: 0; } .ladder > :nth-child(n + 3) { order: 2; }
+    .axis .wide, .marks .milestone { display: none; }
+    /* The last label would run past the edge: it ends with the bar instead. */
+    .marks .settled { left: auto !important; right: 0; width: auto !important; border-left: 0; padding-left: 0; }
   }
+  @media (max-width: 480px) { .levels { grid-template-columns: 1fr; } }
 </style>

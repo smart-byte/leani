@@ -2,6 +2,7 @@
 import Base from '../layouts/Base.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import FinalityStage from '../components/FinalityStage.astro';
 import TerminalFrame from '../components/TerminalFrame.astro';
 import { hlShell, hlToml, hlTs } from '../lib/highlight';
 import { CHAINS, FAMILY_LABELS, STAGES, type Family, type Stage } from '../lib/live/model';
@@ -41,6 +42,13 @@ const levels = [
     cli: 'leani subscribe blocks --finality attested',
   },
   {
+    level: 'confirmed',
+    title: 'Confirmed',
+    use: 'Deposits and payouts on Ethereum that cannot wait a quarter of an hour: the fast confirmation rule, as the consensus nodes you name report it.',
+    toml: 'publish = "confirmed"',
+    cli: 'leani subscribe blocks --finality confirmed',
+  },
+  {
     level: 'finalized',
     title: 'Final',
     use: 'Accounting and anything that cannot be undone: Ethereum finality, or the rollup’s batch final on Ethereum.',
@@ -63,6 +71,7 @@ for await (const change of leani.blocks.subscribe()) {
   switch (change.operation) {
     case "apply":     show(change.data, change.finality); break;
     case "attested":
+    case "confirmed":
     case "finalized":
     case "settled":   promote(change.data, change.operation); break;
     case "undo":      remove(change.block); break;
@@ -103,28 +112,8 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
     </div>
   </section>
 
-  <section class="stage-wrap" aria-label="Live blocks and blobs">
-    <div class="legend wrap mono">
-      <span><i class="swatch block"></i>a rollup block, faint until signed</span>
-      <span><i class="swatch batch"></i>a batch, threaded to its Ethereum block</span>
-      <span><i class="swatch slab"><i></i><i></i><i></i></i>an Ethereum block and its blobs:</span>
-      <span><i class="swatch slab seen"></i>seen</span>
-      <span><i class="swatch slab attested"></i>attested</span>
-      <span><i class="swatch slab confirmed"></i>confirmed, fast confirmation rule</span>
-      <span><i class="swatch slab final"></i>finalized</span>
-      <span><i class="swatch reorg"></i>reorg</span>
-      <span class="buttons">
-        <button type="button" class="toggle" data-expand aria-pressed="false" hidden>days of settlement ▸</button>
-      </span>
-    </div>
-    <div class="stage">
-      <canvas data-canvas aria-hidden="true"></canvas>
-      <div class="tip mono" data-tip hidden></div>
-    </div>
-    <div class="follow wrap mono" data-follow hidden aria-live="polite">
-      <b data-follow-title></b>
-      <ol data-follow-stages></ol>
-    </div>
+  <section aria-label="Live blocks and blobs">
+    <FinalityStage />
   </section>
 
   <section class="section wrap" aria-labelledby="table-h">
@@ -252,18 +241,9 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
 </Base>
 
 <script>
-  import { Scene, duration, type Journey, type Passage } from '../lib/live/scene';
-  import { liveFeed, replayFeed, type Feed, type Recording } from '../lib/live/feed';
-  import { CHAINS, type Chain, type Level } from '../lib/live/model';
-
-  const canvas = document.querySelector<HTMLCanvasElement>('[data-canvas]')!;
-  const tip = document.querySelector<HTMLElement>('[data-tip]')!;
-  const status = document.querySelector<HTMLElement>('[data-status]')!;
-  const dot = document.querySelector<HTMLElement>('[data-status-dot]')!;
-  const expand = document.querySelector<HTMLButtonElement>('[data-expand]')!;
-  const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
-  let feed: Feed | null = null;
-  let present: string[] = CHAINS.map((chain) => chain.id);
+  import { duration, type Passage } from '../lib/live/scene';
+  import { mountStage } from '../lib/live/stage';
+  import { CHAINS } from '../lib/live/model';
 
   const selectFamily = (family: string) => {
     for (const tab of document.querySelectorAll<HTMLElement>('[data-tab]')) {
@@ -276,53 +256,6 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   for (const tab of document.querySelectorAll<HTMLElement>('[data-tab]')) {
     tab.addEventListener('click', () => selectFamily(tab.dataset.tab!));
   }
-
-  const number = (value: number) => value.toLocaleString('en-US');
-  const time = (seconds: number) => (seconds < 0.1 ? '<0.1 s' : duration(seconds));
-  const label = (id: string) => CHAINS.find((chain) => chain.id === id)?.label ?? id;
-  const levelName = (chain: Chain, level: Level) => ({
-    unattested: 'seen, unattested',
-    attested: chain.family === 'ethereum' ? 'attested by the sync committee' : 'signed by the sequencer',
-    confirmed: 'confirmed by the fast confirmation rule',
-    finalized: chain.family === 'ethereum' ? 'finalized' : 'final on Ethereum',
-    settled: 'settled on Ethereum',
-  })[level];
-  const scene = new Scene(canvas, {
-    now: () => feed?.now() ?? Date.now(),
-    reducedMotion,
-    onExpand: (expanded) => {
-      expand.setAttribute('aria-pressed', String(expanded));
-      expand.textContent = expanded ? '◂ last 30 min' : 'days of settlement ▸';
-    },
-    onHover: (hover) => {
-      if (!hover) {
-        tip.hidden = true;
-        return;
-      }
-      const { block, chain, batch } = hover;
-      const lines = [`<b style="color:${chain.color}">${chain.label}</b> ${block ? `#${number(block.number)}` : 'batch'}`];
-      if (block) {
-        lines.push(`${levelName(chain, block.level)} · ${duration(block.age)} old`);
-        if (block.txs !== null) lines.push(`${block.txs} txs${block.gas === null ? '' : ` · ${Math.round(block.gas * 100)}% gas`}`);
-        const blobs = Object.entries(block.blobs ?? {});
-        if (blobs.length) lines.push(blobs.map(([source, count]) => `${count} blob${count === 1 ? '' : 's'} ${source === 'other' ? 'from others' : `from ${label(source)}`}`).join('<br>'));
-        if (chain.family !== 'ethereum' && !hover.followed) lines.push('<span style="color:#8fa89a">click to follow it</span>');
-      }
-      if (batch) {
-        lines.push(`blocks #${number(batch.first)}–${number(batch.last)}: ${number(batch.last - batch.first + 1)}${batch.txs ? `, ${number(batch.txs)} txs` : ''}`);
-        lines.push(`${batch.blobs ? `${batch.blobs} blobs on ` : 'in '}Ethereum #${number(batch.l1)}${batch.bytes ? ` · ${(batch.raw / batch.bytes).toFixed(1)}× compressed` : ''}`);
-        if (batch.source === 'inbox') lines.push('named by its SequencerInbox call');
-        if (batch.verified) lines.push('its parent hash matches the block leani has');
-      }
-      if (block?.hash) lines.push(`${block.hash.slice(0, 10)}…${block.hash.slice(-6)}`);
-      tip.hidden = false;
-      tip.innerHTML = lines.join('<br>');
-      const left = Math.max(4, Math.min(hover.x + 14, canvas.clientWidth - tip.offsetWidth - 4));
-      const top = Math.min(hover.y + 14, canvas.clientHeight - tip.offsetHeight - 8);
-      tip.style.transform = `translate(${left}px, ${top}px)`;
-    },
-  });
-  expand.addEventListener('click', () => scene.expand(expand.getAttribute('aria-pressed') !== 'true'));
 
   const copied = document.querySelector<HTMLElement>('[data-copied]')!;
   for (const button of document.querySelectorAll<HTMLButtonElement>('[data-copy]')) {
@@ -343,37 +276,7 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
     });
   }
 
-  const handlers = {
-    event: (event: Parameters<Scene['handle']>[0]) => scene.handle(event),
-    reset: () => scene.reset(),
-    state: (connected: boolean) => dot.classList.toggle('on', connected),
-    chains: (chains: string[]) => {
-      present = CHAINS.map((chain) => chain.id).filter((chain) => chains.includes(chain));
-      scene.show(present);
-    },
-  };
-  const hub = new URLSearchParams(location.search).get('hub');
-  let source = '';
-  if (hub) {
-    feed = liveFeed(hub, handlers);
-    source = `live from ${new URL(hub).host}`;
-  } else {
-    try {
-      const response = await fetch('/finality/replay.json.gz');
-      if (!response.ok) throw new Error(String(response.status));
-      const bytes = new Uint8Array(await response.arrayBuffer());
-      // A server may send it as `Content-Encoding: gzip`, which the browser has unpacked already.
-      const packed = bytes[0] === 0x1f && bytes[1] === 0x8b;
-      const text = packed
-        ? await new Response(new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'))).text()
-        : new TextDecoder().decode(bytes);
-      const recording = JSON.parse(text) as Recording;
-      feed = replayFeed(recording, handlers);
-      source = `replay of ${new Date(recording.recordedAt).toISOString().slice(0, 16).replace('T', ' ')} UTC`;
-    } catch {
-      source = 'no live hub and no recording';
-    }
-  }
+  const { scene, present } = await mountStage(document.querySelector<HTMLElement>('[data-stage]')!);
 
   const put = (element: HTMLElement | null | undefined, value: string) => {
     if (element && element.textContent !== value) element.textContent = value;
@@ -381,32 +284,6 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   const range = (pair: [number, number] | null) => (pair ? `${duration(pair[0])} – ${duration(pair[1])}` : '—');
   const about = (estimated: boolean) => (estimated ? '~' : '');
   const keep = (text: string) => text.replaceAll(' ', '\u00a0');
-
-  const follow = document.querySelector<HTMLElement>('[data-follow]')!;
-  const followTitle = document.querySelector<HTMLElement>('[data-follow-title]')!;
-  const followStages = document.querySelector<HTMLElement>('[data-follow-stages]')!;
-  const showJourney = (journey: Journey | null) => {
-    follow.hidden = !journey;
-    if (!journey) return;
-    const at = (ms: number | null) => (ms === null ? null : Math.max(0, ms / 1000 - journey.born));
-    const rows: [string, number | null, string][] = [
-      ['signed', at(journey.attestedAt ?? journey.seen), ''],
-      ['in a blob', journey.batch ? Math.max(0, journey.batch.l1Time - journey.born) : null, journey.batch ? `Ethereum #${number(journey.batch.l1)}` : 'waiting for the batcher'],
-      ['confirmed', at(journey.l1?.confirmedAt ?? null), ''],
-      ['final', at(journey.l1?.finalizedAt ?? null), ''],
-      ['settled', null, journey.chain.settlement?.typical ?? '—'],
-    ];
-    followTitle.style.color = journey.chain.color;
-    put(followTitle, `${journey.chain.label} #${number(journey.number)}${journey.txs === null ? '' : ` · ${journey.txs} txs`}`);
-    const html = rows.map(([name, seconds, detail]) =>
-      `<li class="${seconds === null ? 'pending' : 'done'}">${name}${seconds === null ? '' : ` <b>${seconds < 0.1 ? time(seconds) : `+${time(seconds)}`}</b>`}${detail ? ` <em>${detail}</em>` : ''}</li>`).join('');
-    if (followStages.innerHTML !== html) followStages.innerHTML = html;
-  };
-  // A click outside the picture lets the followed block go too, except on the strip about it.
-  document.addEventListener('click', (event) => {
-    if (event.target !== canvas && !follow.contains(event.target as Node)) scene.unfollow();
-    showJourney(scene.journey());
-  });
 
   const cells = new Map(
     [...document.querySelectorAll<HTMLElement>('[data-chain]')].map((row) => [row.dataset.chain!, row]),
@@ -434,16 +311,13 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
     };
   };
   const refresh = () => {
-    const summaries = scene.summaries();
-    expand.hidden = !scene.settles();
-    const following = summaries.filter((summary) => summary.head !== null).length;
-    status.textContent = `${source} · ${following} of ${present.length} chains`;
-    for (const button of picks) button.hidden = !present.includes(button.dataset.pick!);
-    if (!present.includes(picked) && present.length) pick(present[0]);
-    for (const summary of summaries) {
+    const chains = present();
+    for (const button of picks) button.hidden = !chains.includes(button.dataset.pick!);
+    if (!chains.includes(picked) && chains.length) pick(chains[0]);
+    for (const summary of scene.summaries()) {
       const row = cells.get(summary.chain.id);
       if (!row) continue;
-      row.hidden = !present.includes(summary.chain.id);
+      row.hidden = !chains.includes(summary.chain.id);
       row.classList.toggle('quiet', summary.head === null);
       const cell = (name: string) => row.querySelector<HTMLElement>(`[data-cell="${name}"]`);
       put(cell('block'), summary.blockSeconds === null ? '—' : duration(summary.blockSeconds));
@@ -462,7 +336,6 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
       put(cell('finalized'), values.finalized);
       put(cell('settled'), summary.settledAge !== null ? `newest ${duration(summary.settledAge)} old` : summary.chain.settlement?.typical ?? '—');
     }
-    showJourney(scene.journey());
   };
   refresh();
   window.setInterval(refresh, 1000);
@@ -471,38 +344,9 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
 <style>
   .hero { padding-block: 3.5rem 1.5rem; }
   .hero h1 { font-size: clamp(2rem, 5vw, 3.4rem); margin-block: 0.6rem 1rem; max-width: 22ch; }
-  .lede { max-width: 46rem; color: var(--ink-dim); font-size: 1.08rem; }
   .status { margin-top: 1.25rem; display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; color: var(--ink-dim); border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; }
   .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #536b5e; }
   .status .dot:global(.on) { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
-
-  .follow { display: flex; flex-wrap: wrap; align-items: baseline; gap: 0.3rem 1.2rem; padding-block: 0.6rem 0.9rem; font-size: 0.76rem; }
-  .follow[hidden] { display: none; }
-  .follow ol { list-style: none; padding: 0; margin: 0; display: flex; flex-wrap: wrap; gap: 0.3rem 0.6rem; }
-  .follow :global(li + li)::before { content: '→'; color: #536b5e; margin-right: 0.6rem; }
-  .follow :global(li.pending) { color: #536b5e; }
-  .follow :global(li b) { font-weight: 600; color: var(--accent); }
-  .follow :global(li em) { font-style: normal; color: var(--ink-dim); }
-
-  .stage-wrap { border-block: 1px solid var(--panel-edge); background: #0b0f0d; }
-  .legend { display: flex; flex-wrap: wrap; gap: 0.4rem 1.1rem; padding-block: 0.8rem; font-size: 0.74rem; color: var(--ink-dim); align-items: center; }
-  .legend span { display: inline-flex; align-items: center; gap: 0.4rem; }
-  .swatch { display: inline-block; width: 11px; height: 11px; border-radius: 3px; }
-  .swatch.block { background: #ff4d5e; width: 8px; height: 8px; border-radius: 1px; }
-  .swatch.batch { width: 18px; height: 4px; border-radius: 1px; background: #ff4d5e; opacity: 0.7; }
-  .swatch.slab { width: 26px; height: 10px; border: 1.2px solid #9aa8ff; background: #9aa8ff2a; display: inline-flex; gap: 2px; padding: 1.5px; }
-  .swatch.slab i { width: 3px; background: #3d7bff; }
-  .swatch.slab i:first-child { background: #ff4d5e; }
-  .swatch.slab.seen { width: 18px; background: #9aa8ff10; }
-  .swatch.slab.attested { width: 18px; }
-  .swatch.slab.confirmed { width: 18px; background: #9aa8ff4d; border: 1.6px solid #d6dbff; }
-  .swatch.slab.final { width: 18px; background: #2b3c33; border-color: var(--accent); }
-  .swatch.reorg { background: #ff5c5c; transform: rotate(45deg) scale(0.75); }
-  .buttons { margin-left: auto; display: inline-flex; gap: 0.5rem; }
-  .toggle { font: inherit; color: var(--accent); background: none; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.25rem 0.6rem; cursor: pointer; }
-  .stage { position: relative; max-width: 96rem; margin-inline: auto; }
-  canvas { display: block; width: 100%; height: 530px; cursor: crosshair; }
-  .tip { position: absolute; top: 0; left: 0; pointer-events: none; background: color-mix(in srgb, var(--panel) 92%, transparent); border: 1px solid var(--panel-edge); border-radius: 8px; padding: 0.45rem 0.6rem; font-size: 0.72rem; line-height: 1.45; color: var(--ink); min-width: 200px; max-width: 300px; box-shadow: 0 8px 24px rgb(0 0 0 / 0.45); }
 
   .sub { color: var(--ink-dim); max-width: 46rem; margin-block: 0.6rem 1.5rem; }
   .sub code, .bedrock code { font-size: 0.85em; }
@@ -537,7 +381,7 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   .timing b { color: var(--ink); font-weight: 500; }
   .timing .chip { margin-right: 0.35rem; }
 
-  .levels { display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: 0.9rem; margin-bottom: 1.2rem; }
+  .levels { display: grid; grid-template-columns: repeat(auto-fit, minmax(12.5rem, 1fr)); gap: 0.9rem; margin-bottom: 1.2rem; }
   .snippet { position: relative; margin-top: 0.7rem; }
   /* Long lines wrap, continuation lines indented so each reads as one. */
   .snippet pre { font-size: 0.76rem; background: #0b0f0d; border: 1px solid var(--panel-edge); border-radius: 6px; padding: 0.5rem 2.2rem 0.5rem calc(0.65rem + 2ch); text-indent: -2ch; white-space: pre-wrap; overflow-wrap: anywhere; }
@@ -587,8 +431,5 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
   }
   @media (max-width: 639px) {
     .section { padding-block: 4rem; }
-    .lede { font-size: 1rem; }
-    .legend { gap: 0.35rem 0.8rem; font-size: 0.68rem; }
-    canvas { height: 478px; }
   }
 </style>

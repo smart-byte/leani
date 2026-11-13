@@ -2,57 +2,111 @@
 import { BLOBS_MONEY_URL } from '../config';
 
 const rows = [
-  [
-    'a metered RPC',
-    'JSON-RPC from your own node: blocks, transactions, receipts, logs, and subscriptions. Point viem at it.',
-    '/docs/guides/json-rpc/',
-  ],
-  [
-    'a hosted indexer',
-    'Processors that keep only your app’s data: built-in ones for blocks, blobs, token balances, events, and Uniswap pools, or your own in Rust or Wasm.',
-    '/docs/reference/processors/',
-  ],
-  [
-    'a streaming service',
-    'Change streams that resume from a cursor, undo reorgs, and wait for the finality your app asks for.',
-    '/docs/concepts/durable-delivery/',
-  ],
+  {
+    instead: 'a metered RPC',
+    title: 'JSON-RPC',
+    text: 'From your own node: blocks, transactions, receipts, logs, and subscriptions. Point viem at it.',
+    href: '/docs/guides/json-rpc/',
+  },
+  {
+    instead: 'a hosted indexer',
+    title: 'Processors',
+    text: 'They keep only your app’s data: built-in ones for blocks, blobs, token balances, events, and Uniswap pools, or your own in Rust or Wasm.',
+    href: '/docs/reference/processors/',
+  },
+  {
+    instead: 'a streaming service',
+    title: 'Change streams',
+    text: 'They resume from a cursor, undo reorgs, and wait for the finality your app asks for.',
+    href: '/docs/concepts/durable-delivery/',
+  },
 ] as const;
 ---
 <section id="replaces" class="wrap section" aria-labelledby="replaces-h">
   <h2 id="replaces-h"><span class="mono"># </span>What it replaces</h2>
   <p class="lede">
-    We built leani for <a href={BLOBS_MONEY_URL}>blobs.money</a>, which paid a
-    metered RPC for millions of calls to fetch history that public datasets
-    serve for free.
+    Your app needs a small slice of the chain: its contracts’ events, some
+    balances, the newest blocks. Leani gets that slice from public sources
+    on your own machine, so you stop renting it per request. We built it
+    for <a href={BLOBS_MONEY_URL}>blobs.money</a>, which paid a metered RPC
+    for millions of calls to fetch history that public datasets serve for free.
   </p>
-  <dl class="ledger">
-    {rows.map(([instead, leani, href]) => (
-      <div class="row">
-        <dt class="mono">instead of {instead}</dt>
-        <dd>{leani} <a class="more mono" href={href}>docs</a></dd>
-      </div>
-    ))}
-  </dl>
+  <div class="swap">
+    <p class="head mono rented-head">three rented services</p>
+    <p class="head mono node-head"><i class="kept" aria-hidden="true"></i>one leani node, on your machine</p>
+    <dl>
+      {rows.map((row) => (
+        <div class="row">
+          <dt class="mono">
+            <svg viewBox="0 0 28 16" aria-hidden="true"><path d="M1 15h6v-4h6v-4h6v-4h8" /></svg>
+            <span><span class="sr">instead of </span>{row.instead}</span>
+          </dt>
+          <dd>
+            <h3 class="mono">{row.title}</h3>
+            <p>{row.text} <a class="more mono" href={row.href}>docs</a></p>
+          </dd>
+        </div>
+      ))}
+    </dl>
+  </div>
   <p class="foot">
     You pay for the machine it runs on, not per request. leani keeps no EVM
     state, so keep a provider for <code>eth_call</code> and balances.
   </p>
-  <p class="inside"><a href="/inside/">Inside leani</a>: processors at work, what each storage policy keeps, and the exact RPC subset.</p>
 </section>
 
 <style>
-  .lede { color: var(--ink-dim); max-width: 56ch; margin-top: 1rem; }
-  .ledger { margin-top: 2.25rem; border-top: 1px solid var(--panel-edge); }
-  .row {
-    display: grid; grid-template-columns: minmax(0, 14rem) minmax(0, 1fr); gap: 0.3rem 2rem;
-    padding-block: 1.15rem; border-bottom: 1px solid var(--panel-edge);
+  .swap {
+    --rented: 15rem; --gap: 5.5rem;
+    display: grid; grid-template-columns: var(--rented) var(--gap) minmax(0, 1fr); row-gap: 0.75rem; margin-top: 2.5rem;
   }
-  dt { color: var(--ink-dim); font-size: 0.85rem; padding-top: 0.2rem; }
-  dd { margin: 0; max-width: 62ch; }
+  .head { font-size: 0.8rem; color: var(--ink-dim); }
+  .node-head { grid-column: 3; color: var(--ink); display: flex; align-items: center; gap: 0.55rem; }
+  .kept { width: 0.6rem; height: 0.6rem; border-radius: 2px; background: var(--accent); }
+  dl { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; position: relative; }
+  /* The node: one panel behind the three rows on the right. */
+  dl::before {
+    content: ''; position: absolute; inset: 0 0 0 calc(var(--rented) + var(--gap));
+    background: var(--panel); border: 1px solid var(--accent-dim); border-radius: 10px;
+  }
+  .row { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; position: relative; }
+  dt {
+    display: flex; align-items: center; gap: 0.7rem; margin-block: 0.5rem; padding: 0.8rem 1rem;
+    border: 1px dashed var(--panel-edge); border-radius: 8px; color: var(--ink-dim); font-size: 0.85rem;
+  }
+  dt svg { width: 1.75rem; flex: none; fill: none; stroke: #ff7a85; stroke-width: 1.5; opacity: 0.75; }
+  .row::before {
+    content: ''; grid-column: 2; grid-row: 1; height: 1px; margin-inline: 0.6rem 0.9rem;
+    background: linear-gradient(to right, var(--panel-edge), var(--accent));
+  }
+  .row::after {
+    content: ''; grid-column: 2; grid-row: 1; justify-self: end; margin-right: 0.6rem;
+    width: 0.45rem; height: 0.45rem; border: solid var(--accent); border-width: 1px 1px 0 0; rotate: 45deg;
+  }
+  dd { grid-column: 3; margin: 0; padding: 1.15rem 1.5rem; position: relative; display: grid; grid-template-columns: 10rem minmax(0, 1fr); gap: 0.3rem 1.5rem; align-items: baseline; }
+  .row + .row dd { border-top: 1px solid var(--panel-edge); }
+  h3 { font-size: 0.95rem; color: var(--accent); font-weight: 700; }
+  dd p { max-width: 60ch; text-wrap: pretty; }
   .more { font-size: 0.8rem; margin-left: 0.35rem; }
-  .foot { color: var(--ink-dim); max-width: 62ch; margin-top: 1.4rem; }
+  .sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
+  .foot { color: var(--ink-dim); max-width: 46rem; margin-top: 1.6rem; text-wrap: pretty; }
   .foot code { font-family: var(--font-mono); font-size: 0.85em; color: var(--ink); }
-  .inside { color: var(--ink-dim); max-width: 62ch; margin-top: 0.9rem; }
-  @media (max-width: 640px) { .row { grid-template-columns: 1fr; } }
+  @media (max-width: 960px) {
+    .swap { --rented: 12.5rem; --gap: 3rem; }
+    dd { grid-template-columns: 1fr; }
+  }
+  @media (max-width: 680px) {
+    .swap { display: block; }
+    .rented-head { display: none; }
+    .node-head { margin-bottom: 0.75rem; }
+    dl { display: block; }
+    dl::before { inset: 0; }
+    .row { display: block; padding: 1.1rem 1.1rem 0.2rem; }
+    .row::before, .row::after { display: none; }
+    .row + .row { border-top: 1px solid var(--panel-edge); }
+    .row + .row dd { border-top: 0; }
+    dt { display: inline-flex; margin: 0; padding: 0.3rem 0.6rem; font-size: 0.75rem; }
+    dt .sr { position: static; width: auto; height: auto; clip-path: none; }
+    dd { padding: 0.7rem 0 0.9rem; }
+  }
 </style>

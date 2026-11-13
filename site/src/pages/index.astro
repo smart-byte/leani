@@ -12,15 +12,15 @@ import SideNav from '../components/SideNav.astro';
 ---
 <Base
   title="leani — the lean Ethereum indexing node"
-  description="An indexing node you run yourself: it backfills history from public datasets, follows Ethereum and its rollups live, and serves your app's data over JSON-RPC, HTTP, and a TypeScript SDK, with no API key and no per-request bill."
+  description="An indexing node you run next to your app: it backfills history from public datasets, follows Ethereum and its rollups live, labels every block with how final it is, and serves your app's data over JSON-RPC, HTTP, and a TypeScript SDK, with no API key and no per-request bill."
 >
   <Header slot="before-main" />
   <SideNav />
   <Hero />
   <Replaces />
+  <BuiltWith />
   <HowItWorks />
   <Rollups />
-  <BuiltWith />
   <Quickstart />
   <Footer slot="after-main" />
 </Base>
