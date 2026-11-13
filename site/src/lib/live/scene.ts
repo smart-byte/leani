@@ -167,6 +167,8 @@ export interface SceneOptions {
   onHover(hover: Hover | null): void;
   onExpand(expanded: boolean): void;
   reducedMotion: boolean;
+  /** True while nothing needs drawing, such as with the canvas off screen. */
+  paused?(): boolean;
 }
 
 const median = (values: number[]) => {
@@ -334,7 +336,7 @@ export class Scene {
     new ResizeObserver(() => this.layout()).observe(canvas);
     this.layout();
     const loop = () => {
-      this.draw();
+      if (!options.paused?.()) this.draw();
       if (options.reducedMotion) window.setTimeout(() => requestAnimationFrame(loop), 500);
       else requestAnimationFrame(loop);
     };

@@ -41,6 +41,8 @@ body {
 h1, h2, h3 { line-height: 1.15; font-weight: 650; letter-spacing: -0.01em; text-wrap: balance; }
 h2 { font-size: clamp(1.6rem, 3.5vw, 2.4rem); }
 h2 .mono { color: var(--accent); font-size: 0.85em; }
+.lede { color: var(--ink-dim); font-size: 1.1rem; max-width: 46rem; margin-top: 1rem; text-wrap: pretty; }
+@media (max-width: 640px) { .lede { font-size: 1rem; } }
 
 [id] { scroll-margin-top: 4.5rem; }
 
