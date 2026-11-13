@@ -5,12 +5,17 @@
   </picture>
 </h1>
 
-Lean, state-minimized Ethereum indexing node. Leani backfills application
-data from public datasets, follows the chain head over native Ethereum P2P,
-and keeps no raw history. No API key, no archive node.
+Ethereum data without the RPC bill. Leani is an indexing node you run next
+to your app: it backfills history from public datasets, follows Ethereum and
+its rollups live, labels every block with how final it is, and serves the
+data your app needs over JSON-RPC, HTTP, and a TypeScript SDK. No API key, no
+archive node.
 
 Status: stable release (`v0.1.1`). Read the
 [known limitations](docs/operations/preview-limitations.md) before deploying.
+
+[blobs.money](https://blobs.money) and [ticker.leani.dev](https://ticker.leani.dev)
+run on it in production.
 
 ## Install
 
@@ -20,23 +25,13 @@ brew install smart-byte/tap/leani
 
 Or take a checksummed archive from
 [GitHub releases](https://github.com/smart-byte/leani/releases), run the
-container image `ghcr.io/smart-byte/leani:v0.1.1`, or build from source:
+container image `ghcr.io/smart-byte/leani:v0.1.1`, or
+[build from source](https://leani.dev/docs/getting-started/install/).
 
-```bash
-git clone https://github.com/smart-byte/leani.git && cd leani
-cargo build --locked --release -p leani   # target/release/leani
-```
+Using a coding agent? `npx skills add smart-byte/leani -g` installs the Leani
+skill for Codex, Claude Code, Cursor, and others.
 
-See the [install guide](https://leani.dev/docs/getting-started/install/).
-
-Using a coding agent? Install the Leani skill for Codex, Claude Code, Cursor,
-and others, then ask it to "use leani" for any Ethereum data question:
-
-```bash
-npx skills add smart-byte/leani -g
-```
-
-## Follow Ethereum blocks
+## Follow the chain
 
 No configuration file:
 
@@ -44,114 +39,39 @@ No configuration file:
 leani subscribe blocks
 ```
 
-On first use Leani asks independent public providers for a finalized
-checkpoint and lets you accept it once at least two agree. Peer discovery can
-take a few minutes. After that, every new block streams to stdout:
+On first use you approve a finalized checkpoint, the trusted starting point
+Leani verifies the chain from. Then every new Ethereum block streams to
+stdout. Add `--finality finalized` to print only blocks that can no longer
+change, or `--format json` for NDJSON.
 
-```text
-2026-09-07T12:11:59Z  block=25925396  txs=381  gas=43.17M / 60.00M (72.0%)  base_fee=0.069459109 gwei  blobs=3  unattested
-```
-
-Add `--finality finalized` to print only blocks Ethereum consensus has
-finalized, or `--format json` for NDJSON.
-
-## Follow a processor
-
-Built-in processors turn blocks into application data. A live Uniswap V3 price
-uses the same command shape:
+## Run a node for your app
 
 ```bash
-leani subscribe uniswap-v3 ETH/USDC
+leani init blocks                   # Ethereum Mainnet
+leani init blocks --network base    # or a rollup: base, op, arbitrum-one, robinhood, ...
+leani serve                         # HTTP API on 18080, JSON-RPC on 18545
 ```
 
-Several markets, piped as NDJSON into another Unix tool:
+A node replaces three services you would otherwise rent:
 
-```bash
-leani subscribe uniswap-v3 ETH/USDC ETH/USDT --format json |
-  jq --unbuffered '{market, price, baseVolume, blockNumber, finality}'
-```
-
-Keep a node running so several consumers can share it:
-
-```bash
-leani init uniswap-v3 ETH/USDC   # writes a compact leani.toml after the checkpoint quorum
-leani serve                       # HTTP API on :18080, JSON-RPC on :18545
-```
-
-The same `leani subscribe` command in another terminal detects the local node
-and attaches to it instead of starting its own runtime. Guides:
-[block subscriptions](https://leani.dev/docs/guides/live-block-subscriptions/),
-[Uniswap price subscriptions](https://leani.dev/docs/guides/uniswap-price-subscriptions/).
-
-## Index history without an archive node
-
-Backfill a block range from public Xatu datasets, then query the result. The
-`windowed` profile decodes each Uniswap V2 `Sync` event, stamped with its
-hour, and keeps a 30-day window of them:
-
-```bash
-cp config/modes/windowed.toml leani.toml
-leani backfill --processor uniswap-v2-sync-30d --from-block 17000000 --to-block 17000999
-leani serve
-```
-
-```bash
-curl -s 'http://127.0.0.1:8080/v1/processors/uniswap-v2-sync-30d/collections/uniswap_v2.sync/entities?limit=3'
-```
-
-Any contract event can be indexed from its ABI alone. The complete
-[`examples/weth-transfers/node.toml`](examples/weth-transfers/node.toml)
-configures the built-in `evm-events` processor like this:
-
-```toml
-[processors.settings]
-addresses = ["0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"]
-
-[[processors.settings.events]]
-abi = "event Transfer(address indexed from, address indexed to, uint256 value)"
-
-[processors.settings.events.output]
-collection = "weth.transfers"
-kind = "weth.transfer"
-```
-
-The node's backfills resume from committed coverage, and historical Parquet
-material is discarded after each commit. An interrupted `leani backfill` of an
-ordered processor, such as `erc20-balances`, reruns from the block after the
-last one it applied, which the command names when it refuses another start.
-A backfill can run while the live lane already follows the head. See the
-[bounded Mainnet guide](https://leani.dev/docs/getting-started/bounded-mainnet/),
-the [processor catalog](https://leani.dev/docs/reference/processors/), and
-[backfill while following live](https://leani.dev/docs/guides/backfill-while-following-live/).
-
-## Drop-in JSON-RPC
-
-A node prepared with `leani init` serves JSON-RPC on port 18545:
-
-```bash
-curl -s http://127.0.0.1:18545 -H 'Content-Type: application/json' \
-  --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}'
-# {"jsonrpc":"2.0","id":1,"result":"0x1"}
-```
-
-```ts
-import { createPublicClient, http } from "viem";
-
-const eth = createPublicClient({ transport: http("http://127.0.0.1:18545") });
-console.log(await eth.getChainId()); // 1
-```
-
-Leani answers chain metadata, recent and bounded historical blocks,
-transactions, receipts, and `eth_getLogs`, plus reorg-correct `newHeads` and
-`logs` WebSocket subscriptions. Without an EVM and state it does not implement
-`eth_call`, `eth_getBalance`, `eth_getCode`, `eth_getStorageAt`,
-`eth_estimateGas`, or trace methods; those fail explicitly instead of
-answering wrongly. See the [method matrix](docs/reference/ethereum-json-rpc.md).
+- **A metered RPC.** JSON-RPC from your own node: blocks, transactions,
+  receipts, logs, and reorg-correct subscriptions. Point viem at
+  `http://127.0.0.1:18545`. Leani keeps no EVM state, so `eth_call`, balances,
+  and traces fail explicitly; keep a provider for those. See the
+  [method matrix](docs/reference/ethereum-json-rpc.md).
+- **A hosted indexer.** [Processors](https://leani.dev/docs/reference/processors/)
+  keep only your app's data: built-in ones for blocks, blobs, token balances,
+  events, and Uniswap pools, or
+  [your own](https://leani.dev/docs/guides/wasm-processors/) in Rust or
+  TypeScript.
+- **A streaming service.** Change streams resume from a cursor, undo reorgs,
+  and say how final each block is: `attested`, `confirmed`, `finalized`, and
+  on rollups `settled`. See
+  [choose a finality level](https://leani.dev/docs/guides/finality-levels/).
 
 ## TypeScript SDK
 
-Install the SDK version that matches your node release; npm's `latest` tag
-can lag behind a prerelease node:
+Install the SDK version that matches your node release:
 
 ```bash
 bun add @smart-byte/leani-sdk@0.1.1
@@ -169,26 +89,6 @@ for await (const change of leani.blocks.subscribe()) {
 }
 ```
 
-The client exposes typed queries and subscriptions for every built-in
-processor, a resumable SSE change stream, and durable named consumers with
-leases and acknowledgements.
-[Query then follow](https://leani.dev/docs/guides/query-then-follow/) seeds
-application state and handles reorgs;
-[durable consumer](https://leani.dev/docs/guides/durable-consumer/) commits
-the Leani cursor inside your own database transaction.
-
-## Your own processor
-
-When no built-in processor produces the data you need, write your own; that is
-the intended way to extend Leani. A
-[Wasm processor](https://leani.dev/docs/guides/wasm-processors/), in Rust or
-TypeScript, runs in the stock binary without rebuilding it, and
-`leani processor create` writes one from a description of the data to keep. A
-native Rust processor runs fastest and can add typed query routes:
-[`examples/custom-node`](examples/custom-node) adds one and a query extension
-to the stock node through `leani::run_with_registry`, without forking it. See
-the [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
-
 ## How it works
 
 <picture>
@@ -196,23 +96,11 @@ the [processor-author guide](https://leani.dev/docs/guides/custom-processor/).
   <img src="site/public/diagrams/how-it-works-light.svg" alt="A history lane reads public datasets through block N and a live lane follows Ethereum P2P from block N+1; they join where the live block's parent equals hash(N). Blocks are normalized, validated, mapped in parallel, and reduced in canonical order. Raw chunks are dropped after mapping; only processor stores and the change stream stay on disk and serve JSON-RPC, HTTP and SSE, and your database.">
 </picture>
 
-Historical sources are public Xatu Parquet datasets and EraE archives, read
-range by range and verified against block commitments. The live lane follows
-execution peers through isolated Reth networking crates and verifies finality
-from the Beacon API or consensus P2P light-client updates. Both lanes join
-exactly once at a hash-verified boundary. Disk holds only:
-
-```text
-disk =
-  application outputs
-  + processor state/checkpoints
-  + a short recent-block/reorg window
-  + one bounded transient input chunk
-  + optional indexes explicitly enabled by the operator
-```
-
-Read [how Leani works](https://leani.dev/docs/concepts/how-leani-works/),
-[coverage, finality, and reorgs](https://leani.dev/docs/concepts/coverage-finality-and-reorgs/),
+History comes from public Xatu and EraE datasets, verified against block
+commitments. The live lane follows execution peers and verifies finality from
+light-client updates. Both lanes join once, at a hash-verified boundary, and
+disk holds only your processors' results, their state, and a short reorg
+window. Read [how Leani works](https://leani.dev/docs/concepts/how-leani-works/)
 and the [architecture notes](docs/contributing/architecture.md).
 
 ## Documentation
