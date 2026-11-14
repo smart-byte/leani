@@ -1858,7 +1858,44 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ==============================================================================
 BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License (BSD-3-Clause)
 ==============================================================================
+curve25519-dalek 5.0.0 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/curve25519-dalek
+
+Copyright (c) 2016-2021 isis agora lovecruft. All rights reserved.
+Copyright (c) 2016-2021 Henry de Valence. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+==============================================================================
+BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License (BSD-3-Clause)
+==============================================================================
 ed25519-dalek 2.2.0 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek
+ed25519-dalek 3.0.0 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/ed25519-dalek
 
 Copyright (c) 2017-2019 isis agora lovecruft. All rights reserved.
 
@@ -1893,7 +1930,7 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 ==============================================================================
 BSD 3-Clause &quot;New&quot; or &quot;Revised&quot; License (BSD-3-Clause)
 ==============================================================================
-x25519-dalek 2.0.1 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek
+x25519-dalek 3.0.0 — https://github.com/dalek-cryptography/curve25519-dalek/tree/main/x25519-dalek
 
 Copyright (c) 2017-2021 isis agora lovecruft. All rights reserved.
 Copyright (c) 2019-2021 DebugSteven. All rights reserved.
@@ -2977,7 +3014,6 @@ quanta 0.12.6 — https://github.com/metrics-rs/quanta
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-unsigned-varint 0.7.2 — https://github.com/paritytech/unsigned-varint
 unsigned-varint 0.8.0 — https://github.com/paritytech/unsigned-varint
 
 // Copyright (c) 2020 Aleksa Sarai <cyphar@cyphar.com>
@@ -3035,7 +3071,7 @@ gen! {
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-libp2p 0.56.0 — https://github.com/libp2p/rust-libp2p
+libp2p 0.57.1 — https://github.com/libp2p/rust-libp2p
 
 // Copyright 2018 Parity Technologies (UK) Ltd.
 //
@@ -3066,7 +3102,6 @@ pub mod ping;
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-unsigned-varint 0.7.2 — https://github.com/paritytech/unsigned-varint
 unsigned-varint 0.8.0 — https://github.com/paritytech/unsigned-varint
 
 // Copyright 2018-2019 Parity Technologies (UK) Ltd.
@@ -3148,6 +3183,74 @@ pub mod tokio_util;
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+libp2p-identity 0.3.1 — https://github.com/libp2p/rust-libp2p
+
+// Copyright 2020 Parity Technologies (UK) Ltd.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+use std::hint::black_box;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use libp2p_identity::{Keypair, PeerId};
+
+fn from_bytes(c: &mut Criterion) {
+    let peer_id_bytes = Keypair::generate_ed25519().public().to_peer_id().to_bytes();
+
+    c.bench_function("from_bytes", |b| {
+        b.iter(|| {
+            black_box(PeerId::from_bytes(&peer_id_bytes).unwrap());
+        })
+    });
+}
+
+fn clone(c: &mut Criterion) {
+    let peer_id = Keypair::generate_ed25519().public().to_peer_id();
+
+    c.bench_function("clone", |b| {
+        b.iter(|| {
+            black_box(peer_id);
+        })
+    });
+}
+
+fn sort_vec(c: &mut Criterion) {
+    let peer_ids: Vec<_> = (0..100)
+        .map(|_| Keypair::generate_ed25519().public().to_peer_id())
+        .collect();
+
+    c.bench_function("sort_vec", |b| {
+        b.iter(|| {
+            let mut peer_ids = peer_ids.clone();
+            peer_ids.sort_unstable();
+            black_box(peer_ids);
+        })
+    });
+}
+
+criterion_group!(peer_id, from_bytes, clone, sort_vec);
+criterion_main!(peer_id);
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 libp2p-identity 0.2.14 — https://github.com/libp2p/rust-libp2p
 
 // Copyright 2020 Parity Technologies (UK) Ltd.
@@ -3211,6 +3314,35 @@ fn sort_vec(c: &mut Criterion) {
 
 criterion_group!(peer_id, from_bytes, clone, sort_vec);
 criterion_main!(peer_id);
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+libp2p-gossipsub 0.50.1 — https://github.com/libp2p/rust-libp2p
+
+// Copyright 2025 Sigma Prime Pty Ltd.
+//
+// Permission is hereby granted, free of charge, to any person obtaining a
+// copy of this software and associated documentation files (the "Software"),
+// to deal in the Software without restriction, including without limitation
+// the rights to use, copy, modify, merge, publish, distribute, sublicense,
+// and/or sell copies of the Software, and to permit persons to whom the
+// Software is furnished to do so, subject to the following conditions:
+//
+// The above copyright notice and this permission notice shall be included in
+// all copies or substantial portions of the Software.
+//
+// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+// OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+// FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+// DEALINGS IN THE SOFTWARE.
+
+#[cfg(feature = "partial-messages")]
+pub mod partial_messages;
 
 
 ==============================================================================
@@ -3596,18 +3728,18 @@ cc 1.4.0 — https://github.com/rust-lang/cc-rs
 cfg-if 1.0.4 — https://github.com/rust-lang/cfg-if
 cmake 0.1.58 — https://github.com/rust-lang/cmake-rs
 find-msvc-tools 0.1.9 — https://github.com/rust-lang/cc-rs
-futures-timer 3.0.4 — https://github.com/async-rs/futures-timer
+futures-timer 3.0.3 — https://github.com/async-rs/futures-timer
 jobserver 0.1.35 — https://github.com/rust-lang/jobserver-rs
-js-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
+js-sys 0.3.85 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/js-sys
 openssl-probe 0.2.1 — https://github.com/rustls/openssl-probe
 pkg-config 0.3.33 — https://github.com/rust-lang/pkg-config-rs
 socket2 0.6.5 — https://github.com/rust-lang/socket2
-wasm-bindgen-futures 0.4.76 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
-wasm-bindgen-macro-support 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
-wasm-bindgen-macro 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
-wasm-bindgen-shared 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
-wasm-bindgen 0.2.126 — https://github.com/wasm-bindgen/wasm-bindgen
-web-sys 0.3.103 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys
+wasm-bindgen-futures 0.4.58 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/futures
+wasm-bindgen-macro-support 0.2.108 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro-support
+wasm-bindgen-macro 0.2.108 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/macro
+wasm-bindgen-shared 0.2.108 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/shared
+wasm-bindgen 0.2.108 — https://github.com/wasm-bindgen/wasm-bindgen
+web-sys 0.3.85 — https://github.com/wasm-bindgen/wasm-bindgen/tree/master/crates/web-sys
 
 Copyright (c) 2014 Alex Crichton
 
@@ -3728,6 +3860,39 @@ base16ct 0.2.0 — https://github.com/RustCrypto/formats/tree/master/base16ct
 
 Copyright (c) 2014 Steve "Sc00bz" Thomas (steve at tobtu dot com)
 Copyright (c) 2022 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+base16ct 1.0.0 — https://github.com/RustCrypto/formats
+
+Copyright (c) 2014 Steve "Sc00bz" Thomas (steve at tobtu dot com)
+Copyright (c) 2022-2025 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -4206,6 +4371,7 @@ SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 hkdf 0.12.4 — https://github.com/RustCrypto/KDFs/
+hkdf 0.13.0 — https://github.com/RustCrypto/KDFs/
 
 Copyright (c) 2015-2018 Vlad Filippov
 Copyright (c) 2018-2021 RustCrypto Developers
@@ -4343,7 +4509,6 @@ const-random-macro 0.1.16 — https://github.com/tkaitchuck/constrandom
 const-random 0.1.18 — https://github.com/tkaitchuck/constrandom
 hashbrown 0.13.2 — https://github.com/rust-lang/hashbrown
 hashbrown 0.14.5 — https://github.com/rust-lang/hashbrown
-hashbrown 0.15.5 — https://github.com/rust-lang/hashbrown
 hashbrown 0.16.1 — https://github.com/rust-lang/hashbrown
 hashbrown 0.17.1 — https://github.com/rust-lang/hashbrown
 
@@ -4817,6 +4982,7 @@ MIT License (MIT)
 digest 0.10.7 — https://github.com/RustCrypto/traits
 digest 0.9.0 — https://github.com/RustCrypto/traits
 hmac 0.12.1 — https://github.com/RustCrypto/MACs
+hmac 0.13.0 — https://github.com/RustCrypto/MACs
 
 Copyright (c) 2017 Artyom Pavlov
 
@@ -5864,6 +6030,41 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+ecdsa 0.17.0 — https://github.com/RustCrypto/signatures
+ed25519 3.0.0 — https://github.com/RustCrypto/signatures
+rfc6979 0.6.0 — https://github.com/RustCrypto/signatures
+signature 3.0.0 — https://github.com/RustCrypto/traits
+
+Copyright (c) 2018-2026 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 rand_core 0.10.1 — https://github.com/rust-random/rand_core
 
 Copyright (c) 2018-2026 The Rand Project Developers
@@ -6725,6 +6926,7 @@ MIT License (MIT)
 ==============================================================================
 p256 0.13.2 — https://github.com/RustCrypto/elliptic-curves/tree/master/p256
 primeorder 0.13.6 — https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder
+primeorder 0.14.0 — https://github.com/RustCrypto/elliptic-curves
 
 Copyright (c) 2020-2023 RustCrypto Developers
 
@@ -6790,6 +6992,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 k256 0.13.4 — https://github.com/RustCrypto/elliptic-curves/tree/master/k256
+k256 0.14.0 — https://github.com/RustCrypto/elliptic-curves
 
 Copyright (c) 2020-2024 RustCrypto Developers
 
@@ -6854,7 +7057,41 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+elliptic-curve 0.14.3 — https://github.com/RustCrypto/traits
+
+Copyright (c) 2020-2026 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 const-oid 0.10.2 — https://github.com/RustCrypto/formats
+der 0.8.3 — https://github.com/RustCrypto/formats
+pkcs8 0.11.0 — https://github.com/RustCrypto/formats
 
 Copyright (c) 2020-2026 The RustCrypto Project Developers
 
@@ -7108,7 +7345,10 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+crypto-bigint 0.7.11 — https://github.com/RustCrypto/crypto-bigint
 ripemd 0.2.0 — https://github.com/RustCrypto/hashes
+sec1 0.8.1 — https://github.com/RustCrypto/formats
+spki 0.8.1 — https://github.com/RustCrypto/formats
 
 Copyright (c) 2021-2026 The RustCrypto Project Developers
 
@@ -7205,6 +7445,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+cmov 0.5.4 — https://github.com/RustCrypto/utils
 hybrid-array 0.4.14 — https://github.com/RustCrypto/hybrid-array
 
 Copyright (c) 2022-2026 The RustCrypto Project Developers
@@ -7295,6 +7536,38 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+cpubits 0.1.1 — https://github.com/RustCrypto/utils
+
+Copyright (c) 2023-2026 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 rapidhash 4.5.1 — https://github.com/hoxxep/rapidhash
 
 Copyright (c) 2024 Liam Gray <gmail@liamg.me>
@@ -7325,6 +7598,103 @@ system-configuration-sys 0.6.0 — https://github.com/mullvad/system-configurati
 system-configuration 0.7.0 — https://github.com/mullvad/system-configuration-rs
 
 Copyright (c) 2024 Mullvad VPN AB
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+primefield 0.14.0 — https://github.com/RustCrypto/elliptic-curves
+
+Copyright (c) 2024-2026 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+ctutils 0.4.8 — https://github.com/RustCrypto/utils
+
+Copyright (c) 2025-2026 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+wnaf 0.14.1 — https://github.com/RustCrypto/elliptic-curves
+
+Copyright (c) 2026 RustCrypto Developers
+Copyright (c) 2018-2025 `group` crate developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -7576,7 +7946,6 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 MIT License (MIT)
 ==============================================================================
 nohash-hasher 0.2.0 — https://github.com/paritytech/nohash-hasher
-unsigned-varint 0.7.2 — https://github.com/paritytech/unsigned-varint
 unsigned-varint 0.8.0 — https://github.com/paritytech/unsigned-varint
 
 Copyright 2018 Parity Technologies (UK) Ltd.
@@ -8378,7 +8747,7 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-snow 0.9.6 — https://github.com/mcginty/snow
+snow 0.10.0 — https://github.com/mcginty/snow
 
 MIT License
 
@@ -8907,7 +9276,8 @@ chrono 0.4.45 — https://github.com/chronotope/chrono
 concat-kdf 0.1.0 — https://github.com/RustCrypto/KDFs/
 const-str 0.4.3 — https://github.com/Nugine/const-str
 fixed-map-derive 0.9.5 — https://github.com/udoprog/fixed-map
-futures-bounded 0.2.4 — https://github.com/thomaseizinger/rust-futures-bounded
+futures-bounded 0.3.1 — https://github.com/thomaseizinger/rust-futures-bounded
+gloo-timers 0.2.6 — https://github.com/rustwasm/gloo/tree/master/crates/timers
 if-watch 3.2.2 — https://github.com/libp2p/if-watch
 impl-trait-for-tuples 0.2.3 — https://github.com/bkchr/impl-trait-for-tuples
 include_dir 0.7.4 — https://github.com/Michael-F-Bryan/include_dir
@@ -8916,21 +9286,20 @@ jni-macros 0.22.4 — https://github.com/jni-rs/jni-rs
 jni-sys-macros 0.4.1 — https://github.com/jni-rs/jni-sys
 jni 0.22.4 — https://github.com/jni-rs/jni-rs
 libm 0.2.16 — https://github.com/rust-lang/compiler-builtins
-libp2p-allow-block-list 0.6.0 — https://github.com/libp2p/rust-libp2p
-libp2p-connection-limits 0.6.0 — https://github.com/libp2p/rust-libp2p
-libp2p-core 0.43.2 — https://github.com/libp2p/rust-libp2p
-libp2p-gossipsub 0.49.5 — https://github.com/libp2p/rust-libp2p
-libp2p-identify 0.47.0 — https://github.com/libp2p/rust-libp2p
-libp2p-noise 0.46.1 — https://github.com/libp2p/rust-libp2p
-libp2p-ping 0.47.0 — https://github.com/libp2p/rust-libp2p
-libp2p-stream 0.4.0-alpha — https://github.com/libp2p/rust-libp2p
-libp2p-swarm-derive 0.35.1 — https://github.com/libp2p/rust-libp2p
-libp2p-swarm 0.47.1 — https://github.com/libp2p/rust-libp2p
-libp2p-tcp 0.44.1 — https://github.com/libp2p/rust-libp2p
-libp2p-yamux 0.47.0 — https://github.com/libp2p/rust-libp2p
+libp2p-allow-block-list 0.7.0 — https://github.com/libp2p/rust-libp2p
+libp2p-connection-limits 0.7.0 — https://github.com/libp2p/rust-libp2p
+libp2p-core 0.44.0 — https://github.com/libp2p/rust-libp2p
+libp2p-identify 0.48.0 — https://github.com/libp2p/rust-libp2p
+libp2p-noise 0.47.0 — https://github.com/libp2p/rust-libp2p
+libp2p-ping 0.48.0 — https://github.com/libp2p/rust-libp2p
+libp2p-stream 0.5.0-alpha — https://github.com/libp2p/rust-libp2p
+libp2p-swarm-derive 0.36.0 — https://github.com/libp2p/rust-libp2p
+libp2p-swarm 0.48.0 — https://github.com/libp2p/rust-libp2p
+libp2p-tcp 0.45.0 — https://github.com/libp2p/rust-libp2p
+libp2p-yamux 0.48.0 — https://github.com/libp2p/rust-libp2p
 match-lookup 0.1.2 — https://github.com/mriise/smol-base-x
 modular-bitfield-impl 0.13.1 — https://github.com/modular-bitfield/modular-bitfield
-multistream-select 0.13.0 — https://github.com/libp2p/rust-libp2p
+multistream-select 0.14.0 — https://github.com/libp2p/rust-libp2p
 ndk-context 0.1.1 — https://github.com/rust-windowing/android-ndk-rs
 netlink-packet-core 0.8.1 — https://github.com/rust-netlink/netlink-packet-core
 netlink-proto 0.12.1 — https://github.com/rust-netlink/netlink-proto
@@ -8938,8 +9307,7 @@ netlink-sys 0.8.8 — https://github.com/rust-netlink/netlink-sys
 object_store 0.14.2 — https://github.com/apache/arrow-rs-object-store
 op-alloy-consensus 2.0.0 — https://github.com/ethereum-optimism/optimism
 op-alloy-rpc-types-engine 2.0.0 — https://github.com/ethereum-optimism/optimism
-quick-protobuf-codec 0.3.1 — https://github.com/libp2p/rust-libp2p
-quick-protobuf 0.8.1 — https://github.com/tafia/quick-protobuf
+prost-codec 0.4.0 — https://github.com/libp2p/rust-libp2p
 r-efi 5.3.0 — https://github.com/r-efi/r-efi
 r-efi 6.0.0 — https://github.com/r-efi/r-efi
 reth-codecs-derive 0.6.0 — https://github.com/paradigmxyz/reth-core
@@ -8949,7 +9317,7 @@ rtnetlink 0.20.0 — https://github.com/rust-netlink/rtnetlink
 ruint-macro 1.2.1 — https://github.com/recmo/uint
 ruint 1.20.0 — https://github.com/alloy-rs/ruint
 rustls-platform-verifier-android 0.1.1 — https://github.com/rustls/rustls-platform-verifier
-rw-stream-sink 0.4.0 — https://github.com/libp2p/rust-libp2p
+rw-stream-sink 0.5.0 — https://github.com/libp2p/rust-libp2p
 siphasher 1.0.3 — https://github.com/jedisct1/rust-siphash
 sqlx-core 0.9.0 — https://github.com/launchbadge/sqlx
 sqlx-sqlite 0.9.0 — https://github.com/launchbadge/sqlx
@@ -8987,8 +9355,7 @@ windows_i686_msvc 0.52.6 — https://github.com/microsoft/windows-rs
 windows_x86_64_gnu 0.52.6 — https://github.com/microsoft/windows-rs
 windows_x86_64_gnullvm 0.52.6 — https://github.com/microsoft/windows-rs
 windows_x86_64_msvc 0.52.6 — https://github.com/microsoft/windows-rs
-yamux 0.12.1 — https://github.com/paritytech/yamux
-yamux 0.13.10 — https://github.com/paritytech/yamux
+yamux 0.14.1 — https://github.com/paritytech/yamux
 
 MIT License
 
@@ -9265,6 +9632,7 @@ fastrand 2.5.0 — https://github.com/smol-rs/fastrand
 fixed-cache 0.1.10 — https://github.com/DaniPopes/fixed-cache
 futures-lite 2.6.1 — https://github.com/smol-rs/futures-lite
 group 0.13.0 — https://github.com/zkcrypto/group
+group 0.14.0 — https://github.com/zkcrypto/group
 hermit-abi 0.5.2 — https://github.com/hermit-os/hermit-rs
 indenter 0.3.4 — https://github.com/yaahc/indenter
 itoa 1.0.18 — https://github.com/dtolnay/itoa
@@ -9290,6 +9658,7 @@ rustix 1.1.6 — https://github.com/bytecodealliance/rustix
 rustversion 1.0.23 — https://github.com/dtolnay/rustversion
 schnellru 0.2.4 — https://github.com/koute/schnellru
 semver 1.0.28 — https://github.com/dtolnay/semver
+send_wrapper 0.4.0 — https://github.com/thk1/send_wrapper
 seq-macro 0.3.6 — https://github.com/dtolnay/seq-macro
 serde 1.0.229 — https://github.com/serde-rs/serde
 serde_core 1.0.229 — https://github.com/serde-rs/serde
@@ -9432,6 +9801,7 @@ THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLI
 MIT License (MIT)
 ==============================================================================
 multiaddr 0.18.2 — https://github.com/multiformats/rust-multiaddr
+multiaddr 0.19.1 — https://github.com/multiformats/rust-multiaddr
 multihash 0.19.5 — https://github.com/multiformats/rust-multihash
 
 The MIT License
@@ -9973,6 +10343,7 @@ SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 fiat-crypto 0.2.9 — https://github.com/mit-plv/fiat-crypto
+fiat-crypto 0.3.0 — https://github.com/mit-plv/fiat-crypto
 
 The MIT License (MIT)
 
@@ -10059,6 +10430,7 @@ THE SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 ff 0.13.1 — https://github.com/zkcrypto/ff
+ff 0.14.0 — https://github.com/zkcrypto/ff
 
 The MIT License (MIT)
 
@@ -10440,9 +10812,8 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-hashlink 0.10.0 — https://github.com/kyren/hashlink
 hashlink 0.11.1 — https://github.com/djc/hashlink
-hashlink 0.9.1 — https://github.com/kyren/hashlink
+hashlink 0.12.2 — https://github.com/djc/hashlink
 
 This work is derived in part from the `linked-hash-map` crate, Copyright (c)
 2015 The Rust Project Developers
@@ -11053,7 +11424,6 @@ the following restrictions:
 ==============================================================================
 zlib License (Zlib)
 ==============================================================================
-foldhash 0.1.5 — https://github.com/orlp/foldhash
 foldhash 0.2.0 — https://github.com/orlp/foldhash
 
 Copyright (c) 2024 Orson Peters
