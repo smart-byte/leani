@@ -22,7 +22,8 @@ const levelName = (chain: Chain, level: Level) => ({
 /**
  * Wire the picture inside `root`: the canvas, its hover card, the strip about a followed block, and the days
  * toggle. The feed is the hub `?hub=` names, else the recorded replay. The page's one `[data-status]` line, if
- * any, says which. Drawing stops while the canvas is off screen.
+ * any, says which, and how many of its `data-chains` chains have a head. Drawing stops while the canvas is off
+ * screen.
  */
 export async function mountStage(root: ParentNode): Promise<Stage> {
   const canvas = root.querySelector<HTMLCanvasElement>('[data-canvas]')!;
@@ -137,7 +138,7 @@ export async function mountStage(root: ParentNode): Promise<Stage> {
   const refresh = () => {
     expand.hidden = !scene.settles();
     const following = scene.summaries().filter((summary) => summary.head !== null).length;
-    if (status) status.textContent = `${source} · ${following} of ${present.length} chains`;
+    if (status) status.textContent = `${source} · ${following}\u00a0of\u00a0${status.dataset.chains}\u00a0chains`;
     showJourney(scene.journey());
   };
   refresh();

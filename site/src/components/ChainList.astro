@@ -1,0 +1,83 @@
+---
+import { CHAIN_FAMILIES } from '../lib/chains';
+
+interface Props {
+  /** The popover's id. Its trigger names it in `popovertarget` and sets `anchor-name: --<id>`. */
+  id: string;
+}
+
+const { id } = Astro.props;
+const and = new Intl.ListFormat('en');
+// Lines break between chains, never inside a name like World Chain.
+const names = (labels: string[]) => labels.map((label) => label.replaceAll(' ', '\u00a0'));
+---
+<div id={id} popover class="chain-list" style={`position-anchor: --${id}`} data-chain-list>
+  <dl>
+    {CHAIN_FAMILIES.map(({ label, mainnets, testnets }) => (
+      <div>
+        <dt class="mono">{label}</dt>
+        <dd>
+          {names(mainnets).join(', ')}
+          {testnets.length > 0 && <span>{and.format(names(testnets))} {testnets.length > 1 ? 'testnets' : 'testnet'}</span>}
+        </dd>
+      </div>
+    ))}
+  </dl>
+</div>
+
+<style>
+  .chain-list {
+    width: min(23rem, calc(100vw - 2rem));
+    padding: 0.8rem 0.95rem;
+    background: var(--panel);
+    color: var(--ink);
+    border: 1px solid var(--panel-edge);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgb(0 0 0 / 0.45);
+    font: 0.84rem/1.45 var(--font-sans);
+    text-align: left;
+  }
+  /* Beside its trigger where the browser can anchor it; elsewhere the popover's own centered default. */
+  @supports (position-area: bottom) {
+    .chain-list { margin: 0.5rem 0; position-area: bottom span-right; position-try-fallbacks: top span-right, bottom span-left, top span-left; }
+  }
+  dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); align-items: baseline; gap: 0.6rem 0.9rem; margin: 0; }
+  dl > div { display: contents; }
+  dt { color: var(--accent); font-size: 0.74rem; }
+  dd { margin: 0; text-wrap: pretty; }
+  dd span { display: block; color: var(--ink-dim); font-size: 0.78rem; }
+</style>
+
+<script>
+  // A mouse opens a list on hover. Touch and keyboard toggle it with its trigger, and a tap
+  // outside or Escape closes it.
+  for (const list of document.querySelectorAll<HTMLElement>('[data-chain-list]')) {
+    const trigger = document.querySelector<HTMLElement>(`[popovertarget="${list.id}"]`)!;
+    let hovered = false;
+    let timer = 0;
+    const show = () => list.matches(':popover-open') || list.showPopover();
+    const settle = (open: boolean, delay: number) => {
+      window.clearTimeout(timer);
+      timer = window.setTimeout(() => (open ? show() : list.matches(':popover-open') && list.hidePopover()), delay);
+    };
+    for (const element of [trigger, list]) {
+      element.addEventListener('pointerenter', (event) => {
+        if (event.pointerType !== 'mouse') return;
+        hovered = true;
+        settle(true, 80);
+      });
+      element.addEventListener('pointerleave', (event) => {
+        if (event.pointerType !== 'mouse') return;
+        hovered = false;
+        settle(false, 200);
+      });
+    }
+    // The press light-dismisses a list the hover opened; open it again rather than let the click toggle it.
+    trigger.addEventListener('click', (event) => {
+      if (!hovered) return;
+      event.preventDefault();
+      window.clearTimeout(timer);
+      show();
+    });
+  }
+</script>

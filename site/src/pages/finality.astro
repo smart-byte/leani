@@ -2,8 +2,10 @@
 import Base from '../layouts/Base.astro';
 import Header from '../components/Header.astro';
 import Footer from '../components/Footer.astro';
+import ChainList from '../components/ChainList.astro';
 import FinalityStage from '../components/FinalityStage.astro';
 import TerminalFrame from '../components/TerminalFrame.astro';
+import { CHAIN_COUNT } from '../lib/chains';
 import { hlShell, hlToml, hlTs } from '../lib/highlight';
 import { CHAINS, FAMILY_LABELS, STAGES, type Family, type Stage } from '../lib/live/model';
 
@@ -107,9 +109,10 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
       about 13 seconds, final in about 15 minutes, settled for withdrawals in days. Every block
       below is one leani saw.
     </p>
-    <div class="status mono" role="status">
-      <span class="dot" data-status-dot></span><span data-status>connecting…</span>
-    </div>
+    <button type="button" class="status mono" popovertarget="finality-chains" style="anchor-name: --finality-chains">
+      <span class="dot" data-status-dot></span><span role="status" data-status data-chains={CHAIN_COUNT}>connecting…</span>
+    </button>
+    <ChainList id="finality-chains" />
   </section>
 
   <section aria-label="Live blocks and blobs">
@@ -344,7 +347,8 @@ open "https://leani.dev/finality?hub=http://127.0.0.1:8797"`;
 <style>
   .hero { padding-block: 3.5rem 1.5rem; }
   .hero h1 { font-size: clamp(2rem, 5vw, 3.4rem); margin-block: 0.6rem 1rem; max-width: 22ch; }
-  .status { margin-top: 1.25rem; display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; color: var(--ink-dim); border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; }
+  .status { margin-top: 1.25rem; display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; line-height: inherit; text-align: left; color: var(--ink-dim); background: none; border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; cursor: help; }
+  .status:hover { border-color: var(--ink-dim); }
   .status .dot { width: 8px; height: 8px; border-radius: 50%; background: #536b5e; }
   .status .dot:global(.on) { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
 

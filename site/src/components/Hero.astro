@@ -1,13 +1,15 @@
 ---
+import ChainList from './ChainList.astro';
 import EngineWorld from './EngineWorld.astro';
 import { HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
 import { ROLLUP_COUNT } from '../lib/chains';
 
 // Measured or registry-backed facts; the storage figure is the externalized
 // profile's evidence row in data/costs.json, footnoted there as workload-specific.
+// A third entry is the id of the chain list the fact opens.
 const stats = [
   ['0 API keys', 'public datasets and peer-to-peer'],
-  [`Ethereum + ${ROLLUP_COUNT} rollups`, 'OP Mainnet, Base, Arbitrum One, and more'],
+  [`Ethereum + ${ROLLUP_COUNT} rollups`, 'OP Mainnet, Base, Arbitrum One, and more', 'hero-chains'],
   ['1M blocks → 9.5 MB', 'on disk when your database keeps the results'],
   ['MIT-licensed', 'Rust library and standalone node'],
 ];
@@ -51,7 +53,12 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
     </div>
 
     <ul class="stats mono" aria-label="Measured facts">
-      {stats.map(([value, label]) => (
+      {stats.map(([value, label, list]) => list ? (
+        <li>
+          <button type="button" class="chains" popovertarget={list} style={`anchor-name: --${list}`}><b>{value}</b><span>{label}</span></button>
+          <ChainList id={list} />
+        </li>
+      ) : (
         <li><b>{value}</b><span>{label}</span></li>
       ))}
     </ul>
@@ -103,6 +110,9 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
   }
   .stats b { display: block; color: var(--accent); font-size: 0.95rem; }
   .stats span { display: block; color: var(--ink-dim); font-size: 0.76rem; margin-top: 0.15rem; }
+  .chains { display: block; width: 100%; padding: 0; border: 0; background: none; color: inherit; font: inherit; text-align: left; cursor: help; }
+  .chains b { text-decoration: underline dotted color-mix(in srgb, var(--accent) 55%, transparent); text-underline-offset: 0.3em; }
+  .chains:hover b { text-decoration-style: solid; }
 
   @media (max-width: 760px) {
     .stage { height: 24rem; }
