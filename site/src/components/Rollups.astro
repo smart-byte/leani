@@ -1,6 +1,7 @@
 ---
+import ChainList from './ChainList.astro';
 import FinalityStage from './FinalityStage.astro';
-import { ROLLUP_COUNT } from '../lib/chains';
+import { CHAIN_COUNT, ROLLUP_COUNT } from '../lib/chains';
 
 // Typical times: the finality docs' level table for Ethereum, the /finality stages for rollups.
 const levels = [
@@ -65,8 +66,9 @@ const BATCH_CONFIRMED = [30, 4 * MIN] as const;
     </dl>
     <p class="watch">
       Below, five leani nodes follow four rollups and Ethereum at once.
-      <span class="status mono" role="status"><span class="dot" data-status-dot></span><span data-status>a recording, starting as you scroll here</span></span>
+      <button type="button" class="status mono" popovertarget="watch-chains" style="anchor-name: --watch-chains"><span class="dot" data-status-dot></span><span role="status" data-status data-chains={CHAIN_COUNT}>a recording, starting as you scroll here</span></button>
     </p>
+    <ChainList id="watch-chains" />
   </div>
   <FinalityStage lazy />
   <p class="wrap caption">
@@ -112,7 +114,8 @@ const BATCH_CONFIRMED = [30, 4 * MIN] as const;
   dd.milestone { margin-top: 0.6rem; padding-top: 0.6rem; border-top: 1px dashed var(--confirmed); }
 
   .watch { color: var(--ink-dim); margin-block: 3rem 1.25rem; display: flex; flex-wrap: wrap; align-items: center; gap: 0.6rem 1rem; }
-  .status { display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; }
+  .status { display: inline-flex; align-items: center; gap: 0.55rem; font-size: 0.8rem; line-height: inherit; text-align: left; color: inherit; background: none; border: 1px solid var(--panel-edge); border-radius: 999px; padding: 0.3rem 0.8rem; cursor: help; }
+  .status:hover { border-color: var(--ink-dim); }
   .dot { width: 8px; height: 8px; border-radius: 50%; background: #536b5e; }
   .dot:global(.on) { background: var(--accent); box-shadow: 0 0 10px var(--accent); }
   .caption { color: var(--ink-dim); font-size: 0.9rem; margin-top: 1rem; }
