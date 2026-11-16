@@ -4479,11 +4479,12 @@ impl SharedLiveRuntime {
         // The execution P2P source follows the chain by header, so keeping
         // headers costs nothing: ad-hoc runs of header-only processors can
         // then use the retained frames whatever the configured lanes need.
-        if self
-            .source
-            .descriptor()
-            .complete_capabilities
-            .contains(leani_primitives::Capability::Header)
+        // Other sources may serve the lanes without them.
+        let source = self.source.descriptor();
+        if source.kind == leani_primitives::SourceKind::ExecutionP2p
+            && source
+                .complete_capabilities
+                .contains(leani_primitives::Capability::Header)
         {
             request.required = request.required.with(leani_primitives::Capability::Header);
         }
@@ -20586,15 +20587,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_shared_lane_requests_headers_where_its_source_supplies_them() {
+    async fn the_shared_lane_requests_headers_where_the_p2p_source_supplies_them() {
         let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
         let chain = live_chain(Finality::Attested);
-        let mut with_headers = fixture_source_descriptor("live-with-headers", range);
-        with_headers.capabilities = with_headers.capabilities.with(Capability::Header);
-        with_headers.complete_capabilities =
-            with_headers.complete_capabilities.with(Capability::Header);
+        let with_headers = |id, kind| {
+            let mut descriptor = fixture_source_descriptor(id, range);
+            descriptor.kind = kind;
+            descriptor.capabilities = descriptor.capabilities.with(Capability::Header);
+            descriptor.complete_capabilities =
+                descriptor.complete_capabilities.with(Capability::Header);
+            descriptor
+        };
         for (descriptor, headers) in [
-            (with_headers, true),
+            (with_headers("live-p2p", SourceKind::ExecutionP2p), true),
+            // A JSON-RPC lane making blocks from a sequencer feed has none.
+            (with_headers("live-json-rpc", SourceKind::JsonRpc), false),
             (
                 fixture_source_descriptor("live-without-headers", range),
                 false,

@@ -584,16 +584,24 @@ become `attested` once the lane reaches the feed's blocks again. Without
 `finality.finalized_by = "json_rpc"`, and recent frames settle
 `finality.settle_blocks` (default 3,600) below the tip.
 
-When the processors need nothing but transactions' bodies, calldata, and
-senders, such as `transaction-stats`, the live lane asks no endpoint for the
-blocks the sequencer built from signed transactions: it makes them from the
-feed's messages, each as soon as the feed signs it. Their frames hold the
-transactions, with senders recovered from their signatures, and no header,
-receipts, or logs. The blocks of messages from L1, such as deposits,
-retryables, and batch posting reports (about one block in 200 on Arbitrum
-One), and of transactions that call `ArbRetryableTx`, still come from an
-endpoint. So does the header of one block in a thousand that the lane made:
-if its transactions root differs, the lane fetches every block from then on.
+When the processors take filtered material and need nothing but
+transactions' bodies, calldata, and senders, such as `transaction-stats`,
+the live lane asks no endpoint for the blocks the sequencer built from
+signed transactions: it makes them from the feed's messages, each as soon as
+the feed signs it. Their frames hold the transactions, with senders
+recovered from their signatures, and no header, receipts, or logs.
+
+The transactions are declared complete, not checked against the block. A
+transaction that calls `ArbRetryableTx` through a contract makes ArbOS add a
+retry transaction the frame lacks. The sequencer's signature binds the block
+hash, but not where a message's fields end, so these frames trust the feed
+relay to pass messages on unchanged.
+
+The blocks of messages from L1, such as deposits, retryables, and batch
+posting reports (about one block in 200 on Arbitrum One), and of direct
+calls to `ArbRetryableTx`, still come from an endpoint. So does the header
+of one block in a thousand that the lane made: if its transactions root
+differs, the lane fetches every block from then on.
 
 A fresh store under the feed catches up from the lowest `start_block` among
 processors with automatic history, at most

@@ -53,7 +53,7 @@ pub struct FeedConfig {
 
 /// The fields of a signed message that its block's transactions come from.
 #[derive(Debug, Eq, PartialEq)]
-pub struct Message {
+pub(crate) struct Message {
     pub kind: u8,
     pub sender: Address,
     pub l1_block: u64,
@@ -64,7 +64,7 @@ pub struct Message {
 
 /// A block the sequencer signed, and the message it signed with it.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct SignedBlock {
+pub(crate) struct SignedBlock {
     pub number: u64,
     pub hash: B256,
     pub message: Arc<Message>,
@@ -81,7 +81,18 @@ struct Signed {
 
 impl Signed {
     fn insert(&mut self, number: u64, hash: B256) {
-        self.hashes.insert(number, hash);
+        // Signed again with another hash, a block takes the chain above it
+        // along: those blocks were built on the replaced one.
+        if self
+            .hashes
+            .insert(number, hash)
+            .is_some_and(|replaced| replaced != hash)
+        {
+            self.hashes.split_off(&(number + 1));
+            for (_, block) in self.blocks.split_off(&(number + 1)) {
+                self.message_bytes -= block.message.l2.len();
+            }
+        }
         while self.hashes.len() > KEPT_BLOCKS {
             self.hashes.pop_first();
         }
@@ -108,7 +119,7 @@ impl SignedHashes {
     }
 
     /// Keep a signed block's hash, and its message among the newest.
-    pub fn keep(&self, block: SignedBlock) {
+    pub(crate) fn keep(&self, block: SignedBlock) {
         let mut signed = self.lock();
         signed.insert(block.number, block.hash);
         signed.message_bytes += block.message.l2.len();
@@ -127,7 +138,7 @@ impl SignedHashes {
 
     /// A receiver that changes each time a block is signed.
     #[must_use]
-    pub fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+    pub(crate) fn changes(&self) -> tokio::sync::watch::Receiver<()> {
         self.changes.subscribe()
     }
 
@@ -139,7 +150,7 @@ impl SignedHashes {
     /// The block signed at `number` with its message, while kept and still
     /// the one signed there.
     #[must_use]
-    pub fn block(&self, number: u64) -> Option<SignedBlock> {
+    pub(crate) fn block(&self, number: u64) -> Option<SignedBlock> {
         let signed = self.lock();
         signed
             .blocks
@@ -253,7 +264,10 @@ fn signature_hash(
 ///
 /// Returns an error for an undecodable frame or a message the signer did
 /// not sign.
-pub fn signed_blocks(config: &FeedConfig, frame: &str) -> Result<Vec<SignedBlock>, FeedError> {
+pub(crate) fn signed_blocks(
+    config: &FeedConfig,
+    frame: &str,
+) -> Result<Vec<SignedBlock>, FeedError> {
     let broadcast: Broadcast =
         serde_json::from_str(frame).map_err(|error| FeedError::Decode(error.to_string()))?;
     broadcast
@@ -458,6 +472,18 @@ mod tests {
         signed.insert(3, B256::repeat_byte(2));
         assert_eq!(signed.block(3), None);
         assert_eq!(signed.block(2), Some(block(2, 1, half)));
+    }
+
+    #[test]
+    fn a_block_signed_again_with_another_hash_drops_the_blocks_above_it() {
+        let signed = SignedHashes::default();
+        for number in 1..=3 {
+            signed.keep(block(number, 1, 8));
+        }
+        signed.keep(block(2, 2, 8));
+        assert_eq!(signed.newest(), Some((2, B256::repeat_byte(2))));
+        assert_eq!(signed.block(3), None);
+        assert_eq!(signed.get(1), Some(B256::repeat_byte(1)));
     }
 
     #[test]

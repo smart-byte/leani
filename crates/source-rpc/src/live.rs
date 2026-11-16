@@ -99,12 +99,13 @@ impl RpcLiveSource {
     /// the newest signed block, the lane asks a single endpoint for each
     /// block the feed signs: the one that served the last blocks.
     ///
-    /// A request for nothing but transactions' bodies, calldata, and senders
-    /// gets the blocks the sequencer built from signed transactions without
-    /// the endpoints: the lane makes them from the feed's messages. Blocks of
-    /// messages from L1 and of calls to `ArbRetryableTx` still come from the
-    /// endpoints, as does the header of one made block in a thousand, which
-    /// checks the transactions made.
+    /// A request that takes filtered material and needs nothing but
+    /// transactions' bodies, calldata, and senders gets the blocks the
+    /// sequencer built from signed transactions without the endpoints: the
+    /// lane makes them from the feed's messages, their transactions declared
+    /// complete. Blocks of messages from L1 and of calls to `ArbRetryableTx`
+    /// still come from the endpoints, as does the header of one made block
+    /// in a thousand, which checks the transactions made.
     #[must_use]
     pub fn with_signed_hashes(mut self, signed: SignedHashes) -> Self {
         self.descriptor.trust = TrustModel::ProtocolVerified;
@@ -163,7 +164,9 @@ impl LiveSource for RpcLiveSource {
         let state = LiveState {
             mode: FetchMode::for_capabilities(request.required),
             sequenced: self.signed.is_some()
+                && request.allow_filtered
                 && SEQUENCED.contains_all(request.required.with_derivable()),
+            made: false,
             unchecked: None,
             next_check: 0,
             signings: self.signed.as_ref().map(SignedHashes::changes),
@@ -189,9 +192,12 @@ struct LiveState {
     /// needs nothing they lack, and no check found a block `ArbOS` made
     /// otherwise.
     sequenced: bool,
-    /// A block made from the feed, its transactions root, and when an
-    /// endpoint may be asked for its header to check it.
-    unchecked: Option<(u64, B256, tokio::time::Instant)>,
+    /// Whether the lane made a block from the feed's messages: their feed,
+    /// unlike gossip that signs hashes only, keeps them.
+    made: bool,
+    /// A block made from the feed, its hash and transactions root, and when
+    /// an endpoint may be asked for its header to check it.
+    unchecked: Option<(u64, B256, B256, tokio::time::Instant)>,
     /// The lowest block the next check takes.
     next_check: u64,
     /// Changes each time the sequencer signs a block.
@@ -396,6 +402,7 @@ impl LiveState {
             parent = Some(frame.block);
             frames.push(frame);
         }
+        self.made |= !frames.is_empty();
         if self.unchecked.is_none()
             && let Some(frame) = frames
                 .iter()
@@ -404,6 +411,7 @@ impl LiveState {
             let number = frame.block.number.0;
             self.unchecked = Some((
                 number,
+                B256::from(frame.block.hash.0),
                 transactions_root(frame),
                 tokio::time::Instant::now(),
             ));
@@ -417,10 +425,19 @@ impl LiveState {
     /// transactions root there means `ArbOS` made blocks in a way the lane
     /// does not, and the lane fetches every block from then on.
     async fn check_sequenced(&mut self) {
-        let Some((number, root, due)) = self.unchecked else {
+        let Some((number, hash, root, due)) = self.unchecked else {
             return;
         };
         if self.next < number.saturating_add(BATCH_BLOCKS) || tokio::time::Instant::now() < due {
+            return;
+        }
+        // Signed again with another hash, the block made is no longer the
+        // chain's, and its header would not match.
+        if self
+            .trusted_hash(number)
+            .is_some_and(|signed| signed != hash)
+        {
+            self.unchecked = None;
             return;
         }
         let served = self
@@ -431,12 +448,14 @@ impl LiveState {
         let header = served
             .ok()
             .and_then(|(_, served)| decode_block(&served.first()?.0, &serde_json::Value::Null).ok())
-            .filter(|decoded| {
-                decoded.check.header == Check::Verified
-                    && self.trusted_hash(number) == Some(decoded.hash)
-            });
+            .filter(|decoded| decoded.check.header == Check::Verified && decoded.hash == hash);
         let Some(header) = header else {
-            self.unchecked = Some((number, root, tokio::time::Instant::now() + CHECK_RETRY));
+            self.unchecked = Some((
+                number,
+                hash,
+                root,
+                tokio::time::Instant::now() + CHECK_RETRY,
+            ));
             return;
         };
         self.unchecked = None;
@@ -512,10 +531,16 @@ impl LiveState {
                 let last = head.min(self.next.saturating_add(PART_BLOCKS - 1));
                 let made = self.sequenced_frames(last);
                 if made.is_empty() {
-                    // The blocks after one the endpoints serve may again be
-                    // made from the feed.
-                    let last = if self.sequenced { self.next } else { last };
-                    self.fetch_signed(last).await?
+                    // The blocks after one whose message does not make it may
+                    // again be made from the feed.
+                    let alone = self.sequenced
+                        && self
+                            .source
+                            .signed
+                            .as_ref()
+                            .is_some_and(|signed| signed.block(self.next).is_some());
+                    self.fetch_signed(if alone { self.next } else { last })
+                        .await?
                 } else {
                     made
                 }
@@ -631,7 +656,8 @@ async fn next_event(mut state: LiveState) -> Option<(Result<ChainEvent, SourceEr
         // A lane making blocks from the feed that reached the newest signed
         // block makes the next one as soon as it is signed; one waiting on
         // an endpoint keeps to the poll interval.
-        let on_signing = advanced.is_ok() && state.sequenced && state.next > state.head;
+        let on_signing =
+            advanced.is_ok() && state.sequenced && state.made && state.next > state.head;
         // What a round fetched goes out at once; only a round with nothing
         // new waits before the next, so a moving head is followed round
         // after round.

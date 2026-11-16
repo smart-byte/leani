@@ -8,8 +8,9 @@ use alloy_eips::eip2718::{Decodable2718 as _, Encodable2718 as _};
 use alloy_primitives::{Address, B256, Bytes, U256, address, keccak256};
 use leani_primitives::{
     BlockFrame, BlockNumber, BlockRange, BlockRef, Capability, CapabilitySet, ChainId, CheckStatus,
-    Finality, Material, MissingReason, ObjectIdentity, Provenance, SourceId, SourceKind,
-    TransactionEnvelope, TransactionHash, TrustModel, VerificationCheck, VerificationReport,
+    Completeness, FilterScope, Finality, Material, MissingReason, ObjectIdentity, Provenance,
+    SourceId, SourceKind, TransactionEnvelope, TransactionHash, TrustModel, VerificationCheck,
+    VerificationReport,
 };
 
 use crate::{
@@ -142,6 +143,10 @@ fn signed_transaction(index: u32, mut bytes: &[u8]) -> Option<TransactionEnvelop
 /// senders its message gives. `None` when the message does not give them
 /// all: it is not one the sequencer built from signed transactions, or one
 /// of them does not decode, recover its sender, or calls `ArbRetryableTx`.
+///
+/// The transactions are declared complete, not checked: a contract that
+/// calls `ArbRetryableTx` makes `ArbOS` add a retry transaction that no
+/// message shows.
 pub(crate) fn sequenced_frame(
     block: &SignedBlock,
     parent: &BlockRef,
@@ -178,7 +183,11 @@ pub(crate) fn sequenced_frame(
         },
         finality: Finality::Unattested,
         header: Material::Missing(MissingReason::NotAvailable),
-        transactions: Material::Complete(transactions),
+        transactions: Material::Filtered {
+            value: transactions,
+            scope: FilterScope::default(),
+            completeness: Completeness::DatasetDeclared,
+        },
         receipts: Material::Missing(MissingReason::NotAvailable),
         logs: Material::Missing(MissingReason::NotAvailable),
         withdrawals: Material::Missing(MissingReason::NotAvailable),
@@ -201,7 +210,8 @@ pub(crate) fn sequenced_frame(
         }],
         verification: VerificationReport {
             header_hash: not_in_feed("header"),
-            parent_continuity: VerificationCheck::VERIFIED,
+            // The parent is the block signed below it.
+            parent_continuity: not_in_feed("parent hash"),
             transactions_root: not_in_feed("transactions root"),
             ..VerificationReport::default()
         },
@@ -238,8 +248,9 @@ mod tests {
         SourceId::new("feed").unwrap()
     }
 
-    /// Arbitrum One blocks 524,760,444 to 524,760,446 as the feed signed
-    /// them and an endpoint served them, and the block before.
+    /// Arbitrum One blocks 524,760,445 to 524,760,447 as the feed signed
+    /// them and an endpoint served them, and the block before. The last is a
+    /// second later than its parent.
     fn fixture() -> (BlockRef, Vec<SignedBlock>, Vec<Value>) {
         let fixture: Value =
             serde_json::from_str(include_str!("fixtures/arbitrum-one-sequenced-blocks.json"))
@@ -274,9 +285,14 @@ mod tests {
             let decoded = decode_block(served, &Value::Null).unwrap();
             let served = frame(&decoded, CHAIN, &source(), Finality::Unattested, 0, None).unwrap();
             assert_eq!(made.block, served.block);
-            assert_eq!(made.transactions, served.transactions);
+            assert_eq!(
+                made.transactions.as_present(),
+                served.transactions.as_present()
+            );
             assert_eq!(transactions_root(&made), decoded.header.transactions_root);
-            assert!(made.capabilities().satisfies(SEQUENCED, false));
+            // Declared, so only for requests that take filtered material.
+            assert!(made.capabilities().satisfies(SEQUENCED, true));
+            assert!(!made.capabilities().satisfies(SEQUENCED, false));
             assert_eq!(made.group_violation(SEQUENCED), None);
             parent = made.block;
         }
@@ -316,7 +332,7 @@ mod tests {
             made(&empty)
                 .unwrap()
                 .transactions
-                .as_complete()
+                .as_present()
                 .map(Vec::len),
             Some(1),
             "a block holds ArbOS's start transaction"
