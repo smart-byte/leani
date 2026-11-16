@@ -113,7 +113,13 @@ record, and documented RPC contracts.
   poster, checks the blocks the JSON-RPC lanes fetch: a block that differs is
   refused and one that matches attests the chain below it, so the endpoints
   are trusted only to serve. Finality comes from the L1 anchor. A feed
-  connection silent for 30 seconds is reopened.
+  connection silent for 30 seconds is reopened. When the processors need
+  nothing but transactions' bodies, calldata, and senders, such as
+  `transaction-stats`, the live lane makes the blocks the sequencer built
+  from signed transactions out of the feed's messages, without JSON-RPC.
+  Blocks of messages from L1 and those calling `ArbRetryableTx` still come
+  from an endpoint, and so does one header in a thousand, which checks the
+  transactions made.
 - Op-stack history over P2P: a fresh store catches up from the lowest
   `start_block` of the processors with automatic history, bounded by
   `sources.live.history_fallback_blocks`, along the chain of the first signed

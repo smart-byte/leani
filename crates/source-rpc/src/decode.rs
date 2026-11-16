@@ -100,7 +100,7 @@ fn parsed<T: std::str::FromStr>(value: &Value, field: &str) -> Result<T, RpcErro
         .ok_or_else(|| RpcError::Malformed(format!("{field} is malformed")))
 }
 
-fn typed_rlp(ty: u8, fields: &[&dyn Encodable]) -> Vec<u8> {
+pub(crate) fn typed_rlp(ty: u8, fields: &[&dyn Encodable]) -> Vec<u8> {
     let payload_length = fields.iter().map(|field| Encodable::length(*field)).sum();
     let mut out = vec![ty];
     alloy_rlp::Header {
@@ -451,15 +451,15 @@ fn receipt_bytes(
     Ok(typed_rlp(0x7e, &fields))
 }
 
-fn block_hash(value: B256) -> BlockHash {
+pub(crate) fn block_hash(value: B256) -> BlockHash {
     BlockHash::new(value.0)
 }
 
-fn address(value: Address) -> leani_primitives::Address {
+pub(crate) fn address(value: Address) -> leani_primitives::Address {
     leani_primitives::Address::new(value.0.0)
 }
 
-fn amount(value: U256) -> Quantity {
+pub(crate) fn amount(value: U256) -> Quantity {
     Quantity::new(value.to_be_bytes())
 }
 

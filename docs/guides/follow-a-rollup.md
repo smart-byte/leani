@@ -29,7 +29,7 @@ The chain's family picks the sources. Nothing needs an API key.
 | Family | Live blocks | History |
 |---|---|---|
 | OP Stack: OP Mainnet, Base, Unichain, and others | Execution P2P, checked against the sequencer's signed block gossip, and the entry's public JSON-RPC endpoints while no execution peer serves them | Through the live lane |
-| Arbitrum Nitro: Arbitrum One, Robinhood Chain, Arbitrum Nova | The entry's public JSON-RPC endpoints, checked against the sequencer's signed feed | The sources the chain entry names |
+| Arbitrum Nitro: Arbitrum One, Robinhood Chain, Arbitrum Nova | The entry's public JSON-RPC endpoints, checked against the sequencer's signed feed; processors that need only transactions get them from the feed itself | The sources the chain entry names |
 
 An op-stack node gossips on port 9222. Make that port reachable so that peers
 can dial in.
