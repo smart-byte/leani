@@ -8,6 +8,12 @@ text{fill:#e6f0ea}.d{fill:#8fa89a}.f{fill:#536b5e}.a{fill:#3ee07f}.h{fill:#edcb8
 .rule{stroke:#2b3c33;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
 .open{fill:none;stroke:#536b5e;stroke-dasharray:4 3}.opena{fill:none;stroke:#3ee07f;stroke-dasharray:4 3}
 .mk{fill:#536b5e}.mka{fill:#3ee07f}.mkh{fill:#edcb89}.hatch{stroke:#5c4a2a;stroke-width:3}
+.eth{color:#627eea}.base{color:#3a74ff}.arb{color:#28a0f0}.chain{fill:currentColor}.row{fill:#2b3c33}
+.rail{fill:none;stroke:currentColor;stroke-width:16;stroke-linecap:round;stroke-linejoin:round}
+.stream{fill:none;stroke:#3ee07f;stroke-width:7;stroke-linecap:round;stroke-linejoin:round}
+.station{fill:#0e1411;stroke:#e6f0ea;stroke-width:6}.ring{fill:none;stroke:#e6f0ea;stroke-width:3;opacity:.3}
+.proc{fill:#3ee07f;stroke:#0e1411;stroke-width:6}.app{fill:#0e1411;stroke:#e6f0ea;stroke-width:4}
+.wm{fill:none;stroke:#e6f0ea;stroke-width:10}.wmi{fill:#e6f0ea}
 </style>
   <title id="title">Cold and hot lanes overlap before handoff</title>
   <desc id="desc">The cold lane covers blocks up to E and the hot lane starts at C. Blocks C, D, and E are in both lanes; the overlap is at least the reorg window, and their hashes must match. The verified handoff follows E, after which the hot lane continues with F, G, and H.</desc>

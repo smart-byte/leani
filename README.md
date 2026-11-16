@@ -92,16 +92,18 @@ for await (const change of leani.blocks.subscribe()) {
 ## How it works
 
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="site/public/diagrams/how-it-works-dark.svg">
-  <img src="site/public/diagrams/how-it-works-light.svg" alt="A history lane reads public datasets through block N and a live lane follows Ethereum P2P from block N+1; they join where the live block's parent equals hash(N). Blocks are normalized, validated, mapped in parallel, and reduced in canonical order. Raw chunks are dropped after mapping; only processor stores and the change stream stay on disk and serve JSON-RPC, HTTP and SSE, and your database.">
+  <source media="(prefers-color-scheme: dark)" srcset="site/public/diagrams/overview-dark.svg">
+  <img src="site/public/diagrams/overview-light.svg" alt="How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or a sequencer feed, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.">
 </picture>
 
-History comes from public Xatu and EraE datasets, verified against block
-commitments. The live lane follows execution peers and verifies finality from
-light-client updates. Both lanes join once, at a hash-verified boundary, and
-disk holds only your processors' results, their state, and a short reorg
-window. Read [how Leani works](https://leani.dev/docs/concepts/how-leani-works/)
-and the [architecture notes](docs/contributing/architecture.md).
+On Ethereum, history comes from public Xatu and EraE datasets, verified
+against block commitments. The live lane follows execution peers and verifies
+finality from light-client updates. Both lanes join once, at a hash-verified
+boundary, and disk holds only your processors' results, their state, and a
+short reorg window. Rollups get live blocks from their sequencer; see
+[follow a rollup](https://leani.dev/docs/guides/follow-a-rollup/). Read
+[how Leani works](https://leani.dev/docs/concepts/how-leani-works/) and the
+[architecture notes](docs/contributing/architecture.md).
 
 ## Documentation
 

@@ -8,15 +8,18 @@ const siteRoot = resolve(import.meta.dir, '..');
 const sourceDir = resolve(siteRoot, 'src/assets/diagrams');
 const publicDir = resolve(siteRoot, 'public/diagrams');
 
-// Starlight's docs palette (src/styles/docs.css) plus DeliverySequence's amber.
+// Starlight's docs palette (src/styles/docs.css), DeliverySequence's amber, and
+// the chains' brand colors for the overview's lines.
 const palettes = {
   light: {
     ink: '#101713', dim: '#536b5e', faint: '#8ca396', edge: '#cbd8d0', panel: '#f1f6f3',
     accent: '#08763c', accentLow: '#d8f8e5', amber: '#8a5a00', amberEdge: '#dcbd7a', amberLow: '#fcf5e5',
+    eth: '#4f63d2', base: '#0052ff', arb: '#1b80c4',
   },
   dark: {
     ink: '#e6f0ea', dim: '#8fa89a', faint: '#536b5e', edge: '#2b3c33', panel: '#0e1411',
     accent: '#3ee07f', accentLow: '#123b26', amber: '#edcb89', amberEdge: '#5c4a2a', amberLow: '#16140e',
+    eth: '#627eea', base: '#3a74ff', arb: '#28a0f0',
   },
 };
 
@@ -29,6 +32,12 @@ text{fill:${p.ink}}.d{fill:${p.dim}}.f{fill:${p.faint}}.a{fill:${p.accent}}.h{fi
 .rule{stroke:${p.edge};stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
 .open{fill:none;stroke:${p.faint};stroke-dasharray:4 3}.opena{fill:none;stroke:${p.accent};stroke-dasharray:4 3}
 .mk{fill:${p.faint}}.mka{fill:${p.accent}}.mkh{fill:${p.amber}}.hatch{stroke:${p.amberEdge};stroke-width:3}
+.eth{color:${p.eth}}.base{color:${p.base}}.arb{color:${p.arb}}.chain{fill:currentColor}.row{fill:${p.edge}}
+.rail{fill:none;stroke:currentColor;stroke-width:16;stroke-linecap:round;stroke-linejoin:round}
+.stream{fill:none;stroke:${p.accent};stroke-width:7;stroke-linecap:round;stroke-linejoin:round}
+.station{fill:${p.panel};stroke:${p.ink};stroke-width:6}.ring{fill:none;stroke:${p.ink};stroke-width:3;opacity:.3}
+.proc{fill:${p.accent};stroke:${p.panel};stroke-width:6}.app{fill:${p.panel};stroke:${p.ink};stroke-width:4}
+.wm{fill:none;stroke:${p.ink};stroke-width:10}.wmi{fill:${p.ink}}
 </style>`;
 
 const check = process.argv.includes('--check');

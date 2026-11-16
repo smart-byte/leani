@@ -1,0 +1,86 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" role="img" aria-labelledby="title desc">
+<style>
+svg{font-family:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px}
+text{fill:#101713}.d{fill:#536b5e}.f{fill:#8ca396}.a{fill:#08763c}.h{fill:#8a5a00}
+.k{font-size:10px;letter-spacing:.08em}.s{font-size:11px}.b{font-weight:700}
+.box{fill:#f1f6f3;stroke:#cbd8d0}.boxa{fill:#d8f8e5;stroke:#08763c}.boxh{fill:#fcf5e5;stroke:#dcbd7a}
+.ln{fill:none;stroke:#8ca396;stroke-width:1.25}.lna{fill:none;stroke:#08763c;stroke-width:1.5}.lnh{fill:none;stroke:#8a5a00;stroke-width:1.5}
+.rule{stroke:#cbd8d0;stroke-dasharray:2 4}.dash{stroke-dasharray:4 4}
+.open{fill:none;stroke:#8ca396;stroke-dasharray:4 3}.opena{fill:none;stroke:#08763c;stroke-dasharray:4 3}
+.mk{fill:#8ca396}.mka{fill:#08763c}.mkh{fill:#8a5a00}.hatch{stroke:#dcbd7a;stroke-width:3}
+.eth{color:#4f63d2}.base{color:#0052ff}.arb{color:#1b80c4}.chain{fill:currentColor}.row{fill:#cbd8d0}
+.rail{fill:none;stroke:currentColor;stroke-width:16;stroke-linecap:round;stroke-linejoin:round}
+.stream{fill:none;stroke:#08763c;stroke-width:7;stroke-linecap:round;stroke-linejoin:round}
+.station{fill:#f1f6f3;stroke:#101713;stroke-width:6}.ring{fill:none;stroke:#101713;stroke-width:3;opacity:.3}
+.proc{fill:#08763c;stroke:#f1f6f3;stroke-width:6}.app{fill:#f1f6f3;stroke:#101713;stroke-width:4}
+.wm{fill:none;stroke:#101713;stroke-width:10}.wmi{fill:#101713}
+</style>
+  <title id="title">How Leani works</title>
+  <desc id="desc">How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or a sequencer feed, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.</desc>
+
+  <text class="b" x="110" y="148" font-size="52">history</text>
+  <text class="f" x="389" y="148" font-size="52" text-anchor="middle">+</text>
+  <text class="b" x="450" y="148" font-size="52">live</text>
+  <text class="f" x="672" y="148" font-size="52" text-anchor="middle">→</text>
+  <!-- wordmark: site/public/leani-wordmark-on-dark.svg -->
+  <g transform="translate(770 102) scale(0.6216)">
+    <path class="wm" d="M5 0V74M24 50H64.4A20.2 20.2 0 1 0 59.67 62.98M120.8 50A20.2 20.2 0 1 0 80.4 50A20.2 20.2 0 1 0 120.8 50M120.8 26V74M141.8 74V26M141.8 74V48.8A19 19 0 0 1 179.8 48.8V74"/>
+    <path class="wmi" d="M195.8 74L205.8 74L216 26L206 26Z"/>
+    <rect class="a" x="207.37" y="6" width="13" height="13" rx="1.2"/>
+  </g>
+  <text class="f" x="1048" y="148" font-size="52" text-anchor="middle">→</text>
+  <text class="b" x="1190" y="148" font-size="52">your app</text>
+  <text class="d" x="110" y="190" font-size="21">public datasets, P2P</text>
+  <text class="d" x="450" y="190" font-size="21">P2P, sequencer feeds</text>
+  <text class="d" x="770" y="190" font-size="21">your processors</text>
+  <text class="d" x="1190" y="190" font-size="21">data streams</text>
+
+  <rect class="box" x="770" y="242" width="280" height="430" rx="28" stroke-width="2"/>
+  <g class="eth">
+    <text class="chain b" x="110" y="278" font-size="34">Ethereum</text>
+    <path class="rail" d="M464 370H590L650 310"/>
+    <path class="rail" d="M124 310H910"/>
+  </g>
+  <g class="base">
+    <text class="chain b" x="110" y="428" font-size="34">Base</text>
+    <path class="rail" d="M464 520H590L650 460"/>
+    <path class="rail" d="M124 460H910"/>
+  </g>
+  <g class="arb">
+    <text class="chain b" x="110" y="578" font-size="34">Arbitrum</text>
+    <path class="rail" d="M464 670H590L650 610"/>
+    <path class="rail" d="M124 610H910"/>
+  </g>
+  <path class="stream" d="M910 310H1060L1180 430H1216"/>
+  <path class="stream" d="M910 460H1216"/>
+  <path class="stream" d="M910 610H1060L1180 490H1216"/>
+  <circle class="station" cx="124" cy="310" r="14"/>
+  <circle class="ring" cx="464" cy="370" r="27"/>
+  <circle class="station" cx="464" cy="370" r="14"/>
+  <rect class="proc" x="888" y="288" width="44" height="44" rx="7"/>
+  <circle class="station" cx="124" cy="460" r="14"/>
+  <circle class="ring" cx="464" cy="520" r="27"/>
+  <circle class="station" cx="464" cy="520" r="14"/>
+  <rect class="proc" x="888" y="438" width="44" height="44" rx="7"/>
+  <circle class="station" cx="124" cy="610" r="14"/>
+  <circle class="ring" cx="464" cy="670" r="27"/>
+  <circle class="station" cx="464" cy="670" r="14"/>
+  <rect class="proc" x="888" y="588" width="44" height="44" rx="7"/>
+
+  <rect class="app" x="1190" y="360" width="250" height="200" rx="16"/>
+  <rect class="row" x="1192" y="399" width="246" height="2"/>
+  <circle class="mk" cx="1214" cy="380" r="5"/>
+  <circle class="mk" cx="1234" cy="380" r="5"/>
+  <circle class="mk" cx="1254" cy="380" r="5"/>
+  <rect class="a" x="1216" y="423" width="56" height="14" rx="7"/>
+  <rect class="a" x="1216" y="453" width="56" height="14" rx="7"/>
+  <rect class="a" x="1216" y="483" width="56" height="14" rx="7"/>
+  <rect class="row" x="1286" y="423" width="118" height="14" rx="7"/>
+  <rect class="row" x="1286" y="453" width="86" height="14" rx="7"/>
+  <rect class="row" x="1286" y="483" width="128" height="14" rx="7"/>
+  <rect class="row" x="1286" y="513" width="100" height="14" rx="7"/>
+
+  <text class="d b" x="110" y="752" font-size="26">+ 9 more chains</text>
+  <text class="d" x="110" y="788" font-size="18">OP Mainnet · Unichain · World Chain · Zora · Ink · Mode · Soneium · Arbitrum Nova · Robinhood Chain</text>
+  <text class="d" x="1190" y="602" font-size="18">HTTP · SSE · JSON-RPC · SDK</text>
+</svg>
