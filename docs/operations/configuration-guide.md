@@ -98,12 +98,12 @@ Use the advanced schema below when any expanded field needs an override.
 `ethereum-hoodi`, `base`, `op`, `arbitrum-one`, or `robinhood`, and
 `leani init blocks --network base` writes one. The chain's family picks the
 lanes. An Ethereum testnet follows its own beacon chain from the checkpoint in
-`[finality]`. An op-stack chain follows the sequencer's signed block gossip
-over execution P2P, on gossip port 9222 so that peers can dial in, and over
-the entry's public JSON-RPC endpoints while no execution peer serves it; its
-history comes through the live lane. A Nitro chain follows its sequencer feed
-over the entry's public JSON-RPC endpoints, with history from the sources the
-entry names: SonarX and then the endpoints for Arbitrum One, the endpoints
+`[finality]`. An op-stack chain takes its blocks from execution P2P, checked
+against the sequencer's signed block gossip on gossip port 9222 so that peers
+can dial in, and from the entry's public JSON-RPC endpoints while no execution
+peer serves them; its history comes through the live lane. A Nitro chain takes
+its blocks from the entry's public JSON-RPC endpoints, checked against its
+sequencer's signed feed, with history from the sources the entry names: SonarX and then the endpoints for Arbitrum One, the endpoints
 for the others. On a rollup, `[finality]` holds the Ethereum Mainnet
 checkpoint its L1 anchor reads. Base Sepolia takes none: it settles on
 Ethereum Sepolia. Uniswap markets are Ethereum Mainnet's.
