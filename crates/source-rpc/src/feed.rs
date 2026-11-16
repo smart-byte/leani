@@ -18,6 +18,9 @@ use crate::websocket::Socket;
 
 /// Signed blocks kept for the live lane to check its blocks against.
 const KEPT_BLOCKS: usize = 16_384;
+/// Message bytes kept for the live lane to make blocks from: minutes of
+/// Arbitrum One's.
+const KEPT_MESSAGE_BYTES: usize = 8 << 20;
 /// The longest pause between reconnects.
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 /// Silence after which a feed connection counts as dead: feeds send blocks
@@ -48,33 +51,89 @@ pub struct FeedConfig {
     pub first_block: u64,
 }
 
-/// Recent block hashes the sequencer signed, by number.
+/// The fields of a signed message that its block's transactions come from.
+#[derive(Debug, Eq, PartialEq)]
+pub struct Message {
+    pub kind: u8,
+    pub sender: Address,
+    pub l1_block: u64,
+    pub timestamp: u64,
+    pub l1_base_fee: u128,
+    pub l2: Vec<u8>,
+}
+
+/// A block the sequencer signed, and the message it signed with it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SignedBlock {
+    pub number: u64,
+    pub hash: B256,
+    pub message: Arc<Message>,
+}
+
+#[derive(Debug, Default)]
+struct Signed {
+    hashes: BTreeMap<u64, B256>,
+    /// The newest signed blocks with their messages, within
+    /// [`KEPT_MESSAGE_BYTES`].
+    blocks: BTreeMap<u64, SignedBlock>,
+    message_bytes: usize,
+}
+
+/// Recent block hashes the sequencer signed, by number, and the newest
+/// blocks' messages.
 #[derive(Clone, Debug, Default)]
-pub struct SignedHashes(Arc<Mutex<BTreeMap<u64, B256>>>);
+pub struct SignedHashes(Arc<Mutex<Signed>>);
 
 impl SignedHashes {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Signed> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub fn insert(&self, number: u64, hash: B256) {
-        let mut hashes = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        hashes.insert(number, hash);
-        while hashes.len() > KEPT_BLOCKS {
-            hashes.pop_first();
+        let mut signed = self.lock();
+        signed.hashes.insert(number, hash);
+        while signed.hashes.len() > KEPT_BLOCKS {
+            signed.hashes.pop_first();
+        }
+    }
+
+    /// Keep a signed block's hash, and its message among the newest.
+    pub fn keep(&self, block: SignedBlock) {
+        self.insert(block.number, block.hash);
+        let mut signed = self.lock();
+        signed.message_bytes += block.message.l2.len();
+        if let Some(replaced) = signed.blocks.insert(block.number, block) {
+            signed.message_bytes -= replaced.message.l2.len();
+        }
+        while signed.message_bytes > KEPT_MESSAGE_BYTES || signed.blocks.len() > KEPT_BLOCKS {
+            let Some((_, oldest)) = signed.blocks.pop_first() else {
+                break;
+            };
+            signed.message_bytes -= oldest.message.l2.len();
         }
     }
 
     #[must_use]
     pub fn get(&self, number: u64) -> Option<B256> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.lock().hashes.get(&number).copied()
+    }
+
+    /// The block signed at `number` with its message, while kept and still
+    /// the one signed there.
+    #[must_use]
+    pub fn block(&self, number: u64) -> Option<SignedBlock> {
+        let signed = self.lock();
+        signed
+            .blocks
             .get(&number)
-            .copied()
+            .filter(|block| signed.hashes.get(&number) == Some(&block.hash))
+            .cloned()
     }
 
     #[must_use]
     pub fn newest(&self) -> Option<(u64, B256)> {
-        self.0
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
+        self.lock()
+            .hashes
             .last_key_value()
             .map(|(number, hash)| (*number, *hash))
     }
@@ -131,9 +190,14 @@ fn base64(field: &str, sequence: u64) -> Result<Vec<u8>, FeedError> {
 }
 
 /// Nitro's `SignatureHash`: a fixed prefix, then every signed field in
-/// order. The L1 base fee is a big integer's minimal big-endian bytes, none
-/// for zero.
-fn signature_hash(chain_id: u64, message: &FeedMessage, hash: B256) -> Result<B256, FeedError> {
+/// order, `l2` last. The L1 base fee is a big integer's minimal big-endian
+/// bytes, none for zero.
+fn signature_hash(
+    chain_id: u64,
+    message: &FeedMessage,
+    hash: B256,
+    l2: &[u8],
+) -> Result<B256, FeedError> {
     let sequence = message.sequence_number;
     let incoming = &message.message.message;
     let header = &incoming.header;
@@ -160,18 +224,18 @@ fn signature_hash(chain_id: u64, message: &FeedMessage, hash: B256) -> Result<B2
             .unwrap_or(bytes.len());
         data.extend(&bytes[first..]);
     }
-    data.extend(base64(&incoming.l2_msg, sequence)?);
+    data.extend(l2);
     Ok(keccak256(data))
 }
 
 /// The blocks one feed frame names, each checked against the configured
-/// signer: its number and hash.
+/// signer.
 ///
 /// # Errors
 ///
 /// Returns an error for an undecodable frame or a message the signer did
 /// not sign.
-pub fn signed_blocks(config: &FeedConfig, frame: &str) -> Result<Vec<(u64, B256)>, FeedError> {
+pub fn signed_blocks(config: &FeedConfig, frame: &str) -> Result<Vec<SignedBlock>, FeedError> {
     let broadcast: Broadcast =
         serde_json::from_str(frame).map_err(|error| FeedError::Decode(error.to_string()))?;
     broadcast
@@ -186,8 +250,10 @@ pub fn signed_blocks(config: &FeedConfig, frame: &str) -> Result<Vec<(u64, B256)
                 FeedError::Decode(format!("message {sequence}: {error}"))
             };
             let signature = Signature::from_raw(&base64(signature, sequence)?).map_err(invalid)?;
+            let incoming = &message.message.message;
+            let l2 = base64(&incoming.l2_msg, sequence)?;
             let recovered = signature
-                .recover_address_from_prehash(&signature_hash(config.chain_id, message, hash)?)
+                .recover_address_from_prehash(&signature_hash(config.chain_id, message, hash, &l2)?)
                 .map_err(invalid)?;
             if recovered != config.signer {
                 return Err(FeedError::WrongSigner {
@@ -196,7 +262,19 @@ pub fn signed_blocks(config: &FeedConfig, frame: &str) -> Result<Vec<(u64, B256)
                     recovered,
                 });
             }
-            Ok((config.first_block + sequence, hash))
+            let header = &incoming.header;
+            Ok(SignedBlock {
+                number: config.first_block + sequence,
+                hash,
+                message: Arc::new(Message {
+                    kind: header.kind,
+                    sender: header.sender,
+                    l1_block: header.block_number,
+                    timestamp: header.timestamp,
+                    l1_base_fee: header.base_fee_l1.unwrap_or(0),
+                    l2,
+                }),
+            })
         })
         .collect()
 }
@@ -269,11 +347,12 @@ async fn read_feed(
                 continue;
             }
         };
-        for (number, hash) in blocks {
+        for block in blocks {
+            let number = block.number;
             if last.is_none() {
                 info!(block = number, "first block from the sequencer feed");
             }
-            hashes.insert(number, hash);
+            hashes.keep(block);
             last = Some(number);
         }
     }
@@ -302,8 +381,12 @@ mod tests {
             address!("C1b634853Cb333D3aD8663715b08f41A3Aec47cc"),
             22_207_817,
         );
+        let blocks = signed_blocks(&one, include_str!("fixtures/arbitrum-one-feed.json")).unwrap();
         assert_eq!(
-            signed_blocks(&one, include_str!("fixtures/arbitrum-one-feed.json")).unwrap(),
+            blocks
+                .iter()
+                .map(|block| (block.number, block.hash))
+                .collect::<Vec<_>>(),
             [(
                 518_420_127,
                 b256!("449bbfefffd3e4faf80453a57942a396017895a38cde573568eb5bb68a25cf4f")
@@ -318,13 +401,45 @@ mod tests {
         let blocks =
             signed_blocks(&nova, include_str!("fixtures/arbitrum-nova-feed.json")).unwrap();
         assert_eq!(
-            blocks.iter().map(|(number, _)| *number).collect::<Vec<_>>(),
+            blocks.iter().map(|block| block.number).collect::<Vec<_>>(),
             [85_287_622, 85_287_623, 85_287_624, 85_287_625]
         );
         assert_eq!(
-            blocks[0].1,
+            blocks[0].hash,
             b256!("2f238566cc443870084d97f9315bfe6bf35ebbedd8940353a2f4275b298d9097")
         );
+    }
+
+    fn block(number: u64, hash: u8, l2_bytes: usize) -> SignedBlock {
+        SignedBlock {
+            number,
+            hash: B256::repeat_byte(hash),
+            message: Arc::new(Message {
+                kind: 3,
+                sender: Address::ZERO,
+                l1_block: 0,
+                timestamp: 0,
+                l1_base_fee: 0,
+                l2: vec![0; l2_bytes],
+            }),
+        }
+    }
+
+    #[test]
+    fn messages_are_kept_for_the_newest_blocks_within_their_byte_budget() {
+        let signed = SignedHashes::default();
+        let half = KEPT_MESSAGE_BYTES / 2;
+        for number in 1..=3 {
+            signed.keep(block(number, 1, half));
+        }
+        // The oldest message gave way; its hash is still kept.
+        assert_eq!(signed.block(1), None);
+        assert_eq!(signed.get(1), Some(B256::repeat_byte(1)));
+        assert_eq!(signed.block(3), Some(block(3, 1, half)));
+        // Signed again with another hash, a block drops the old message.
+        signed.insert(3, B256::repeat_byte(2));
+        assert_eq!(signed.block(3), None);
+        assert_eq!(signed.block(2), Some(block(2, 1, half)));
     }
 
     #[test]

@@ -19,10 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    FetchMode, PART_BLOCKS, RpcQuorum,
+    Check, FetchMode, PART_BLOCKS, RpcQuorum, decode_block,
     feed::SignedHashes,
     frame,
     history::{Label, capabilities, decode_chain, fetch_range},
+    nitro::{SEQUENCED, sequenced_frame, transactions_root},
     unix_now_ms,
 };
 
@@ -34,6 +35,11 @@ const BATCH_BLOCKS: u64 = 32;
 const CATCH_UP_BLOCKS: u64 = 256;
 /// How often the endpoints' `safe` block is read for promotions.
 const SAFE_POLL: Duration = Duration::from_secs(2);
+/// One in this many blocks made from the feed is checked against the
+/// transactions root an endpoint's header names.
+const CHECK_EVERY: u64 = 1_000;
+/// How long a check waits once an endpoint did not serve the header.
+const CHECK_RETRY: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Debug)]
 pub struct RpcLiveSource {
@@ -92,6 +98,13 @@ impl RpcLiveSource {
     /// links to, so the endpoints are trusted for nothing but serving. Near
     /// the newest signed block, the lane asks a single endpoint for each
     /// block the feed signs: the one that served the last blocks.
+    ///
+    /// A request for nothing but transactions' bodies, calldata, and senders
+    /// gets the blocks the sequencer built from signed transactions without
+    /// the endpoints: the lane makes them from the feed's messages. Blocks of
+    /// messages from L1 and of calls to `ArbRetryableTx` still come from the
+    /// endpoints, as does the header of one made block in a thousand, which
+    /// checks the transactions made.
     #[must_use]
     pub fn with_signed_hashes(mut self, signed: SignedHashes) -> Self {
         self.descriptor.trust = TrustModel::ProtocolVerified;
@@ -149,6 +162,10 @@ impl LiveSource for RpcLiveSource {
         };
         let state = LiveState {
             mode: FetchMode::for_capabilities(request.required),
+            sequenced: self.signed.is_some()
+                && SEQUENCED.contains_all(request.required.with_derivable()),
+            unchecked: None,
+            next_check: 0,
             source: self.clone(),
             recent,
             next,
@@ -167,6 +184,15 @@ impl LiveSource for RpcLiveSource {
 
 struct LiveState {
     mode: FetchMode,
+    /// Whether the lane makes blocks from the feed's messages: the request
+    /// needs nothing they lack, and no check found a block `ArbOS` made
+    /// otherwise.
+    sequenced: bool,
+    /// A block made from the feed, its transactions root, and when an
+    /// endpoint may be asked for its header to check it.
+    unchecked: Option<(u64, B256, tokio::time::Instant)>,
+    /// The lowest block the next check takes.
+    next_check: u64,
     source: RpcLiveSource,
     recent: VecDeque<BlockRef>,
     next: u64,
@@ -333,6 +359,93 @@ impl LiveState {
         Ok(frames)
     }
 
+    /// The blocks from `next` through `last` made from the sequencer's
+    /// messages, up to the first whose transactions need the endpoints, each
+    /// on the block the sequencer signed below it.
+    fn sequenced_frames(&mut self, last: u64) -> Vec<BlockFrame> {
+        let Some(signed) = self.source.signed.as_ref().filter(|_| self.sequenced) else {
+            return Vec::new();
+        };
+        let descriptor = &self.source.descriptor;
+        let observed = unix_now_ms();
+        let mut parent = self.recent.back().copied();
+        let mut frames = Vec::new();
+        for number in self.next..=last {
+            let Some(frame) = parent
+                .filter(|parent| {
+                    signed
+                        .get(parent.number.0)
+                        .is_some_and(|hash| hash.0 == parent.hash.0)
+                })
+                .zip(signed.block(number))
+                .and_then(|(parent, block)| {
+                    sequenced_frame(
+                        &block,
+                        &parent,
+                        descriptor.chain_id,
+                        &descriptor.id,
+                        observed,
+                    )
+                })
+            else {
+                break;
+            };
+            parent = Some(frame.block);
+            frames.push(frame);
+        }
+        if self.unchecked.is_none()
+            && let Some(frame) = frames
+                .iter()
+                .find(|frame| frame.block.number.0 >= self.next_check)
+        {
+            let number = frame.block.number.0;
+            self.unchecked = Some((
+                number,
+                transactions_root(frame),
+                tokio::time::Instant::now(),
+            ));
+            self.next_check = number.saturating_add(CHECK_EVERY);
+        }
+        frames
+    }
+
+    /// Check the block taken for a check against the header an endpoint
+    /// serves for it, once the endpoints likely serve it. Another
+    /// transactions root there means `ArbOS` made blocks in a way the lane
+    /// does not, and the lane fetches every block from then on.
+    async fn check_sequenced(&mut self) {
+        let Some((number, root, due)) = self.unchecked else {
+            return;
+        };
+        if self.next < number.saturating_add(BATCH_BLOCKS) || tokio::time::Instant::now() < due {
+            return;
+        }
+        let served = self
+            .source
+            .quorum
+            .served_blocks(self.preferred, number, number, FetchMode::Header)
+            .await;
+        let header = served
+            .ok()
+            .and_then(|(_, served)| decode_block(&served.first()?.0, &serde_json::Value::Null).ok())
+            .filter(|decoded| {
+                decoded.check.header == Check::Verified
+                    && self.trusted_hash(number) == Some(decoded.hash)
+            });
+        let Some(header) = header else {
+            self.unchecked = Some((number, root, tokio::time::Instant::now() + CHECK_RETRY));
+            return;
+        };
+        self.unchecked = None;
+        if header.header.transactions_root != root {
+            warn!(
+                block = number,
+                "a block made from the sequencer feed holds other transactions than its header names; fetching every block from the endpoints"
+            );
+            self.sequenced = false;
+        }
+    }
+
     /// The hash the sequencer signed at `number`, or that a proof down from a
     /// signed block found there.
     fn trusted_hash(&self, number: u64) -> Option<B256> {
@@ -392,8 +505,17 @@ impl LiveState {
         let head = self.head;
         if self.next <= head {
             let frames = if self.source.signed.is_some() && head - self.next < BATCH_BLOCKS {
-                self.fetch_signed(head.min(self.next.saturating_add(PART_BLOCKS - 1)))
-                    .await?
+                self.check_sequenced().await;
+                let last = head.min(self.next.saturating_add(PART_BLOCKS - 1));
+                let made = self.sequenced_frames(last);
+                if made.is_empty() {
+                    // The blocks after one the endpoints serve may again be
+                    // made from the feed.
+                    let last = if self.sequenced { self.next } else { last };
+                    self.fetch_signed(last).await?
+                } else {
+                    made
+                }
             } else {
                 let batch = if head - self.next >= BATCH_BLOCKS {
                     CATCH_UP_BLOCKS

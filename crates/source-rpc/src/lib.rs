@@ -164,6 +164,7 @@ pub mod feed;
 mod finality;
 mod history;
 mod live;
+mod nitro;
 mod websocket;
 
 pub use decode::{BlockCheck, Check, DecodedBlock, decode_block, frame};
@@ -1444,6 +1445,10 @@ mod tests {
                     };
                     let result = if body["method"] == "eth_chainId" {
                         Value::from("0x1")
+                    } else if body["method"] == "eth_getBlockReceipts" {
+                        by_number
+                            .get(&number)
+                            .map_or(Value::Null, |_| serde_json::json!([]))
                     } else {
                         by_hash
                             .get(tag)
@@ -1736,6 +1741,16 @@ mod tests {
         signed: &crate::feed::SignedHashes,
         hashes: &[B256],
     ) -> leani_source_api::ChainEventStream {
+        signed_lane_for(live_request(), pool, signed, hashes).await
+    }
+
+    /// A [`signed_lane`] for `request`.
+    async fn signed_lane_for(
+        request: leani_source_api::DataRequest,
+        pool: RpcQuorum,
+        signed: &crate::feed::SignedHashes,
+        hashes: &[B256],
+    ) -> leani_source_api::ChainEventStream {
         use leani_source_api::LiveSource as _;
 
         let start = leani_source_api::LiveStart::Block(leani_primitives::BlockRef {
@@ -1753,7 +1768,7 @@ mod tests {
         .unwrap()
         .with_signed_hashes(signed.clone())
         .subscribe(
-            live_request(),
+            request,
             start,
             live_budget(),
             tokio_util::sync::CancellationToken::new(),
@@ -1872,6 +1887,54 @@ mod tests {
                 .unwrap(),
             9
         );
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_a_lane_for_transactions_makes_the_sequencers_blocks_from_its_messages()
+    {
+        let (served, hashes) = header_chain(11, 0);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = RpcQuorum::new(
+            vec![counted(served, Duration::ZERO, Arc::clone(&requests)).await],
+            1,
+            1_000,
+        )
+        .unwrap();
+        let asked = || requests.load(std::sync::atomic::Ordering::Relaxed);
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(8, hashes[7]);
+        // Empty sequencer batches, and between them a message from L1.
+        let message = |number: u64, sender: alloy_primitives::Address| crate::feed::SignedBlock {
+            number,
+            hash: hashes[usize::try_from(number).unwrap() - 1],
+            message: Arc::new(crate::feed::Message {
+                kind: 3,
+                sender,
+                l1_block: 1,
+                timestamp: 0,
+                l1_base_fee: 0,
+                l2: vec![3],
+            }),
+        };
+        signed.keep(message(9, crate::nitro::SEQUENCER));
+        signed.keep(message(10, alloy_primitives::Address::repeat_byte(1)));
+        signed.keep(message(11, crate::nitro::SEQUENCER));
+        let mut request = live_request();
+        request.required = CapabilitySet::of(Capability::Body).with(Capability::Senders);
+        let mut events = signed_lane_for(request, pool, &signed, &hashes).await;
+        let within = Duration::from_secs(30);
+        let next = async |events: &mut leani_source_api::ChainEventStream| {
+            tokio::time::timeout(within, next_block(events))
+                .await
+                .unwrap()
+        };
+        assert_eq!(next(&mut events).await, 9);
+        assert_eq!(asked(), 0);
+        assert_eq!(next(&mut events).await, 10);
+        let fetched = asked();
+        assert!(fetched > 0);
+        assert_eq!(next(&mut events).await, 11);
+        assert_eq!(asked(), fetched);
     }
 
     #[tokio::test]
