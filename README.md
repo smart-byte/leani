@@ -93,16 +93,25 @@ for await (const change of leani.blocks.subscribe()) {
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="site/public/diagrams/overview-dark.svg">
-  <img src="site/public/diagrams/overview-light.svg" alt="How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or a sequencer feed, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.">
+  <img src="site/public/diagrams/overview-light.svg" alt="How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or RPC and signed by rollup sequencers, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.">
 </picture>
 
-On Ethereum, history comes from public Xatu and EraE datasets, verified
-against block commitments. The live lane follows execution peers and verifies
-finality from light-client updates. Both lanes join once, at a hash-verified
-boundary, and disk holds only your processors' results, their state, and a
-short reorg window. Rollups get live blocks from their sequencer; see
-[follow a rollup](https://leani.dev/docs/guides/follow-a-rollup/). Read
-[how Leani works](https://leani.dev/docs/concepts/how-leani-works/) and the
+Every default source is public and needs no API key:
+
+| Chains | History | Live |
+|---|---|---|
+| Ethereum | [EraE](https://ethpandaops.io/data/history/) archives, then [Xatu](https://github.com/ethpandaops/xatu-data) Parquet, then execution P2P | Execution P2P, following the beacon chain |
+| OP Stack: OP Mainnet, Base, Unichain, World Chain, Zora, Ink, Mode, Soneium | Execution P2P, then public JSON-RPC | Execution P2P, checked against the sequencer's signed gossip; public JSON-RPC while no peer serves |
+| Arbitrum Nitro: Arbitrum One, Arbitrum Nova, Robinhood Chain | SonarX on AWS Open Data for Arbitrum One, then public JSON-RPC | Public JSON-RPC, checked against the sequencer's signed feed |
+
+The [chain entries](config/chains) list the public endpoints; add your own in
+`sources.json_rpc.endpoints`. [AWS Open Data](https://registry.opendata.aws/aws-public-blockchain/)
+also holds Ethereum and Base history for an `aws_public` source, about a day
+behind for Ethereum and a week for Base and Arbitrum One. History and live
+join once, at a hash-verified boundary, and disk holds only your processors'
+results, their state, and a short reorg window. Read
+[how Leani works](https://leani.dev/docs/concepts/how-leani-works/),
+[follow a rollup](https://leani.dev/docs/guides/follow-a-rollup/), and the
 [architecture notes](docs/contributing/architecture.md).
 
 ## Documentation
