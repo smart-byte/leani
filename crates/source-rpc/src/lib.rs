@@ -656,6 +656,85 @@ impl RpcClient {
             .await
     }
 
+    /// The blocks from `first` through `last` it serves, up to the first it
+    /// does not, and their receipts unless `mode` is `Header`, asked for
+    /// together. Empty when it does not serve `first` yet.
+    async fn served_blocks(
+        &self,
+        first: u64,
+        last: u64,
+        mode: FetchMode,
+    ) -> Result<Vec<(Value, Value)>, RpcError> {
+        let full = mode == FetchMode::Full;
+        let with_receipts = mode != FetchMode::Header;
+        let calls = (first..=last)
+            .flat_map(|number| {
+                let tag = format!("{number:#x}");
+                let receipts =
+                    with_receipts.then(|| ("eth_getBlockReceipts", serde_json::json!([&tag])));
+                std::iter::once(("eth_getBlockByNumber", serde_json::json!([tag, full])))
+                    .chain(receipts)
+            })
+            .collect();
+        let mut results = self.results(calls).await?.into_iter();
+        Ok(std::iter::from_fn(|| {
+            let block = results.next().filter(|block| !block.is_null())?;
+            let receipts = if with_receipts {
+                results.next().filter(|receipts| !receipts.is_null())?
+            } else {
+                Value::Null
+            };
+            Some((block, receipts))
+        })
+        .collect())
+    }
+
+    /// Each call's result, null where the endpoint gave none, in one batched
+    /// request; one request per call where the endpoint refuses batches.
+    async fn results(&self, calls: Vec<(&'static str, Value)>) -> Result<Vec<Value>, RpcError> {
+        let (methods, calls): (Vec<&'static str>, Vec<Value>) = calls
+            .into_iter()
+            .enumerate()
+            .map(|(id, (method, params))| {
+                let call = serde_json::json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+                (method, call)
+            })
+            .unzip();
+        let batched = if self
+            .shared
+            .batches
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            self.batch(&calls).await
+        } else {
+            None
+        };
+        if let Some(responses) = batched {
+            let mut results = vec![Value::Null; calls.len()];
+            for response in responses {
+                if let Some(result) = response["id"]
+                    .as_u64()
+                    .and_then(|id| usize::try_from(id).ok())
+                    .and_then(|id| results.get_mut(id))
+                {
+                    *result = response["result"].clone();
+                }
+            }
+            return Ok(results);
+        }
+        stream::iter(calls.into_iter().enumerate())
+            .map(|(index, call)| {
+                let method = methods[index];
+                async move {
+                    let response: Value = self.post(method, &call).await?;
+                    Ok::<_, RpcError>(response["result"].clone())
+                }
+            })
+            .buffered(CONCURRENT_CALLS)
+            .try_collect()
+            .await
+    }
+
     /// One batched request, or `None` when the endpoint will not take it.
     async fn batch(&self, calls: &[Value]) -> Option<Vec<Value>> {
         let count = u32::try_from(calls.len()).unwrap_or(u32::MAX);
@@ -1142,6 +1221,45 @@ impl RpcQuorum {
         )))
     }
 
+    /// The blocks from `first` through `last` that the `at`th endpoint in
+    /// pool order serves, up to the first it does not, and the endpoint that
+    /// served them. Once it has taken twice as long as usual, the next
+    /// endpoint is asked as well, and the first answer counts unless it is an
+    /// error. Empty when the endpoint that answered serves not even `first`
+    /// yet.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the endpoints asked fail.
+    pub(crate) async fn served_blocks(
+        &self,
+        at: usize,
+        first: u64,
+        last: u64,
+        mode: FetchMode,
+    ) -> Result<(usize, Vec<(Value, Value)>), RpcError> {
+        let at = at % self.clients.len();
+        let next = (at + 1) % self.clients.len();
+        let mut asked = std::pin::pin!(self.clients[at].served_blocks(first, last, mode));
+        if next == at {
+            return asked.await.map(|served| (at, served));
+        }
+        if let Ok(served) = tokio::time::timeout(self.clients[at].usual() * 2, &mut asked).await {
+            return served.map(|served| (at, served));
+        }
+        let hedge = std::pin::pin!(self.clients[next].served_blocks(first, last, mode));
+        match futures::future::select(asked, hedge).await {
+            futures::future::Either::Left((Err(_), hedge)) => {
+                hedge.await.map(|served| (next, served))
+            }
+            futures::future::Either::Right((Err(_), asked)) => {
+                asked.await.map(|served| (at, served))
+            }
+            futures::future::Either::Left((served, _)) => served.map(|served| (at, served)),
+            futures::future::Either::Right((served, _)) => served.map(|served| (next, served)),
+        }
+    }
+
     /// Each endpoint's block at `tag`, as the endpoints answer, until all
     /// did or [`ANSWER_GRACE`] after `quorum` of them answered.
     async fn answers(&self, tag: &str) -> Vec<Result<(u64, B256), RpcError>> {
@@ -1594,6 +1712,165 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "{:?}",
             started.elapsed()
+        );
+    }
+
+    /// The number of the next block the stream delivers, past other events.
+    async fn next_block(events: &mut leani_source_api::ChainEventStream) -> u64 {
+        loop {
+            let event = events
+                .next()
+                .await
+                .expect("open stream")
+                .expect("an event, not an error");
+            if let leani_source_api::ChainEvent::Block(frame) = event {
+                return frame.block.number.0;
+            }
+        }
+    }
+
+    /// A live lane over `pool` that checks blocks against `signed`, from
+    /// block 8 of the chain of `hashes`, polling every 10 ms.
+    async fn signed_lane(
+        pool: RpcQuorum,
+        signed: &crate::feed::SignedHashes,
+        hashes: &[B256],
+    ) -> leani_source_api::ChainEventStream {
+        use leani_source_api::LiveSource as _;
+
+        let start = leani_source_api::LiveStart::Block(leani_primitives::BlockRef {
+            number: leani_primitives::BlockNumber(8),
+            hash: leani_primitives::BlockHash::new(hashes[7].0),
+            parent_hash: leani_primitives::BlockHash::new(hashes[6].0),
+            timestamp: 0,
+        });
+        RpcLiveSource::new(
+            "rpc",
+            leani_primitives::ChainId(1),
+            pool,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+        .with_signed_hashes(signed.clone())
+        .subscribe(
+            live_request(),
+            start,
+            live_budget(),
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_the_live_lane_asks_one_endpoint_for_each_newly_signed_block() {
+        let (served, hashes) = header_chain(10, 0);
+        let requests: [Arc<std::sync::atomic::AtomicUsize>; 3] = Default::default();
+        let mut endpoints = Vec::new();
+        for counter in &requests {
+            endpoints.push(counted(served.clone(), Duration::ZERO, Arc::clone(counter)).await);
+        }
+        let load = || {
+            requests
+                .each_ref()
+                .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(9, hashes[8]);
+        let pool = RpcQuorum::new(endpoints, 1, 1_000).unwrap();
+        let mut events = signed_lane(pool, &signed, &hashes).await;
+        let within = Duration::from_secs(30);
+        assert_eq!(
+            tokio::time::timeout(within, next_block(&mut events))
+                .await
+                .unwrap(),
+            9
+        );
+        // The endpoints serve block 10, but the sequencer has not signed it:
+        // thirty rounds pass without a request.
+        let asked = load();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), next_block(&mut events))
+                .await
+                .is_err()
+        );
+        assert_eq!(load(), asked);
+        signed.insert(10, hashes[9]);
+        assert_eq!(
+            tokio::time::timeout(within, next_block(&mut events))
+                .await
+                .unwrap(),
+            10
+        );
+        // Block 10 alone, from the endpoint that served block 9 and refused
+        // a batch then: one request, and none to the others.
+        assert_eq!(load(), [asked[0] + 1, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_an_endpoint_that_keeps_lacking_a_signed_block_hands_over_to_the_next() {
+        let (served, hashes) = header_chain(11, 0);
+        let behind = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let pool = RpcQuorum::new(
+            vec![
+                counted(served[..8].to_vec(), Duration::ZERO, Arc::clone(&behind)).await,
+                serving(served, Duration::ZERO).await,
+            ],
+            1,
+            1_000,
+        )
+        .unwrap();
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(9, hashes[8]);
+        signed.insert(10, hashes[9]);
+        let mut events = signed_lane(pool, &signed, &hashes).await;
+        // The first endpoint serves up to block 8: asked again a poll
+        // interval later, it still lacks block 9, and the second serves it.
+        let within = Duration::from_secs(30);
+        for expected in [9, 10] {
+            assert_eq!(
+                tokio::time::timeout(within, next_block(&mut events))
+                    .await
+                    .unwrap(),
+                expected
+            );
+        }
+        // A batch it refused, blocks 9 and 10, then block 9 alone.
+        let asked = behind.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(asked, 4);
+        // The second keeps serving, so the first is not asked again.
+        signed.insert(11, hashes[10]);
+        assert_eq!(
+            tokio::time::timeout(within, next_block(&mut events))
+                .await
+                .unwrap(),
+            11
+        );
+        assert_eq!(behind.load(std::sync::atomic::Ordering::Relaxed), asked);
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_a_slow_endpoint_is_backed_by_the_next() {
+        let (served, hashes) = header_chain(10, 0);
+        let pool = RpcQuorum::new(
+            vec![
+                serving(served.clone(), Duration::from_secs(20)).await,
+                serving(served, Duration::ZERO).await,
+            ],
+            1,
+            1_000,
+        )
+        .unwrap();
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(9, hashes[8]);
+        let mut events = signed_lane(pool, &signed, &hashes).await;
+        // The first endpoint answers after 20 seconds; once it has taken
+        // twice as long as usual, the second serves the block.
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(10), next_block(&mut events))
+                .await
+                .unwrap(),
+            9
         );
     }
 

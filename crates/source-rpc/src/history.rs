@@ -14,7 +14,7 @@ use leani_source_api::{
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::{FetchMode, RpcQuorum, decode_block, frame, unix_now_ms};
+use crate::{DecodedBlock, FetchMode, RpcQuorum, decode_block, frame, unix_now_ms};
 
 /// Blocks per chunk: each chunk is authenticated by its parent links down
 /// from one trusted tip. Chunks end on multiples of it, so an anchored
@@ -282,6 +282,25 @@ impl HistorySource for RpcHistorySource {
     }
 }
 
+/// Decode fetched blocks, each linked to the one before.
+pub(crate) fn decode_chain(
+    fetched: &[(serde_json::Value, serde_json::Value)],
+) -> Result<Vec<DecodedBlock>, SourceError> {
+    let blocks = fetched
+        .iter()
+        .map(|(block, receipts)| decode_block(block, receipts))
+        .collect::<Result<Vec<_>, _>>()?;
+    for pair in blocks.windows(2) {
+        if pair[1].header.parent_hash != pair[0].hash {
+            return Err(SourceError::CorruptFrame(format!(
+                "block {} does not link to block {}",
+                pair[1].header.number, pair[0].header.number
+            )));
+        }
+    }
+    Ok(blocks)
+}
+
 /// Fetch, check, and link a chunk, then, with `quorum_tip`, check its tip with
 /// the quorum: the parent links extend the quorum's agreement to every block
 /// below it. Without it, the caller checks the blocks against what it trusts.
@@ -294,20 +313,11 @@ pub(crate) async fn fetch_range(
     quorum_tip: bool,
 ) -> Result<Vec<leani_primitives::BlockFrame>, SourceError> {
     let observed = unix_now_ms();
-    let blocks = quorum
-        .blocks(chunk.range.start().0, chunk.range.end().0, mode)
-        .await?
-        .iter()
-        .map(|(block, receipts)| decode_block(block, receipts))
-        .collect::<Result<Vec<_>, _>>()?;
-    for pair in blocks.windows(2) {
-        if pair[1].header.parent_hash != pair[0].hash {
-            return Err(SourceError::CorruptFrame(format!(
-                "block {} does not link to block {}",
-                pair[1].header.number, pair[0].header.number
-            )));
-        }
-    }
+    let blocks = decode_chain(
+        &quorum
+            .blocks(chunk.range.start().0, chunk.range.end().0, mode)
+            .await?,
+    )?;
     if let (Some(first), Some(expected)) = (blocks.first(), &chunk.expected_parent)
         && BlockHash::new(first.header.parent_hash.0) != *expected
     {

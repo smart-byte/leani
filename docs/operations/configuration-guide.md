@@ -573,10 +573,13 @@ chain entry names, whose every message carries a block's hash signed by the
 chain's batch poster. The endpoints then only carry blocks: one whose hash
 differs from the signed one is refused, and one that matches makes it and
 every block it links to `attested`, so a single endpoint is enough (the
-quorum defaults to 1). The lanes start at a signed block the endpoints
-serve. A feed connection silent for 30 seconds is reopened. Feed relays
-replay only the last few minutes, so after a longer outage blocks become
-`attested` once the lane reaches the feed's blocks again. Without
+quorum defaults to 1). Near the head, the live lane asks one endpoint for
+each block the feed signs, with its receipts. It moves to the next endpoint
+when that one fails or still lacks the block a poll interval later, and asks
+the next one too while it is slow. The lanes start at a signed block the
+endpoints serve. A feed connection silent for 30 seconds is reopened. Feed
+relays replay only the last few minutes, so after a longer outage blocks
+become `attested` once the lane reaches the feed's blocks again. Without
 `[l1_anchor]` nothing is `finalized` unless
 `finality.finalized_by = "json_rpc"`, and recent frames settle
 `finality.settle_blocks` (default 3,600) below the tip.
