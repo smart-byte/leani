@@ -79,28 +79,38 @@ struct Signed {
     message_bytes: usize,
 }
 
+impl Signed {
+    fn insert(&mut self, number: u64, hash: B256) {
+        self.hashes.insert(number, hash);
+        while self.hashes.len() > KEPT_BLOCKS {
+            self.hashes.pop_first();
+        }
+    }
+}
+
 /// Recent block hashes the sequencer signed, by number, and the newest
 /// blocks' messages.
 #[derive(Clone, Debug, Default)]
-pub struct SignedHashes(Arc<Mutex<Signed>>);
+pub struct SignedHashes {
+    signed: Arc<Mutex<Signed>>,
+    /// Marked changed once a block is signed, after it is kept.
+    changes: tokio::sync::watch::Sender<()>,
+}
 
 impl SignedHashes {
     fn lock(&self) -> std::sync::MutexGuard<'_, Signed> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.signed.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     pub fn insert(&self, number: u64, hash: B256) {
-        let mut signed = self.lock();
-        signed.hashes.insert(number, hash);
-        while signed.hashes.len() > KEPT_BLOCKS {
-            signed.hashes.pop_first();
-        }
+        self.lock().insert(number, hash);
+        self.changes.send_replace(());
     }
 
     /// Keep a signed block's hash, and its message among the newest.
     pub fn keep(&self, block: SignedBlock) {
-        self.insert(block.number, block.hash);
         let mut signed = self.lock();
+        signed.insert(block.number, block.hash);
         signed.message_bytes += block.message.l2.len();
         if let Some(replaced) = signed.blocks.insert(block.number, block) {
             signed.message_bytes -= replaced.message.l2.len();
@@ -111,6 +121,14 @@ impl SignedHashes {
             };
             signed.message_bytes -= oldest.message.l2.len();
         }
+        drop(signed);
+        self.changes.send_replace(());
+    }
+
+    /// A receiver that changes each time a block is signed.
+    #[must_use]
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.changes.subscribe()
     }
 
     #[must_use]

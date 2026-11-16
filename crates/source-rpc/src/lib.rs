@@ -1741,12 +1741,20 @@ mod tests {
         signed: &crate::feed::SignedHashes,
         hashes: &[B256],
     ) -> leani_source_api::ChainEventStream {
-        signed_lane_for(live_request(), pool, signed, hashes).await
+        signed_lane_for(
+            live_request(),
+            Duration::from_millis(10),
+            pool,
+            signed,
+            hashes,
+        )
+        .await
     }
 
-    /// A [`signed_lane`] for `request`.
+    /// A [`signed_lane`] for `request`, polling every `poll_interval`.
     async fn signed_lane_for(
         request: leani_source_api::DataRequest,
+        poll_interval: Duration,
         pool: RpcQuorum,
         signed: &crate::feed::SignedHashes,
         hashes: &[B256],
@@ -1759,22 +1767,17 @@ mod tests {
             parent_hash: leani_primitives::BlockHash::new(hashes[6].0),
             timestamp: 0,
         });
-        RpcLiveSource::new(
-            "rpc",
-            leani_primitives::ChainId(1),
-            pool,
-            Duration::from_millis(10),
-        )
-        .unwrap()
-        .with_signed_hashes(signed.clone())
-        .subscribe(
-            request,
-            start,
-            live_budget(),
-            tokio_util::sync::CancellationToken::new(),
-        )
-        .await
-        .unwrap()
+        RpcLiveSource::new("rpc", leani_primitives::ChainId(1), pool, poll_interval)
+            .unwrap()
+            .with_signed_hashes(signed.clone())
+            .subscribe(
+                request,
+                start,
+                live_budget(),
+                tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .unwrap()
     }
 
     #[tokio::test]
@@ -1921,7 +1924,8 @@ mod tests {
         signed.keep(message(11, crate::nitro::SEQUENCER));
         let mut request = live_request();
         request.required = CapabilitySet::of(Capability::Body).with(Capability::Senders);
-        let mut events = signed_lane_for(request, pool, &signed, &hashes).await;
+        let mut events =
+            signed_lane_for(request, Duration::from_millis(10), pool, &signed, &hashes).await;
         let within = Duration::from_secs(30);
         let next = async |events: &mut leani_source_api::ChainEventStream| {
             tokio::time::timeout(within, next_block(events))
@@ -1935,6 +1939,57 @@ mod tests {
         assert!(fetched > 0);
         assert_eq!(next(&mut events).await, 11);
         assert_eq!(asked(), fetched);
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_a_lane_making_blocks_makes_each_as_soon_as_it_is_signed() {
+        let (served, hashes) = header_chain(10, 0);
+        let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(8, hashes[7]);
+        let sequenced = |number: u64| crate::feed::SignedBlock {
+            number,
+            hash: hashes[usize::try_from(number).unwrap() - 1],
+            message: Arc::new(crate::feed::Message {
+                kind: 3,
+                sender: crate::nitro::SEQUENCER,
+                l1_block: 1,
+                timestamp: 0,
+                l1_base_fee: 0,
+                l2: vec![3],
+            }),
+        };
+        signed.keep(sequenced(9));
+        let mut request = live_request();
+        request.required = CapabilitySet::of(Capability::Body).with(Capability::Senders);
+        let mut events =
+            signed_lane_for(request, Duration::from_secs(5), pool, &signed, &hashes).await;
+        let within = Duration::from_secs(30);
+        assert_eq!(
+            tokio::time::timeout(within, next_block(&mut events))
+                .await
+                .unwrap(),
+            9
+        );
+        // Signed while the lane waits out its five-second poll interval.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), next_block(&mut events))
+                .await
+                .is_err()
+        );
+        signed.keep(sequenced(10));
+        let signed_at = std::time::Instant::now();
+        assert_eq!(
+            tokio::time::timeout(within, next_block(&mut events))
+                .await
+                .unwrap(),
+            10
+        );
+        assert!(
+            signed_at.elapsed() < Duration::from_secs(2),
+            "{:?}",
+            signed_at.elapsed()
+        );
     }
 
     #[tokio::test]
