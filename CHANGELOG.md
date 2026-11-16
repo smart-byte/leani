@@ -72,7 +72,9 @@ record, and documented RPC contracts.
   sources in priority order, and the live lane takes over just below that
   block. Under the L1 anchor a `json_rpc` history source proves its blocks
   by parent links down from the confirmed hash before a processor sees them,
-  so they are `finalized` without trusting the endpoints.
+  so they are `finalized` without trusting the endpoints. Without such a
+  processor, the lanes start without waiting for the anchor to confirm a
+  block.
 - A history source missing the newest blocks of a range keeps the blocks
   before them, and the next source serves the rest: an `aws_public` source
   ahead of a `json_rpc` one serves the days SonarX exported, and the
@@ -114,16 +116,23 @@ record, and documented RPC contracts.
   refused and one that matches attests the chain below it, so the endpoints
   are trusted only to serve. Finality comes from the L1 anchor. A feed
   connection silent for 30 seconds is reopened.
-  When the processors take filtered material and need nothing but
-  transactions' bodies, calldata, and senders, such as `transaction-stats`,
-  the live lane makes the blocks the sequencer built from signed
-  transactions out of the feed's messages, without JSON-RPC, each as soon as
-  the feed signs it. Their transactions are declared complete, not checked:
-  a contract's `redeem` call adds a retry transaction they lack, and the
-  signature binds a message's block hash, not where its fields end, so they
-  trust the feed relay. Blocks of messages from L1 and of direct calls to
-  `ArbRetryableTx` still come from an endpoint, and so does one header in a
-  thousand, which checks the transactions made.
+  When the processors need nothing of a block but its header and
+  transactions, such as `transaction-stats` or `block-summary`, the live
+  lane makes the blocks the sequencer built from signed transactions out of
+  the feed's messages, each as soon as the feed signs it, also while it
+  catches up through blocks the feed kept, and asks one endpoint for each
+  block's header alone: one call per block instead of two. The header's
+  transactions root checks the transactions made; a block whose header names
+  others, as when a contract's `redeem` call adds a retry, comes whole from
+  the endpoint, as do blocks of messages from L1 and of direct calls to
+  `ArbRetryableTx`; after eight such blocks in a row, the lane fetches
+  every block whole. `sources.live.trust = "trusted_dataset"` takes the
+  blocks made without headers, for processors that take filtered material
+  and need nothing but transactions' bodies, calldata, and senders, so the
+  lane follows the head without JSON-RPC. Their transactions are then
+  declared complete, not checked: they can lack such a retry, and as the
+  signature binds a message's block hash but not where its fields end, they
+  trust the feed relay.
 - Op-stack history over P2P: a fresh store catches up from the lowest
   `start_block` of the processors with automatic history, bounded by
   `sources.live.history_fallback_blocks`, along the chain of the first signed

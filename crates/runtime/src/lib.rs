@@ -3762,6 +3762,9 @@ pub struct SharedLiveRuntimeConfig {
     pub confirmation_votes: Option<tokio::sync::watch::Receiver<ConfirmationVotes>>,
     /// Counts the reorgs that revert a confirmed block.
     pub network_telemetry: NetworkTelemetry,
+    /// What the live source's material must prove, `CompleteCryptographic`
+    /// unless the operator trusts the source's dataset.
+    pub verification_policy: VerificationPolicy,
 }
 
 impl Default for SharedLiveRuntimeConfig {
@@ -3778,6 +3781,7 @@ impl Default for SharedLiveRuntimeConfig {
             live_gap_fill_time_limit: Duration::from_mins(5),
             confirmation_votes: None,
             network_telemetry: NetworkTelemetry::default(),
+            verification_policy: VerificationPolicy::CompleteCryptographic,
         }
     }
 }
@@ -4476,6 +4480,7 @@ impl SharedLiveRuntime {
         // so those frames must carry their material too.
         let mut request =
             compile_live_request(&self.processors, self.source.descriptor().chain_id, &start)?;
+        request.verification_policy = self.config.verification_policy;
         // The execution P2P source follows the chain by header, so keeping
         // headers costs nothing: ad-hoc runs of header-only processors can
         // then use the retained frames whatever the configured lanes need.
@@ -20637,6 +20642,47 @@ mod tests {
                 source.requests()[0].required.contains(Capability::Header),
                 headers
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_shared_lane_requests_the_verification_policy_it_is_configured_with() {
+        let range = BlockRange::new(BlockNumber(0), BlockNumber(2)).expect("range");
+        let chain = live_chain(Finality::Attested);
+        for policy in [
+            VerificationPolicy::CompleteCryptographic,
+            VerificationPolicy::TrustedDataset,
+        ] {
+            let (_directory, store) = store().await;
+            let source = Arc::new(FilteringLiveSource::new(
+                fixture_source_descriptor("live", range),
+                chain
+                    .iter()
+                    .cloned()
+                    .map(|frame| ChainEvent::Block(Box::new(frame)))
+                    .collect(),
+            ));
+            SharedLiveRuntime::new(
+                store,
+                source.clone(),
+                vec![Arc::new(FilteredCounter::named(
+                    "senders",
+                    vec![sender_requirement(OTHER_SENDER)],
+                ))],
+                SharedLiveRuntimeConfig {
+                    verification_policy: policy,
+                    ..SharedLiveRuntimeConfig::default()
+                },
+            )
+            .expect("runtime")
+            .run(
+                LiveStart::Head,
+                default_source_budget(),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("live run");
+            assert_eq!(source.requests()[0].verification_policy, policy);
         }
     }
 

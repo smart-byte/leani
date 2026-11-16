@@ -39,6 +39,11 @@ const START_BLOCK: [u8; 4] = [0x6b, 0xf6, 0xa4, 0x2d];
 pub(crate) const SEQUENCED: CapabilitySet = CapabilitySet::of(Capability::Body)
     .with(Capability::Calldata)
     .with(Capability::Senders);
+/// What a block made from its message gives with the header that checks it:
+/// the header, and every field group of its transactions.
+pub(crate) const CHECKED: CapabilitySet = CapabilitySet::of(Capability::Header)
+    .with(Capability::Transactions)
+    .with_derivable();
 
 /// The signed transactions of a message the sequencer built, or `None` for
 /// any other: a message from L1 may hold transactions that do not execute,
@@ -218,6 +223,36 @@ pub(crate) fn sequenced_frame(
     })
 }
 
+/// The frame of `header`, a block an endpoint served without its
+/// transactions, holding those of `made`, the same block made from its
+/// message: complete, since the header's transactions root names them.
+/// `None` when the header is another block's or names other transactions,
+/// as when a contract's `redeem` call made `ArbOS` add a retry.
+pub(crate) fn with_header(made: BlockFrame, mut header: BlockFrame) -> Option<BlockFrame> {
+    let root = block_hash(transactions_root(&made));
+    let Material::Complete(envelope) = &mut header.header else {
+        return None;
+    };
+    if header.block != made.block || envelope.transactions_root != Some(root) {
+        return None;
+    }
+    let Material::Filtered {
+        value: transactions,
+        ..
+    } = made.transactions
+    else {
+        return None;
+    };
+    envelope.transaction_count = Some(u32::try_from(transactions.len()).unwrap_or(u32::MAX));
+    header.transactions = Material::Complete(transactions);
+    header.verification.transactions_root = VerificationCheck::VERIFIED;
+    for provenance in &mut header.provenance {
+        provenance.projection = vec!["header".to_owned()];
+    }
+    header.provenance.extend(made.provenance);
+    Some(header)
+}
+
 /// The root of a frame's transactions, as its block's header names it.
 pub(crate) fn transactions_root(frame: &BlockFrame) -> B256 {
     let transactions = frame
@@ -280,9 +315,9 @@ mod tests {
     fn a_sequencer_message_makes_the_transactions_its_block_holds() {
         let (mut parent, signed, served) = fixture();
         assert_eq!(signed.len(), served.len());
-        for (block, served) in signed.iter().zip(&served) {
+        for (block, json) in signed.iter().zip(&served) {
             let made = sequenced_frame(block, &parent, CHAIN, &source(), 0).unwrap();
-            let decoded = decode_block(served, &Value::Null).unwrap();
+            let decoded = decode_block(json, &Value::Null).unwrap();
             let served = frame(&decoded, CHAIN, &source(), Finality::Unattested, 0, None).unwrap();
             assert_eq!(made.block, served.block);
             assert_eq!(
@@ -295,6 +330,36 @@ mod tests {
             assert!(!made.capabilities().satisfies(SEQUENCED, false));
             assert_eq!(made.group_violation(SEQUENCED), None);
             parent = made.block;
+            // The header an endpoint serves with transaction hashes alone
+            // checks them.
+            let mut header = json.clone();
+            header["transactions"] = json["transactions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|transaction| transaction["hash"].clone())
+                .collect();
+            let header = frame(
+                &decode_block(&header, &Value::Null).unwrap(),
+                CHAIN,
+                &source(),
+                Finality::Unattested,
+                0,
+                None,
+            )
+            .unwrap();
+            // Not the header of another block, here one a second later.
+            let mut later = header.clone();
+            later.block.timestamp += 1;
+            assert!(with_header(made.clone(), later).is_none());
+            let checked = with_header(made, header).unwrap();
+            assert_eq!(checked.header.as_complete(), served.header.as_complete());
+            assert_eq!(
+                checked.transactions.as_complete(),
+                served.transactions.as_complete()
+            );
+            assert!(checked.capabilities().satisfies(CHECKED, false));
+            assert_eq!(checked.group_violation(CHECKED), None);
         }
     }
 

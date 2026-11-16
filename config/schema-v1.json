@@ -395,7 +395,11 @@
           "$ref": "#/$defs/positiveInteger",
           "description": "Optional maximum finalized suffix eligible for execution-P2P history fallback. When omitted, every gap at or after the processor start block is eligible."
         },
-        "handoff_overlap_blocks": { "$ref": "#/$defs/positiveInteger" }
+        "handoff_overlap_blocks": { "$ref": "#/$defs/positiveInteger" },
+        "trust": {
+          "enum": ["trusted_dataset", "verified_material"],
+          "description": "trusted_dataset lets the JSON-RPC lane under a Nitro sequencer feed take the blocks it makes from the feed's messages without the header that checks each, for processors that take filtered material and need nothing but transactions' bodies, calldata, and senders (default verified_material)."
+        }
       }
     },
     "sources": {
