@@ -100,8 +100,11 @@ record, and documented RPC contracts.
   The live lane fetches 256 blocks at a time while catching up, hands each
   round's blocks over as soon as they are fetched, and asks for the head
   again at once while it moves. With
-  `sequencer_feed`, the quorum defaults to 1 and no
-  endpoint can claim a head the sequencer has not signed. Nitro entries list
+  `sequencer_feed`, the quorum defaults to 1, no
+  endpoint can claim a head the sequencer has not signed, and near the head
+  the live lane asks one endpoint for each block the feed signs, with its
+  receipts, moving on when that endpoint fails or still lacks the block a
+  poll interval later. Nitro entries list
   public keyless endpoints of several operators. Requests name `leani` in
   their User-Agent.
 - `finality.kind = "sequencer_feed"` follows a Nitro chain's sequencer feed

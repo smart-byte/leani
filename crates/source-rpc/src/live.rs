@@ -8,7 +8,8 @@ use alloy_primitives::B256;
 use async_trait::async_trait;
 use futures::{StreamExt, stream};
 use leani_primitives::{
-    BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, SourceId, SourceKind, TrustModel,
+    BlockFrame, BlockHash, BlockNumber, BlockRange, BlockRef, ChainId, Finality, SourceId,
+    SourceKind, TrustModel,
 };
 use leani_source_api::{
     ChainEvent, ChainEventStream, DataRequest, FinalityModel, LiveSource, LiveStart, Partitioning,
@@ -18,9 +19,11 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 use crate::{
-    FetchMode, RpcQuorum,
+    FetchMode, PART_BLOCKS, RpcQuorum,
     feed::SignedHashes,
-    history::{Label, capabilities, fetch_range},
+    frame,
+    history::{Label, capabilities, decode_chain, fetch_range},
+    unix_now_ms,
 };
 
 /// Delivered blocks kept to find a fork point.
@@ -86,7 +89,9 @@ impl RpcLiveSource {
 
     /// Check blocks against the hashes the sequencer signed: a block whose
     /// hash differs is refused, and a signed one attests the blocks it
-    /// links to, so the endpoints are trusted for nothing but serving.
+    /// links to, so the endpoints are trusted for nothing but serving. Near
+    /// the newest signed block, the lane asks a single endpoint for each
+    /// block the feed signs: the one that served the last blocks.
     #[must_use]
     pub fn with_signed_hashes(mut self, signed: SignedHashes) -> Self {
         self.descriptor.trust = TrustModel::ProtocolVerified;
@@ -148,6 +153,8 @@ impl LiveSource for RpcLiveSource {
             recent,
             next,
             head: 0,
+            preferred: 0,
+            unserved: None,
             attested_through: 0,
             safe_polled: None,
             pending: VecDeque::new(),
@@ -164,6 +171,13 @@ struct LiveState {
     recent: VecDeque<BlockRef>,
     next: u64,
     head: u64,
+    /// The endpoint asked first under the feed: the one that served the last
+    /// signed blocks, or the next in pool order once it failed or lacked a
+    /// signed block twice.
+    preferred: usize,
+    /// A signed block the preferred endpoint did not serve yet, and when it
+    /// was asked for it.
+    unserved: Option<(u64, tokio::time::Instant)>,
     attested_through: u64,
     safe_polled: Option<tokio::time::Instant>,
     pending: VecDeque<ChainEvent>,
@@ -212,15 +226,110 @@ impl LiveState {
             self.source.signed.is_none(),
         )
         .await?;
-        if let Some(frame) = frames.iter().find(|frame| {
+        self.check_signed(&frames)?;
+        Ok(frames)
+    }
+
+    /// Refuse a block off the chain the sequencer signed.
+    fn check_signed(&self, frames: &[BlockFrame]) -> Result<(), SourceError> {
+        match frames.iter().find(|frame| {
             self.trusted_hash(frame.block.number.0)
                 .is_some_and(|hash| hash.0 != frame.block.hash.0)
         }) {
-            return Err(SourceError::CorruptFrame(format!(
+            Some(frame) => Err(SourceError::CorruptFrame(format!(
                 "block {} is not on the chain the sequencer signed",
                 frame.block.number.0
-            )));
+            ))),
+            None => Ok(()),
         }
+    }
+
+    /// The blocks from `next` through `last` that the preferred endpoint
+    /// serves, near the newest signed block. A block it lacks is asked for
+    /// again, alone, a poll interval later, and the next endpoint is
+    /// preferred once it still lacks it then, or fails.
+    async fn fetch_signed(&mut self, last: u64) -> Result<Vec<BlockFrame>, SourceError> {
+        let next = self.next;
+        let last = match self.unserved {
+            Some((unserved, asked)) if unserved == next => {
+                if asked.elapsed() < self.source.poll_interval {
+                    return Ok(Vec::new());
+                }
+                next
+            }
+            _ => last,
+        };
+        let observed = unix_now_ms();
+        let asked = tokio::time::Instant::now();
+        let served = self
+            .source
+            .quorum
+            .served_blocks(self.preferred, next, last, self.mode)
+            .await;
+        let (served_by, served) = match served {
+            Ok(served) => served,
+            Err(error) => {
+                debug!(%error, "a json-rpc endpoint failed at the signed head; preferring the next");
+                self.preferred = self.preferred.wrapping_add(1);
+                self.unserved = None;
+                return Ok(Vec::new());
+            }
+        };
+        if served.is_empty() {
+            if self.unserved.is_some_and(|(unserved, _)| unserved == next) {
+                self.preferred = self.preferred.wrapping_add(1);
+                self.unserved = None;
+            } else {
+                self.unserved = Some((next, asked));
+            }
+            return Ok(Vec::new());
+        }
+        match self.signed_frames(&served, next, observed) {
+            Ok(frames) => {
+                let after = frames.last().map_or(next, |frame| frame.block.number.0 + 1);
+                self.preferred = served_by;
+                self.unserved = (after <= last).then_some((after, asked));
+                Ok(frames)
+            }
+            Err(error) => {
+                self.preferred = served_by.wrapping_add(1);
+                self.unserved = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// The frames of blocks served from `first` on, each checked against its
+    /// number and the hash the sequencer signed.
+    fn signed_frames(
+        &self,
+        served: &[(serde_json::Value, serde_json::Value)],
+        first: u64,
+        observed: u64,
+    ) -> Result<Vec<BlockFrame>, SourceError> {
+        let descriptor = &self.source.descriptor;
+        let frames = decode_chain(served)?
+            .iter()
+            .zip(first..)
+            .map(|(decoded, number)| {
+                if decoded.header.number != number {
+                    return Err(SourceError::CorruptFrame(format!(
+                        "block {} came for block {number}",
+                        decoded.header.number
+                    )));
+                }
+                frame(
+                    decoded,
+                    descriptor.chain_id,
+                    &descriptor.id,
+                    Finality::Unattested,
+                    observed,
+                    None,
+                )
+                .map_err(Into::into)
+            })
+            .collect::<Result<Vec<_>, SourceError>>()?;
+        self.check_signed(&frames)?;
         Ok(frames)
     }
 
@@ -264,26 +373,40 @@ impl LiveState {
     async fn advance(&mut self) -> Result<(), SourceError> {
         // While catching up, the known head is still ahead: no need to ask.
         if self.next > self.head {
-            let latest = self.source.quorum.agreed_tag("latest").await?.0;
-            // An endpoint cannot claim a head the sequencer has not signed.
             self.head = match &self.source.signed {
-                Some(signed) => signed.newest().map_or(0, |(number, _)| number.min(latest)),
-                None => latest,
+                // An endpoint cannot claim a head the sequencer has not
+                // signed, and the feed names each block it signs: near the
+                // newest, the lane asks for the signed blocks themselves,
+                // and further behind it catches up to the newest block an
+                // endpoint serves.
+                Some(signed) => match signed.newest() {
+                    Some((newest, _)) if newest >= self.next.saturating_add(BATCH_BLOCKS) => {
+                        newest.min(self.source.quorum.agreed_tag("latest").await?.0)
+                    }
+                    Some((newest, _)) => newest,
+                    None => self.head,
+                },
+                None => self.source.quorum.agreed_tag("latest").await?.0,
             };
         }
         let head = self.head;
         if self.next <= head {
-            let batch = if head - self.next >= BATCH_BLOCKS {
-                CATCH_UP_BLOCKS
+            let frames = if self.source.signed.is_some() && head - self.next < BATCH_BLOCKS {
+                self.fetch_signed(head.min(self.next.saturating_add(PART_BLOCKS - 1)))
+                    .await?
             } else {
-                BATCH_BLOCKS
+                let batch = if head - self.next >= BATCH_BLOCKS {
+                    CATCH_UP_BLOCKS
+                } else {
+                    BATCH_BLOCKS
+                };
+                let mut last = head.min(self.next.saturating_add(batch - 1));
+                // A catch-up batch ends at a proven block, which checks it all.
+                if let Some((tip, _)) = self.source.proven.range(self.next..).next() {
+                    last = last.min(*tip);
+                }
+                self.fetch(self.next, last).await?
             };
-            let mut last = head.min(self.next.saturating_add(batch - 1));
-            // A catch-up batch ends at a proven block, which checks it all.
-            if let Some((tip, _)) = self.source.proven.range(self.next..).next() {
-                last = last.min(*tip);
-            }
-            let frames = self.fetch(self.next, last).await?;
             let links = match (self.recent.back(), frames.first()) {
                 (Some(tip), Some(first)) => first.block.parent_hash == tip.hash,
                 _ => true,
