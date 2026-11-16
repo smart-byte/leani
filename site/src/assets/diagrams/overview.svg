@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1600 900" width="1600" height="900" role="img" aria-labelledby="title desc">
   <title id="title">How Leani works</title>
-  <desc id="desc">How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or a sequencer feed, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.</desc>
+  <desc id="desc">How Leani works, drawn as a metro map. Each chain is a line: Ethereum, Base, Arbitrum, and nine more. A line starts at a history station, fed by public datasets or P2P, and a live branch, fed by P2P or RPC and signed by rollup sequencers, joins it. Inside Leani, your processor on each line turns the chain into a data stream, and the streams feed your app over HTTP, SSE, JSON-RPC, or the SDK.</desc>
 
   <text class="b" x="110" y="148" font-size="52">history</text>
   <text class="f" x="389" y="148" font-size="52" text-anchor="middle">+</text>
@@ -15,7 +15,7 @@
   <text class="f" x="1048" y="148" font-size="52" text-anchor="middle">→</text>
   <text class="b" x="1190" y="148" font-size="52">your app</text>
   <text class="d" x="110" y="190" font-size="21">public datasets, P2P</text>
-  <text class="d" x="450" y="190" font-size="21">P2P, sequencer feeds</text>
+  <text class="d" x="450" y="190" font-size="21">P2P, RPC, sequencers</text>
   <text class="d" x="770" y="190" font-size="21">your processors</text>
   <text class="d" x="1190" y="190" font-size="21">data streams</text>
 
