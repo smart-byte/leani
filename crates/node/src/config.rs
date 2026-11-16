@@ -841,6 +841,16 @@ pub struct LiveSourceConfig {
     /// are fetched through P2P and reconciled with historical coverage.
     #[serde(default = "default_handoff_overlap_blocks")]
     pub handoff_overlap_blocks: u64,
+    /// `trusted_dataset` lets the JSON-RPC lane under a Nitro sequencer feed
+    /// take the blocks it makes from the feed's messages without the header
+    /// that checks each, for processors that take filtered material and need
+    /// nothing but transactions' bodies, calldata, and senders.
+    #[serde(default = "default_live_trust")]
+    pub trust: HistoryTrust,
+}
+
+const fn default_live_trust() -> HistoryTrust {
+    HistoryTrust::VerifiedMaterial
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2591,6 +2601,14 @@ impl Config {
             errors.push(ValidationError::new(
                 "sources.json_rpc.public_endpoints",
                 "anyone can list an endpoint on chainlist.org, so its endpoints only carry blocks the sequencer feed checks; use `bundled` or `none` with this finality",
+            ));
+        }
+        if matches!(self.sources.live.trust, HistoryTrust::TrustedDataset)
+            && !matches!(self.finality.kind, FinalitySourceKind::SequencerFeed)
+        {
+            errors.push(ValidationError::new(
+                "sources.live.trust",
+                "only applies to sequencer_feed finality, whose messages the live lane makes blocks from",
             ));
         }
         if self.sources.live.kind.uses(LiveSourceKind::P2p)
@@ -5411,7 +5429,24 @@ endpoints = ["https://ethereum-beacon-api.publicnode.com/"]
                 .any(|error| error.field == "sources.json_rpc.public_endpoints"),
             "chainlist endpoints vouched for blocks"
         );
+        // Only the feed's messages make blocks to trust.
         config.sources.json_rpc.public_endpoints = None;
+        config.sources.live.trust = HistoryTrust::TrustedDataset;
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .any(|error| error.field == "sources.live.trust"),
+            "trust without the feed was accepted"
+        );
+        config.finality.kind = FinalitySourceKind::SequencerFeed;
+        assert!(
+            config
+                .validation_errors()
+                .iter()
+                .all(|error| error.field != "sources.live.trust")
+        );
+        config.sources.live.trust = HistoryTrust::VerifiedMaterial;
         config.finality.kind = FinalitySourceKind::SequencerFeed;
         config.chain.name = "ethereum-hoodi".to_owned();
         config.chain.chain_id = 560_048;

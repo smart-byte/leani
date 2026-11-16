@@ -584,24 +584,30 @@ become `attested` once the lane reaches the feed's blocks again. Without
 `finality.finalized_by = "json_rpc"`, and recent frames settle
 `finality.settle_blocks` (default 3,600) below the tip.
 
-When the processors take filtered material and need nothing but
-transactions' bodies, calldata, and senders, such as `transaction-stats`,
-the live lane asks no endpoint for the blocks the sequencer built from
-signed transactions: it makes them from the feed's messages, each as soon as
-the feed signs it. Their frames hold the transactions, with senders
-recovered from their signatures, and no header, receipts, or logs.
+When the processors need nothing of a block but its header and
+transactions, such as `transaction-stats` or `block-summary`, the live lane
+makes the blocks the sequencer built from signed transactions from the
+feed's messages, each as soon as the feed signs it, and asks one endpoint
+for each block's header alone: one call per block, where a block with its
+receipts takes two. Once the lane reaches blocks whose messages the feed
+kept, such as those signed while the node started, it makes them this way
+however far behind it is. The header's transactions root checks the
+transactions made, with senders recovered from their signatures; the frames
+hold no receipts or logs. A block whose header names other transactions
+comes whole from the endpoint: a transaction that calls `ArbRetryableTx`
+through a contract makes ArbOS add a retry transaction that no message
+carries. So do the blocks of messages from L1, such as deposits,
+retryables, and batch posting reports (about one block in 200 on Arbitrum
+One), and of direct calls to `ArbRetryableTx`. After eight contradicted
+blocks in a row, the lane fetches every block whole from then on.
 
-The transactions are declared complete, not checked against the block. A
-transaction that calls `ArbRetryableTx` through a contract makes ArbOS add a
-retry transaction the frame lacks. The sequencer's signature binds the block
-hash, but not where a message's fields end, so these frames trust the feed
-relay to pass messages on unchanged.
-
-The blocks of messages from L1, such as deposits, retryables, and batch
-posting reports (about one block in 200 on Arbitrum One), and of direct
-calls to `ArbRetryableTx`, still come from an endpoint. So does the header
-of one block in a thousand that the lane made: if its transactions root
-differs, the lane fetches every block from then on.
+With `sources.live.trust = "trusted_dataset"`, processors that take
+filtered material and need nothing but transactions' bodies, calldata, and
+senders get the blocks made without their headers, so the live lane follows
+the head without JSON-RPC. Their transactions are then declared complete,
+not checked: they can lack the retry a contract's `redeem` call adds, and the
+sequencer's signature binds the block hash but not where a message's fields
+end, so these frames trust the feed relay to pass messages on unchanged.
 
 A fresh store under the feed catches up from the lowest `start_block` among
 processors with automatic history, at most
@@ -619,7 +625,8 @@ confirmed last, about 6.4 days old; without the anchor and the feed, the
 endpoints' `finalized` block. Each processor with automatic history
 backfills from its `start_block` up to it from `sources.history` in priority
 order, and the live lane takes over just below it; under the feed it then
-catches up from there as above. A `json_rpc` history source reads the
+catches up from there as above; without such a processor the lanes start
+without waiting for the anchor. A `json_rpc` history source reads the
 JSON-RPC endpoint pool below. Under the L1 anchor its blocks are proven by
 parent links down from the confirmed hash before a processor sees them, at
 one more call per block, so they are `finalized` without trusting any

@@ -141,6 +141,11 @@ that instance's lane by failing.
 
 - `trusted_dataset` sources can omit predicate-matching rows without a
   cryptographic completeness proof;
+- under a Nitro sequencer feed, `sources.live.trust = "trusted_dataset"`
+  takes the blocks the live lane makes from the relay's messages unchecked.
+  The sequencer's signature binds each block's hash but not where a
+  message's fields end, so a relay can change their transactions, and they
+  can lack the retry a contract's call to `ArbRetryableTx` adds;
 - event-derived ERC-20 balances do not model rebases or non-standard hidden
   balance changes;
 - processor changes, off unless `api.allow_processor_changes = true`, let a

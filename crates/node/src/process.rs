@@ -7903,8 +7903,10 @@ async fn run_rpc_lanes(
     };
     // The finalized block the backfills reach: the one the L1 anchor
     // confirmed last, or else the endpoints' `finalized` one; under the feed
-    // alone there is none.
+    // alone there is none. Without a backfill the lanes do not wait for the
+    // anchor to confirm one.
     let finalized = match (&anchored, &signed) {
+        (Some(_), _) if !cold_backfills_needed(config, u64::MAX) => None,
         (Some(assertions), _) => {
             let Some(block) =
                 confirmed_block(&quorum, assertions.confirmed.clone(), cancellation).await?
@@ -8069,6 +8071,14 @@ async fn run_rpc_lanes(
             pending_delta_bytes: config.budgets.pending_delta_bytes,
             committed_events: Some(committed_events),
             recent_hard_bytes: config.budgets.recent_raw_hard_bytes,
+            verification_policy: if matches!(
+                config.sources.live.trust,
+                crate::config::HistoryTrust::TrustedDataset
+            ) {
+                leani_source_api::VerificationPolicy::TrustedDataset
+            } else {
+                leani_source_api::VerificationPolicy::CompleteCryptographic
+            },
             ..SharedLiveRuntimeConfig::default()
         },
     )?;

@@ -1720,8 +1720,10 @@ mod tests {
         );
     }
 
-    /// The number of the next block the stream delivers, past other events.
-    async fn next_block(events: &mut leani_source_api::ChainEventStream) -> u64 {
+    /// The next block the stream delivers, past other events.
+    async fn next_frame(
+        events: &mut leani_source_api::ChainEventStream,
+    ) -> leani_primitives::BlockFrame {
         loop {
             let event = events
                 .next()
@@ -1729,9 +1731,14 @@ mod tests {
                 .expect("open stream")
                 .expect("an event, not an error");
             if let leani_source_api::ChainEvent::Block(frame) = event {
-                return frame.block.number.0;
+                return *frame;
             }
         }
+    }
+
+    /// The number of the next block the stream delivers, past other events.
+    async fn next_block(events: &mut leani_source_api::ChainEventStream) -> u64 {
+        next_frame(events).await.block.number.0
     }
 
     /// A live lane over `pool` that checks blocks against `signed`, from
@@ -1892,16 +1899,16 @@ mod tests {
         );
     }
 
-    /// An empty batch the feed signed at `number` of the chain of `hashes`,
-    /// sent by `sender`.
+    /// An empty batch the feed signed as block `number` with `hash`, sent by
+    /// `sender`.
     fn feed_block(
-        hashes: &[B256],
+        hash: B256,
         number: u64,
         sender: alloy_primitives::Address,
     ) -> crate::feed::SignedBlock {
         crate::feed::SignedBlock {
             number,
-            hash: hashes[usize::try_from(number).unwrap() - 1],
+            hash,
             message: Arc::new(crate::feed::Message {
                 kind: 3,
                 sender,
@@ -1913,6 +1920,61 @@ mod tests {
         }
     }
 
+    /// Blocks `1..=count` at timestamp 0, chained by parent hash, as an
+    /// endpoint serves their headers, naming transactions by hash, and their
+    /// hashes. The blocks `holds` picks hold `ArbOS`'s start transaction
+    /// alone, as the sequencer builds a block from an empty batch; the others
+    /// hold nothing.
+    fn sequenced_chain(count: u64, holds: impl Fn(u64) -> bool) -> (Vec<(u64, Value)>, Vec<B256>) {
+        let source = leani_primitives::SourceId::new("feed").unwrap();
+        let mut parent = leani_primitives::BlockRef {
+            number: leani_primitives::BlockNumber(0),
+            hash: leani_primitives::BlockHash::ZERO,
+            parent_hash: leani_primitives::BlockHash::ZERO,
+            timestamp: 0,
+        };
+        let mut hashes = Vec::new();
+        let served = (1..=count)
+            .map(|number| {
+                let made = holds(number).then(|| {
+                    crate::nitro::sequenced_frame(
+                        &feed_block(B256::ZERO, number, crate::nitro::SEQUENCER),
+                        &parent,
+                        leani_primitives::ChainId(1),
+                        &source,
+                        0,
+                    )
+                    .unwrap()
+                });
+                let header = alloy_consensus::Header {
+                    number,
+                    parent_hash: B256::from(parent.hash.0),
+                    transactions_root: made
+                        .as_ref()
+                        .map_or(alloy_trie::EMPTY_ROOT_HASH, crate::nitro::transactions_root),
+                    ..Default::default()
+                };
+                let hash = header.hash_slow();
+                parent = leani_primitives::BlockRef {
+                    number: leani_primitives::BlockNumber(number),
+                    hash: leani_primitives::BlockHash::new(hash.0),
+                    parent_hash: parent.hash,
+                    timestamp: 0,
+                };
+                hashes.push(hash);
+                let mut served =
+                    serde_json::to_value(alloy_rpc_types_eth::Header::new(header)).unwrap();
+                served["transactions"] = made
+                    .iter()
+                    .flat_map(|made| made.transactions.as_present().unwrap())
+                    .map(|transaction| Value::from(transaction.hash.to_string()))
+                    .collect();
+                (number, served)
+            })
+            .collect();
+        (served, hashes)
+    }
+
     /// A live request for transactions' bodies and senders that takes
     /// filtered material.
     fn transactions_request() -> leani_source_api::DataRequest {
@@ -1922,8 +1984,21 @@ mod tests {
         request
     }
 
+    /// `request`, trusting its sources' datasets.
+    fn trusting(mut request: leani_source_api::DataRequest) -> leani_source_api::DataRequest {
+        request.verification_policy = leani_source_api::VerificationPolicy::TrustedDataset;
+        request
+    }
+
+    /// Whether `frame` holds transactions made from the feed's messages.
+    fn made(frame: &leani_primitives::BlockFrame) -> bool {
+        frame.provenance.iter().any(|provenance| {
+            provenance.source_kind == leani_primitives::SourceKind::SequencerGossip
+        })
+    }
+
     #[tokio::test]
-    async fn under_the_feed_a_lane_for_transactions_makes_the_sequencers_blocks_from_its_messages()
+    async fn under_the_feed_a_lane_trusting_it_makes_the_sequencers_blocks_from_its_messages_alone()
     {
         let (served, hashes) = header_chain(11, 0);
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1937,15 +2012,15 @@ mod tests {
         let signed = crate::feed::SignedHashes::default();
         signed.insert(8, hashes[7]);
         // Empty sequencer batches, and between them a message from L1.
-        signed.keep(feed_block(&hashes, 9, crate::nitro::SEQUENCER));
+        signed.keep(feed_block(hashes[8], 9, crate::nitro::SEQUENCER));
         signed.keep(feed_block(
-            &hashes,
+            hashes[9],
             10,
             alloy_primitives::Address::repeat_byte(1),
         ));
-        signed.keep(feed_block(&hashes, 11, crate::nitro::SEQUENCER));
+        signed.keep(feed_block(hashes[10], 11, crate::nitro::SEQUENCER));
         let mut events = signed_lane_for(
-            transactions_request(),
+            trusting(transactions_request()),
             Duration::from_millis(10),
             pool,
             &signed,
@@ -1973,9 +2048,9 @@ mod tests {
         let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
         let signed = crate::feed::SignedHashes::default();
         signed.insert(8, hashes[7]);
-        signed.keep(feed_block(&hashes, 9, crate::nitro::SEQUENCER));
+        signed.keep(feed_block(hashes[8], 9, crate::nitro::SEQUENCER));
         let mut events = signed_lane_for(
-            transactions_request(),
+            trusting(transactions_request()),
             Duration::from_secs(5),
             pool,
             &signed,
@@ -1995,7 +2070,7 @@ mod tests {
                 .await
                 .is_err()
         );
-        signed.keep(feed_block(&hashes, 10, crate::nitro::SEQUENCER));
+        signed.keep(feed_block(hashes[9], 10, crate::nitro::SEQUENCER));
         let signed_at = std::time::Instant::now();
         assert_eq!(
             tokio::time::timeout(within, next_block(&mut events))
@@ -2011,13 +2086,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn under_the_feed_a_lane_needing_more_than_declared_transactions_fetches_every_block() {
-        let mut headers = transactions_request();
-        headers.required = headers.required.with(Capability::Header);
-        let mut complete = transactions_request();
-        complete.allow_filtered = false;
-        for request in [headers, complete] {
-            let (served, hashes) = header_chain(9, 0);
+    async fn under_the_feed_a_lane_checks_each_block_it_makes_against_the_header_alone() {
+        let mut block_summary = live_request();
+        block_summary.required = CapabilitySet::of(Capability::Header).with(Capability::Body);
+        block_summary.allow_filtered = true;
+        let mut whole = transactions_request();
+        whole.allow_filtered = false;
+        for request in [transactions_request(), block_summary, whole] {
+            // The endpoint names transactions by hash, so it serves headers
+            // alone.
+            let (served, hashes) = sequenced_chain(10, |_| true);
             let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let pool = RpcQuorum::new(
                 vec![counted(served, Duration::ZERO, Arc::clone(&requests)).await],
@@ -2025,18 +2103,34 @@ mod tests {
                 1_000,
             )
             .unwrap();
+            let asked = || requests.load(std::sync::atomic::Ordering::Relaxed);
             let signed = crate::feed::SignedHashes::default();
             signed.insert(8, hashes[7]);
-            signed.keep(feed_block(&hashes, 9, crate::nitro::SEQUENCER));
-            let mut events =
-                signed_lane_for(request, Duration::from_millis(10), pool, &signed, &hashes).await;
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(30), next_block(&mut events))
-                    .await
-                    .unwrap(),
-                9
-            );
-            assert!(requests.load(std::sync::atomic::Ordering::Relaxed) > 0);
+            signed.keep(feed_block(hashes[8], 9, crate::nitro::SEQUENCER));
+            let mut events = signed_lane_for(
+                request.clone(),
+                Duration::from_millis(10),
+                pool,
+                &signed,
+                &hashes,
+            )
+            .await;
+            let within = Duration::from_secs(30);
+            let first = tokio::time::timeout(within, next_frame(&mut events))
+                .await
+                .unwrap();
+            let before = asked();
+            signed.keep(feed_block(hashes[9], 10, crate::nitro::SEQUENCER));
+            let second = tokio::time::timeout(within, next_frame(&mut events))
+                .await
+                .unwrap();
+            // One request for its header.
+            assert_eq!(asked(), before + 1);
+            for frame in [first, second] {
+                assert!(made(&frame), "{frame:?}");
+                assert!(frame.header.is_complete());
+                assert!(frame.capabilities().satisfies(request.required, false));
+            }
         }
     }
 
@@ -2078,10 +2172,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn under_the_feed_a_header_naming_other_transactions_stops_the_lane_making_blocks() {
-        // The endpoints' blocks hold no transactions, while each block made
+    async fn under_the_feed_a_made_block_its_header_contradicts_comes_whole_at_once() {
+        // Block 11 holds no transactions at the endpoint, unlike the block
+        // made from its message.
+        let (served, hashes) = sequenced_chain(12, |number| number != 11);
+        let pool = RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+        let signed = crate::feed::SignedHashes::default();
+        signed.insert(8, hashes[7]);
+        for (number, hash) in (9..=10).zip(&hashes[8..]) {
+            signed.keep(feed_block(*hash, number, crate::nitro::SEQUENCER));
+        }
+        let mut events = signed_lane_for(
+            transactions_request(),
+            Duration::from_secs(5),
+            pool,
+            &signed,
+            &hashes,
+        )
+        .await;
+        let within = Duration::from_secs(30);
+        let next = async |events: &mut leani_source_api::ChainEventStream, within| {
+            let frame = tokio::time::timeout(within, next_frame(events))
+                .await
+                .unwrap();
+            (frame.block.number.0, made(&frame), frame)
+        };
+        for number in 9..=10 {
+            let (delivered, from_feed, _) = next(&mut events, within).await;
+            assert_eq!((delivered, from_feed), (number, true));
+        }
+        // Signed once the lane caught up: well within its five-second poll
+        // interval.
+        signed.keep(feed_block(hashes[10], 11, crate::nitro::SEQUENCER));
+        let (number, from_feed, frame) = next(&mut events, Duration::from_secs(2)).await;
+        assert_eq!((number, from_feed), (11, false));
+        assert_eq!(frame.transactions.as_complete().map(Vec::len), Some(0));
+        signed.keep(feed_block(hashes[11], 12, crate::nitro::SEQUENCER));
+        let (number, from_feed, _) = next(&mut events, within).await;
+        assert_eq!((number, from_feed), (12, true));
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_a_lane_stops_making_blocks_their_headers_keep_contradicting() {
+        // The endpoint's blocks hold no transactions, while each block made
         // from the feed holds ArbOS's start transaction.
-        let (served, hashes) = header_chain(45, 0);
+        let (served, hashes) = header_chain(68, 0);
         let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let pool = RpcQuorum::new(
             vec![counted(served, Duration::ZERO, Arc::clone(&requests)).await],
@@ -2091,6 +2226,9 @@ mod tests {
         .unwrap();
         let signed = crate::feed::SignedHashes::default();
         signed.insert(8, hashes[7]);
+        for (number, hash) in (9..=68).zip(&hashes[8..]) {
+            signed.keep(feed_block(*hash, number, crate::nitro::SEQUENCER));
+        }
         let mut events = signed_lane_for(
             transactions_request(),
             Duration::from_millis(10),
@@ -2099,38 +2237,52 @@ mod tests {
             &hashes,
         )
         .await;
-        // Each block is signed once the lane delivered the one before, as
-        // at the head.
-        let mut made = Vec::new();
-        for number in 9..=45 {
-            signed.keep(feed_block(&hashes, number, crate::nitro::SEQUENCER));
-            loop {
-                let event = tokio::time::timeout(Duration::from_secs(30), events.next())
+        for number in 9..=68 {
+            let frame = tokio::time::timeout(Duration::from_secs(30), next_frame(&mut events))
+                .await
+                .unwrap();
+            assert_eq!((frame.block.number.0, made(&frame)), (number, false));
+        }
+        // Soon only the blocks and their receipts, not also the headers of
+        // the blocks made after each.
+        let asked = requests.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(asked < 4 * 60, "{asked} requests for 60 blocks");
+    }
+
+    #[tokio::test]
+    async fn under_the_feed_a_lane_far_behind_makes_the_blocks_whose_messages_the_feed_kept() {
+        // Trusting the feed, the lane needs no endpoint, not even one that
+        // serves nothing past its start; checking, it asks for headers.
+        let (mut lagging, hashes) = header_chain(60, 0);
+        lagging.truncate(8);
+        let (headers, checked_hashes) = sequenced_chain(60, |_| true);
+        for (request, served, hashes, checked) in [
+            (trusting(transactions_request()), lagging, hashes, false),
+            (transactions_request(), headers, checked_hashes, true),
+        ] {
+            let pool =
+                RpcQuorum::new(vec![serving(served, Duration::ZERO).await], 1, 1_000).unwrap();
+            let signed = crate::feed::SignedHashes::default();
+            signed.insert(8, hashes[7]);
+            for (number, hash) in (9..=60).zip(&hashes[8..]) {
+                signed.keep(feed_block(*hash, number, crate::nitro::SEQUENCER));
+            }
+            let mut events =
+                signed_lane_for(request, Duration::from_millis(10), pool, &signed, &hashes).await;
+            for number in 9..=60 {
+                let frame = tokio::time::timeout(Duration::from_secs(30), next_frame(&mut events))
                     .await
-                    .unwrap()
-                    .expect("open stream")
-                    .expect("an event, not an error");
-                if let leani_source_api::ChainEvent::Block(frame) = event {
-                    made.push((
+                    .unwrap();
+                assert_eq!(
+                    (
                         frame.block.number.0,
-                        frame.provenance[0].source_kind == leani_primitives::SourceKind::JsonRpc,
-                    ));
-                    break;
-                }
+                        made(&frame),
+                        frame.header.is_complete()
+                    ),
+                    (number, true, checked)
+                );
             }
         }
-        // Block 9 is checked once the lane is 32 blocks past it; from then on
-        // every block comes from the endpoints.
-        assert_eq!(made.first(), Some(&(9, false)));
-        let fetched = made
-            .iter()
-            .position(|(_, fetched)| *fetched)
-            .expect("a fetched block");
-        assert!(
-            made[fetched..].iter().all(|(_, fetched)| *fetched),
-            "{made:?}"
-        );
-        assert!(made[fetched].0 >= 41, "{made:?}");
     }
 
     #[tokio::test]
