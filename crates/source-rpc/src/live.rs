@@ -166,6 +166,7 @@ impl LiveSource for RpcLiveSource {
                 && SEQUENCED.contains_all(request.required.with_derivable()),
             unchecked: None,
             next_check: 0,
+            signings: self.signed.as_ref().map(SignedHashes::changes),
             source: self.clone(),
             recent,
             next,
@@ -193,6 +194,8 @@ struct LiveState {
     unchecked: Option<(u64, B256, tokio::time::Instant)>,
     /// The lowest block the next check takes.
     next_check: u64,
+    /// Changes each time the sequencer signs a block.
+    signings: Option<tokio::sync::watch::Receiver<()>>,
     source: RpcLiveSource,
     recent: VecDeque<BlockRef>,
     next: u64,
@@ -617,11 +620,18 @@ async fn next_event(mut state: LiveState) -> Option<(Result<ChainEvent, SourceEr
             state.terminal = true;
             return Some((Err(SourceError::Cancelled), state));
         }
+        if let Some(signings) = &mut state.signings {
+            signings.borrow_and_update();
+        }
         let cancellation = state.cancellation.clone();
         let advanced = tokio::select! {
             () = cancellation.cancelled() => continue,
             advanced = state.advance() => advanced,
         };
+        // A lane making blocks from the feed that reached the newest signed
+        // block makes the next one as soon as it is signed; one waiting on
+        // an endpoint keeps to the poll interval.
+        let on_signing = advanced.is_ok() && state.sequenced && state.next > state.head;
         // What a round fetched goes out at once; only a round with nothing
         // new waits before the next, so a moving head is followed round
         // after round.
@@ -638,9 +648,19 @@ async fn next_event(mut state: LiveState) -> Option<(Result<ChainEvent, SourceEr
             }
         };
         if state.pending.is_empty() {
+            let signings = state.signings.as_mut().filter(|_| on_signing);
+            let signed = async move {
+                if let Some(signings) = signings
+                    && signings.changed().await.is_ok()
+                {
+                    return;
+                }
+                std::future::pending::<()>().await;
+            };
             tokio::select! {
                 () = state.cancellation.cancelled() => {}
                 () = tokio::time::sleep(wait) => {}
+                () = signed => {}
             }
         }
     }
