@@ -5,6 +5,7 @@ work_directory=$(mktemp -d)
 trap 'rm -rf "$work_directory"' EXIT HUP INT TERM
 checksums="$work_directory/SHA256SUMS"
 formula="$work_directory/leani.rb"
+rc_formula="$work_directory/leani-rc.rb"
 sha=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 
 for target in \
@@ -21,20 +22,34 @@ render() {
 }
 
 render "$checksums" "$formula"
+render "$checksums" "$rc_formula"
 
-if grep -q '@[A-Z_]*@' "$formula"; then
-  echo "rendered formula contains an unresolved placeholder" >&2
+for rendered in "$formula" "$rc_formula"; do
+  if grep -q '@[A-Z_]*@' "$rendered"; then
+    echo "rendered formula contains an unresolved placeholder" >&2
+    exit 1
+  fi
+  if [ "$(grep -c "sha256 \"$sha\"" "$rendered")" -ne 4 ]; then
+    echo "rendered formula must carry all four archive checksums" >&2
+    exit 1
+  fi
+  ruby -c "$rendered"
+done
+# Homebrew loads a formula by the class its file name spells, and both
+# formulae install `leani`, so each names the other as a conflict.
+if ! grep -q '^class Leani < Formula$' "$formula" || ! grep -q 'conflicts_with "leani-rc",' "$formula"; then
+  echo "leani.rb must define Leani and conflict with leani-rc" >&2
   exit 1
 fi
-if [ "$(grep -c "sha256 \"$sha\"" "$formula")" -ne 4 ]; then
-  echo "rendered formula must carry all four archive checksums" >&2
+if ! grep -q '^class LeaniRc < Formula$' "$rc_formula" || ! grep -q 'conflicts_with "leani",' "$rc_formula"; then
+  echo "leani-rc.rb must define LeaniRc and conflict with leani" >&2
   exit 1
 fi
-ruby -c "$formula"
 
 # A missing, duplicated, or malformed checksum must fail before a formula exists.
+mkdir "$work_directory/rejected"
 reject_checksums() {
-  rejected="$work_directory/rejected.rb"
+  rejected="$work_directory/rejected/leani.rb"
   if render "$work_directory/$2" "$rejected" 2>/dev/null; then
     echo "Homebrew renderer accepted $1" >&2
     exit 1

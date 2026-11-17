@@ -185,18 +185,20 @@ jobs:
           cd release-assets
           for checksum in leani-*.sha256; do sha256sum --check "$checksum"; done
           awk '{ print $1 "  " $2 }' leani-*.sha256 | sort -k2 > SHA256SUMS
-      - name: Render Homebrew formula
+      - name: Render Homebrew formulae
         run: |
-          scripts/render-homebrew-formula.sh \
-            "$RELEASE_VERSION" \
-            "${{ github.repository }}" \
-            release-assets/SHA256SUMS \
-            release-assets/leani.rb
+          for formula in leani leani-rc; do
+            scripts/render-homebrew-formula.sh \
+              "$RELEASE_VERSION" \
+              "${{ github.repository }}" \
+              release-assets/SHA256SUMS \
+              "release-assets/$formula.rb"
+          done
       - name: Inspect public metadata
         run: |
           ruby scripts/check-artifact-privacy.rb \
             release-assets/*.cdx.json release-assets/THIRD_PARTY_LICENSES.txt \
-            release-assets/leani.rb release-assets/SHA256SUMS
+            release-assets/leani.rb release-assets/leani-rc.rb release-assets/SHA256SUMS
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: leani-release-candidate-${{ inputs.version }}

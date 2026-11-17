@@ -2,7 +2,7 @@
 set -eu
 
 if [ "$#" -ne 4 ]; then
-  echo "usage: $0 <v-version> <owner/repository> <SHA256SUMS> <output.rb>" >&2
+  echo "usage: $0 <v-version> <owner/repository> <SHA256SUMS> <leani.rb|leani-rc.rb>" >&2
   exit 2
 fi
 
@@ -19,6 +19,14 @@ esac
 case "$repository" in
   */*) ;;
   *) echo "repository must be owner/name" >&2; exit 2 ;;
+esac
+
+# leani follows stable releases and leani-rc every release; Homebrew loads
+# each by the class its file name spells.
+case "$(basename "$output")" in
+  leani.rb) class=Leani conflict=leani-rc ;;
+  leani-rc.rb) class=LeaniRc conflict=leani ;;
+  *) echo "output must be named leani.rb or leani-rc.rb" >&2; exit 2 ;;
 esac
 
 checksum() {
@@ -52,6 +60,8 @@ macos_arm_sha=$(checksum "$macos_arm")
 require_sha256 "$macos_arm" "$macos_arm_sha"
 
 sed \
+  -e "s|@CLASS@|$class|g" \
+  -e "s|@CONFLICT@|$conflict|g" \
   -e "s|@TAG@|$version|g" \
   -e "s|@REPOSITORY@|$repository|g" \
   -e "s|@LINUX_X86_SHA@|$linux_x86_sha|g" \

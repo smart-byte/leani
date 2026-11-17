@@ -22,6 +22,7 @@ from lib.release_common import (CRATES, SDK, GitHub, ReleaseError, command, file
                                 version_order)
 
 TAP = "smart-byte/homebrew-tap"
+FORMULAE = ("leani", "leani-rc")
 WORKFLOWS = {"ci": "ci.yml", "security": "security.yml", "site": "site.yml", "container": "container.yml",
              "binaries": "release.yml", "crates": "crates-release.yml", "sdk": "sdk-release.yml"}
 TARGETS = ("x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "aarch64-apple-darwin")
@@ -268,8 +269,9 @@ class Coordinator:
                 listed = verify_sums(destination)
                 if stage == "binaries":
                     archives = {f"leani-v{plan['version']}-{target}.tar.gz" for target in TARGETS}
-                    if not archives <= hashes.keys() or not {"leani.cdx.json", "THIRD_PARTY_LICENSES.txt", "leani.rb"} <= hashes.keys():
-                        raise ReleaseError("binary candidate is missing archives, notices, formula, or node SBOM")
+                    required = {"leani.cdx.json", "THIRD_PARTY_LICENSES.txt", *(f"{name}.rb" for name in FORMULAE)}
+                    if not archives <= hashes.keys() or not required <= hashes.keys():
+                        raise ReleaseError("binary candidate is missing archives, notices, formulae, or node SBOM")
                 elif stage == "container":
                     if listed != {f"{name}.tar.gz", f"{name}.cdx.json", "image.id"}:
                         raise ReleaseError("container candidate inventory is incomplete")
@@ -447,48 +449,55 @@ class Coordinator:
                                        "check the Cloudflare Pages deployment and its Git connection")
                 self.report(f"site: {SITE_URL} serves v{release}")
             # Last, so a tap problem never holds back the site. The archives are
-            # public now, and the verified formula points at them.
-            self.homebrew_pr(release, (root / "binaries" / f"leani-release-candidate-v{release}" / "leani.rb").read_text())
+            # public now, and the verified formulae point at them.
+            candidate = root / "binaries" / f"leani-release-candidate-v{release}"
+            self.homebrew_pr(release, {name: (candidate / f"{name}.rb").read_text() for name in FORMULAE})
         self.report(f"Release v{release} is fully published")
 
     def site_follows(self, release):
-        # The tap's rule: the site documents the newest prerelease only until the
-        # first stable release, so docs never run ahead of what installs give users.
+        # The site documents the newest prerelease only until the first stable
+        # release; after that, showing a prerelease to everyone is a maintainer decision.
         stable = "-rc." in release and self.gh.api("releases/latest", missing=True)
         if stable:
             self.report(f"site: {SITE_URL} follows stable {stable['tag_name']}; dispatch site-promote.yml from v{release} to show it")
         return not stable
 
-    def homebrew_pr(self, release, formula):
+    def homebrew_pr(self, release, formulae):
         # The tap stays a reviewed PR, so its install tests run before users get it.
-        # Until the first stable release the formula follows the newest prerelease;
-        # after that, shipping a prerelease through the tap is a maintainer decision.
-        current = base64.b64decode(self.tap.api("contents/Formula/leani.rb")["content"]).decode()
-        match = re.search(r"/releases/download/v([^/]+)/", current)
-        if not match:
-            raise ReleaseError("the tap's Formula/leani.rb names no release archive")
-        tapped = match[1]
-        if version_order(tapped) >= version_order(release):
-            self.report(f"homebrew: tap already serves v{tapped}")
-            return
-        if "-rc." in release and "-rc." not in tapped:
-            self.report(f"homebrew: tap follows stable v{tapped}; open a tap PR by hand to ship v{release} through it")
+        # leani-rc follows every release. leani follows the newest prerelease only
+        # until the first stable release, and stable releases alone after it.
+        moved = {}
+        for name, formula in formulae.items():
+            current = self.tap.api(f"contents/Formula/{name}.rb", missing=True)
+            if current:
+                match = re.search(r"/releases/download/v([^/]+)/", base64.b64decode(current["content"]).decode())
+                if not match:
+                    raise ReleaseError(f"the tap's Formula/{name}.rb names no release archive")
+                tapped = match[1]
+                if version_order(tapped) >= version_order(release):
+                    continue
+                if name == "leani" and "-rc." in release and "-rc." not in tapped:
+                    continue
+            moved[name] = formula
+        if not moved:
+            self.report(f"homebrew: the tap already serves v{release} or later")
             return
         branch = f"leani-v{release}"
-        title = f"feat(leani): publish v{release} formula"
+        title = f"feat({','.join(moved)}): publish v{release}"
         try:
             if not self.tap.api(f"git/ref/heads/{branch}", missing=True):
                 main = self.tap.api("commits/main")
-                tree = self.tap.api("git/trees", {"base_tree": main["commit"]["tree"]["sha"],
-                                                  "tree": [{"path": "Formula/leani.rb", "mode": "100644", "type": "blob", "content": formula}]})
+                tree = self.tap.api("git/trees", {"base_tree": main["commit"]["tree"]["sha"], "tree": [
+                    {"path": f"Formula/{name}.rb", "mode": "100644", "type": "blob", "content": formula} for name, formula in moved.items()]})
                 commit = self.tap.api("git/commits", {"message": title, "tree": tree["sha"], "parents": [main["sha"]]})
                 self.tap.api("git/refs", {"ref": f"refs/heads/{branch}", "sha": commit["sha"]})
             pulls = self.tap.api(f"pulls?state=open&head={self.tap.repository.split('/')[0]}:{branch}&base=main")
             pull = pulls[0] if pulls else self.tap.api("pulls", {
                 "title": title, "head": branch, "base": "main",
-                "body": (f"Moves the formula to [Leani v{release}](https://github.com/{self.gh.repository}/releases/tag/v{release}). "
-                         "The file is the release's verified `leani.rb` candidate asset, opened by Coordinate release.\n\n"
-                         "The test workflow style-checks, audits, installs, and tests the formula on Linux and macOS for both architectures.")})
+                "body": (f"Moves {' and '.join(f'`{name}`' for name in moved)} to "
+                         f"[Leani v{release}](https://github.com/{self.gh.repository}/releases/tag/v{release}). "
+                         "Each file is the release's verified candidate asset of the same name, opened by Coordinate release.\n\n"
+                         "The test workflow style-checks, audits, installs, and tests each formula on Linux and macOS for both architectures.")})
         except ReleaseError as error:
             raise ReleaseError(f"{error}; RELEASE_CONTROL_TOKEN needs Contents and Pull requests write on {self.tap.repository} "
                                "(docs/maintainers/releasing.md); rerun to open the tap PR") from error
