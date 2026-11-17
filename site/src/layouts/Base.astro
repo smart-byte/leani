@@ -5,6 +5,7 @@ import '@fontsource-variable/inter';
 import '../styles/global.css';
 import { SOCIAL_IMAGE } from '../lib/social';
 import { umamiScript } from '../lib/analytics';
+import ReleaseCandidateBanner from '../components/ReleaseCandidateBanner.astro';
 
 interface Props { title: string; description: string }
 const { title, description } = Astro.props;
@@ -37,6 +38,7 @@ const socialImage = new URL(SOCIAL_IMAGE.path, Astro.site);
   <body>
     <a class="skip-link" href="#main">Skip to content</a>
     <slot name="before-main" />
+    <ReleaseCandidateBanner />
     <main id="main">
       <slot />
     </main>

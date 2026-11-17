@@ -82,6 +82,20 @@ describe('documentation build metadata', () => {
     expect(metadata({ LEANI_SITE_MODE: 'production' })).toMatchObject({ docsRef: `v${version}` });
   });
 
+  test('only a production build of a prerelease is a release candidate', async () => {
+    tagHead(`v${version}`);
+    expect(metadata()).toMatchObject({ mode: 'production', releaseCandidate: true });
+    // A preview names its ref in the preview banner instead, even on a release tag.
+    expect(metadata({ LEANI_SITE_MODE: 'preview' })).toMatchObject({ docsRef: `v${version}`, releaseCandidate: false });
+    tagHead();
+    await writeFile(join(root, 'Cargo.toml'), '[workspace.package]\nversion = "1.2.3"\n', 'utf8');
+    try {
+      expect(metadata({ LEANI_SITE_MODE: 'production' })).toMatchObject({ docsRef: 'v1.2.3', releaseCandidate: false });
+    } finally {
+      await writeFile(join(root, 'Cargo.toml'), `[workspace.package]\nversion = "${version}"\n`, 'utf8');
+    }
+  });
+
   test('previews derive the ref from their branch', () => {
     tagHead();
     const branch = 'dependabot/github_actions/actions/checkout-5.1.0';

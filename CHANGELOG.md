@@ -12,6 +12,9 @@ record, and documented RPC contracts.
   candidates included, while `smart-byte/tap/leani` keeps installing the latest
   stable release. Both install `leani`, so the formulae conflict. The release
   coordinator moves each formula forward in its tap PR.
+- A release candidate's site says on every page that it shows a release
+  candidate and links the stable release, and its install commands install the
+  release candidate through `leani-rc`.
 
 ## [0.2.0-rc.1] - 2026-11-16
 

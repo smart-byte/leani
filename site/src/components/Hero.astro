@@ -2,6 +2,7 @@
 import ChainList from './ChainList.astro';
 import EngineWorld from './EngineWorld.astro';
 import { HOMEBREW_INSTALL, INSTALL_URL, LIMITATIONS_URL } from '../config';
+import buildMetadata from '../generated/build-metadata.json';
 import { ROLLUP_COUNT } from '../lib/chains';
 
 // Measured or registry-backed facts; the storage figure is the externalized
@@ -20,7 +21,7 @@ const commands = [HOMEBREW_INSTALL, 'leani subscribe blocks'];
 <section class="hero">
   <div class="wrap body">
     <div class="intro">
-      <a class="eyebrow mono" href={LIMITATIONS_URL}>Stable release</a>
+      <a class="eyebrow mono" href={LIMITATIONS_URL}>{buildMetadata.releaseCandidate ? 'Release candidate' : 'Stable release'}</a>
       <h1>Ethereum data without the RPC bill.</h1>
       <p class="sub">
         An indexing node you run next to your app. It backfills history from
