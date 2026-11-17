@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.2.0-rc.2] - 2026-11-17
+
 ### Added
 
 - `brew install smart-byte/tap/leani-rc` installs the newest release, release

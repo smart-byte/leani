@@ -40,7 +40,7 @@ exclude = ["examples/wasm-processors"]
 default-members = ["crates/node"]
 
 [workspace.package]
-version = "0.2.0-rc.1"
+version = "0.2.0-rc.2"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
