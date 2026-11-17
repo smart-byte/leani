@@ -209,7 +209,7 @@ Run `Prepare release` with the version matching the workspace manifest and
 `publish=false`. It executes the offline fixture on native Linux and macOS
 runners for both architectures, then uploads a release candidate containing
 the archives, checksums, portable SBOM files, the committed
-`THIRD_PARTY_LICENSES.txt` dependency notices, and Homebrew formula. The
+`THIRD_PARTY_LICENSES.txt` dependency notices, and both Homebrew formulae. The
 notices file is regenerated from `Cargo.lock` and must match the commit, so
 an outdated copy fails the candidate. Build paths are remapped and the
 extracted binaries are checked for private content before their fixture tests
@@ -276,18 +276,18 @@ anonymous pulls for both architectures before announcing the release.
 
 ## Homebrew
 
-After the binary release is public, the coordinator opens a PR on the shared
-`smart-byte/homebrew-tap` repository that copies the verified candidate's
-`leani.rb` to `Formula/leani.rb` on branch `leani-v<version>`. The tap's tests
-install and test the formula on Linux and macOS; merge the PR once they pass.
-A rerun reuses the branch and its open PR.
+The tap serves two formulae that both install `leani`, so each names the other
+as a conflict. `leani` follows stable releases, and `leani-rc` follows every
+release, release candidates included. After the binary release is public, the
+coordinator opens a PR on the shared `smart-byte/homebrew-tap` repository, on
+branch `leani-v<version>`, that copies the verified candidate's `leani.rb` and
+`leani-rc.rb` to `Formula/` for each formula the release moves forward. The
+tap's tests install and test both formulae on Linux and macOS; merge the PR
+once they pass. A rerun reuses the branch and its open PR.
 
-Until the first stable release, the formula follows the newest prerelease. Once
-the tap serves a stable release, the coordinator opens no PR for a later
-prerelease: shipping one through the tap requires an explicit decision and a
-hand-made PR with the same file. It never moves the formula to an older
-version. Rendering the formula fails if `SHA256SUMS` lacks an archive or holds a
-malformed checksum.
+Until the first stable release, `leani` follows the newest prerelease too. The
+coordinator never moves a formula to an older version. Rendering a formula
+fails if `SHA256SUMS` lacks an archive or holds a malformed checksum.
 
 ## Site promotion
 
@@ -305,10 +305,10 @@ The release and publish actions promote the site through `site-promote.yml`,
 then wait up to 20 minutes until leani.dev serves the release: production
 documentation edit links name the release tag. A run that times out leaves
 `site-production` promoted; check the Pages deployment, then dispatch the same
-action again. Like the tap, the site follows the newest prerelease only until
-the first stable release. After that, the coordinator leaves the site on the
-stable release when it publishes a prerelease; to show one anyway, promote it
-by hand.
+action again. Like the `leani` formula, the site follows the newest prerelease
+only until the first stable release. After that, the coordinator leaves the
+site on the stable release when it publishes a prerelease; to show one anyway,
+promote it by hand.
 
 To promote by hand, dispatch `site-promote.yml` from the release tag. Its first
 job checks that the release is published and builds the production site with

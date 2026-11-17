@@ -1,9 +1,10 @@
 # Homebrew release preparation
 
-The `Prepare release` workflow produces `leani.rb` from the exact checksums of
-the four release archives. After the binary release is public, Coordinate
-release opens a PR that copies it to `Formula/leani.rb` in
-`smart-byte/homebrew-tap`; a maintainer merges it once the tap's tests pass.
+The `Prepare release` workflow renders `leani.rb` and `leani-rc.rb` from this
+template and the exact checksums of the four release archives. After the
+binary release is public, Coordinate release opens a PR that copies them to
+`Formula/` in `smart-byte/homebrew-tap`; a maintainer merges it once the tap's
+tests pass.
 See [Homebrew](../../docs/maintainers/releasing.md#homebrew) for the policy.
 
 The coordinator writes to the tap with `RELEASE_CONTROL_TOKEN`, which must

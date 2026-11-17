@@ -1,4 +1,4 @@
-class Leani < Formula
+class @CLASS@ < Formula
   desc "Lean, state-minimized Ethereum indexing node"
   homepage "https://github.com/@REPOSITORY@"
   license "MIT"
@@ -22,6 +22,8 @@ class Leani < Formula
       sha256 "@LINUX_X86_SHA@"
     end
   end
+
+  conflicts_with "@CONFLICT@", because: "both install a `leani` binary"
 
   def install
     bin.install "leani"

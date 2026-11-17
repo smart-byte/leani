@@ -6,6 +6,13 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Added
+
+- `brew install smart-byte/tap/leani-rc` installs the newest release, release
+  candidates included, while `smart-byte/tap/leani` keeps installing the latest
+  stable release. Both install `leani`, so the formulae conflict. The release
+  coordinator moves each formula forward in its tap PR.
+
 ## [0.2.0-rc.1] - 2026-11-16
 
 ### Added

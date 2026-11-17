@@ -56,6 +56,7 @@ Prerelease versions are marked as GitHub prereleases and do not replace the
 latest stable release. Until the first stable release, each SDK prerelease
 takes npm's `latest` tag, so an unversioned install resolves to the newest
 prerelease. From the first stable release on, stable versions take `latest`
-and prereleases take `next`. The Homebrew formula follows the same rule: the
-release coordinator opens a reviewed tap PR once a release's archives are
-public.
+and prereleases take `next`. Homebrew's `smart-byte/tap/leani` follows the
+same rule as `latest`, and `smart-byte/tap/leani-rc` follows every release,
+release candidates included. The release coordinator opens a reviewed tap PR
+once a release's archives are public.

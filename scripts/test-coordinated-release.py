@@ -174,7 +174,7 @@ class Publication(unittest.TestCase):
         self.site_commit = None
         self.cloudflare_builds = True
         self.stable_release = None
-        self.tap_version = "0.0.1-rc.1"
+        self.tap_versions = {"leani": "0.0.1-rc.1", "leani-rc": "0.0.1-rc.1"}
         self.tap_writes = []
         self.tap_denied = False
         self.files = {}
@@ -192,7 +192,8 @@ class Publication(unittest.TestCase):
 
         binary_name = f"leani-release-candidate-v{self.version}"
         binary = {f"leani-v{self.version}-{target}.tar.gz": target.encode() for target in release.TARGETS}
-        binary.update({"leani.cdx.json": b'{"bomFormat":"CycloneDX"}', "THIRD_PARTY_LICENSES.txt": b"MIT", "leani.rb": b"formula"})
+        binary.update({"leani.cdx.json": b'{"bomFormat":"CycloneDX"}', "THIRD_PARTY_LICENSES.txt": b"MIT", "leani.rb": b"formula",
+                       "leani-rc.rb": b"rc formula"})
         self.binary = artifact("binaries", binary_name, binary)
         self.crates = artifact("crates", "leani-rust-library-candidate", {f"{name}-{self.version}.crate": name.encode() for name in CRATES})
         buffer = io.BytesIO()
@@ -292,8 +293,13 @@ class Publication(unittest.TestCase):
         raise AssertionError(f"unexpected GitHub API request: {path}")
 
     def tap_api(self, path, data=None, missing=False):
-        if path == "contents/Formula/leani.rb":
-            formula = f'url "https://github.com/example/leani/releases/download/v{self.tap_version}/leani.tar.gz"'
+        if path.startswith("contents/Formula/"):
+            version = self.tap_versions[path.removeprefix("contents/Formula/").removesuffix(".rb")]
+            if version is None:
+                if missing:
+                    return None
+                raise ReleaseError(f"GitHub {path}: HTTP 404")
+            formula = f'url "https://github.com/example/leani/releases/download/v{version}/leani.tar.gz"'
             return {"content": release.base64.b64encode(formula.encode()).decode()}
         if path.startswith("git/ref/heads/"):
             return None
@@ -355,20 +361,28 @@ class Publication(unittest.TestCase):
                          ["release.yml", "crates-release.yml", "sdk-release.yml", "container.yml", "site-promote.yml"])
         self.assertEqual(json.loads((self.root / "release-plan.json").read_text())["state"], "verified")
         self.assertEqual(coordinator.messages[-1], f"Release v{self.version} is fully published")
-        # The tap PR carries the verified candidate formula.
+        # The tap PR carries the verified candidate formulae.
         self.assertEqual([path for path, _ in self.tap_writes], ["git/trees", "git/commits", "git/refs", "pulls"])
-        self.assertEqual(self.tap_writes[0][1]["tree"][0]["content"], "formula")
+        self.assertEqual([(item["path"], item["content"]) for item in self.tap_writes[0][1]["tree"]],
+                         [("Formula/leani.rb", "formula"), ("Formula/leani-rc.rb", "rc formula")])
         self.assertEqual(self.tap_writes[3][1]["head"], f"leani-v{self.version}")
 
-    def test_tap_keeps_a_stable_formula_and_never_downgrades(self):
-        with self.services() as coordinator:
-            self.tap_version = "0.1.0"
-            coordinator.homebrew_pr("0.2.0-rc.1", "formula")
-            self.tap_version = "0.2.0-rc.2"
-            coordinator.homebrew_pr("0.2.0-rc.1", "formula")
-        self.assertEqual(self.tap_writes, [])
-        self.assertIn("open a tap PR by hand", coordinator.messages[0])
-        self.assertEqual(coordinator.messages[1], "homebrew: tap already serves v0.2.0-rc.2")
+    def test_tap_moves_leani_rc_with_every_release_and_leani_with_stable_ones(self):
+        cases = [
+            # tapped leani, tapped leani-rc (None: not in the tap yet), release, formulae the PR moves
+            ("0.1.0", None, "0.2.0-rc.1", ["leani-rc"]),
+            ("0.1.0", "0.2.0-rc.1", "0.2.0-rc.2", ["leani-rc"]),
+            ("0.1.0", "0.2.0-rc.2", "0.2.0", ["leani", "leani-rc"]),
+            ("0.1.0", "0.2.0-rc.2", "0.2.0-rc.1", []),
+        ]
+        for leani, leani_rc, version, moved in cases:
+            with self.subTest(version=version), self.services() as coordinator:
+                self.tap_versions = {"leani": leani, "leani-rc": leani_rc}
+                self.tap_writes = []
+                coordinator.homebrew_pr(version, {"leani": "formula", "leani-rc": "rc formula"})
+                trees = [data["tree"] for path, data in self.tap_writes if path == "git/trees"]
+                self.assertEqual([item["path"] for tree in trees for item in tree], [f"Formula/{name}.rb" for name in moved])
+        self.assertEqual(coordinator.messages, ["homebrew: the tap already serves v0.2.0-rc.1 or later"])
 
     def test_site_keeps_a_stable_release(self):
         with self.services() as coordinator:
