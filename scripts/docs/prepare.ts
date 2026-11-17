@@ -9,6 +9,8 @@ export interface DocsBuildMetadata {
   mode: 'preview' | 'production';
   docsRef: string;
   sourceCommit: string;
+  /** A production build of a prerelease: every page says so, and it installs through `leani-rc`. */
+  releaseCandidate: boolean;
 }
 
 const repositoryRoot = resolve(import.meta.dir, '../..');
@@ -72,7 +74,12 @@ export function docsBuildMetadata(
     throw new Error(`invalid documentation ref: ${docsRef}`);
   }
 
-  return { mode: mode as DocsBuildMetadata['mode'], docsRef, sourceCommit };
+  return {
+    mode: mode as DocsBuildMetadata['mode'],
+    docsRef,
+    sourceCommit,
+    releaseCandidate: mode === 'production' && docsRef.includes('-'),
+  };
 }
 
 export async function prepareDocs(): Promise<void> {

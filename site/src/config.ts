@@ -9,9 +9,15 @@ export const INSTALL_URL = '/docs/getting-started/install/';
 export const EVIDENCE_URL = '/docs/contributing/manual-verification/#real-source-delivery-benchmark';
 export const BLOBS_MONEY_URL = 'https://blobs.money';
 export const TICKER_URL = 'https://ticker.leani.dev';
+// GitHub resolves it to the newest release that is not a prerelease.
+export const STABLE_RELEASE_URL = `${GITHUB_URL}/releases/latest`;
 
-// The published release's install command, as docs/getting-started/install.mdx documents it.
-export const HOMEBREW_INSTALL = 'brew install smart-byte/tap/leani';
+// The install commands docs/getting-started/install.mdx documents. The site
+// offers the one for the release it documents: leani-rc follows every release.
+export const HOMEBREW_STABLE_INSTALL = 'brew install smart-byte/tap/leani';
+export const HOMEBREW_INSTALL = buildMetadata.releaseCandidate
+  ? 'brew install smart-byte/tap/leani-rc'
+  : HOMEBREW_STABLE_INSTALL;
 // The agent skill's install command, as docs/guides/ai-agents.md documents it.
 export const AGENT_SKILL_INSTALL = 'npx skills add smart-byte/leani -g';
 export const AI_AGENTS_URL = '/docs/guides/ai-agents/';

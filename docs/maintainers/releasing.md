@@ -308,7 +308,9 @@ documentation edit links name the release tag. A run that times out leaves
 action again. Like the `leani` formula, the site follows the newest prerelease
 only until the first stable release. After that, the coordinator leaves the
 site on the stable release when it publishes a prerelease; to show one anyway,
-promote it by hand.
+promote it by hand. A prerelease's production site says on every page that it
+shows a release candidate, links the stable release, and installs through
+`leani-rc`.
 
 To promote by hand, dispatch `site-promote.yml` from the release tag. Its first
 job checks that the release is published and builds the production site with

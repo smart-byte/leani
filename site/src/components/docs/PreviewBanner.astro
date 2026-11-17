@@ -1,5 +1,6 @@
 ---
 import buildMetadata from '../../generated/build-metadata.json';
+import ReleaseCandidateBanner from '../ReleaseCandidateBanner.astro';
 
 const isPreview = buildMetadata.mode === 'preview';
 ---
@@ -11,6 +12,7 @@ const isPreview = buildMetadata.mode === 'preview';
     </aside>
   )
 }
+<ReleaseCandidateBanner />
 
 <style>
   @layer starlight.core {
