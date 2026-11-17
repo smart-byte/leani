@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.2.0-rc.1] - 2026-11-16
+
 ### Added
 
 - A rollup's blocks rise to `settled` once its settlement contracts on
