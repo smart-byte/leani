@@ -23,6 +23,12 @@ ignore = [
   # only versions below 0.38. The node opens only the databases in its own
   # data directory. Remove on the sqlx bump that allows 0.39.
   { id = "RUSTSEC-2026-0459", reason = "libsqlite3-sys 0.30.1 is capped by sqlx 0.9.0, whose newest release allows no patched version" },
+  # Unmaintained notices for every version, with no release that clears them:
+  # chrono, and humantime, which wraps it. Arrow's arrow-array, parquet and
+  # object_store and Reth's network types depend on them, so they stay in the
+  # build whatever leani's own few uses do. Revisit on every Arrow or Reth bump.
+  { id = "RUSTSEC-2026-0542", reason = "humantime wraps chrono and is inherited through Reth's network types and Arrow's parquet and object_store" },
+  { id = "RUSTSEC-2026-0543", reason = "chrono is inherited through Arrow's arrow-array, parquet and object_store, and no release clears the notice" },
 ]
 
 [licenses]
