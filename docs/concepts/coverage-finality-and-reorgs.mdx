@@ -175,12 +175,12 @@ backfill gap is still being filled.
 ### Undo runs
 
 A reorg undoes its reverted blocks newest first, and so does the revert at a
-restart after a long outage. A consumer's live stream delivers each reverted
-block's `undo` changes as a batch of its own, so several reverted blocks
-arrive as a run of `undo` batches, newest first, before any replacement
-block's `apply` batch. An application that keeps derived aggregates, such as
-leaderboards or rolling totals, beside its per-block state can rebuild them
-once per run instead of once per batch:
+restart after a long outage. A consumer's live stream never puts `undo`
+changes in a batch with other changes, so several reverted blocks arrive as a
+run of `undo` batches, newest first, before any replacement block's `apply`
+batch. One batch can hold several reverted blocks. An application that keeps
+derived aggregates, such as leaderboards or rolling totals, beside its
+per-block state can rebuild them once per run instead of once per batch:
 
 1. Apply each `undo` to the per-block state immediately, record in the same
    transaction that the aggregates need a rebuild, and acknowledge the batch

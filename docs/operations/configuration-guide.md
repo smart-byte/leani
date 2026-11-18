@@ -1270,8 +1270,19 @@ remove it.
 
 History and live delivery use independent transport limits under
 `api.delivery.history_batches` and `api.delivery.live_batches`. The defaults
-are byte-first (`4MiB` history, `64KiB` live), with hard encoded-byte, event,
-processed-block, and maximum-delay bounds. History subscriptions may request
+are byte-first (a `4MiB` target in both), with hard encoded-byte, event,
+processed-block, and maximum-delay bounds; only the delay differs (`50ms`
+history, `10ms` live). A live batch never waits for new blocks: at the head
+it holds one block, and for a consumer that is behind it packs the whole
+blocks already committed, reading on toward its target for at most
+`maximum_delay`. A block whose changes pass `maximum_events` or
+`maximum_encoded_bytes` arrives in several batches, which the consumer
+acknowledges only at the block's end; one change larger than
+`maximum_encoded_bytes` ends the stream with
+`single_change_exceeds_delivery_batch_limit` until the limit is raised. A
+live batch also leaves room in `maximum_buffered_bytes` for its record's own
+fields, so its changes stay below that buffer even when it is no larger than
+`maximum_encoded_bytes`. History subscriptions may request
 smaller effective limits; those values are persisted with the subscription and
 returned by its status endpoint. `maximum_buffered_batches` and
 `maximum_buffered_bytes` independently cap the per-connection encoder queue;

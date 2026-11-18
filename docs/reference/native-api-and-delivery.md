@@ -452,11 +452,18 @@ replaces that session. A page read or a stream batch records the last
 sequence it hands out as the consumer's delivered sequence
 (`deliveredSequence`), and a cursor beyond it gets `409
 acknowledgement_beyond_delivered`, so a buggy client cannot let retention
-prune changes it never received. A live stream batch holds one block's whole
-commit, and a live acknowledgement must end one, as each batch's
-`acknowledgeableCursor` does (`409 acknowledgement_mid_block` otherwise). A
-backfill acknowledgement must be a batch's `acknowledgeableCursor` or the
-completion's `cursor`.
+prune changes it never received. A live acknowledgement must end a commit: a
+block's changes, or a finality or gap notice (`409 acknowledgement_mid_block`
+otherwise). A live stream batch holds whole commits, as many as
+`api.delivery.live_batches` allows, so a consumer that is behind receives many
+blocks per batch, and each batch's `acknowledgeableCursor` ends its last one.
+A commit past those limits arrives in several batches; every one but the last
+offers the end of the commit before as its `acknowledgeableCursor`, so a
+consumer acknowledges the block once it has all of it. In a live batch,
+`processedBlockCount` and `progressUnitCount` count the commits it ends,
+`fromBlock` and `throughBlock` are the lowest and highest block number of its
+changes, and the changes keep stream order. A backfill acknowledgement must be a
+batch's `acknowledgeableCursor` or the completion's `cursor`.
 
 A processor with a split live stream (`block_versioned_idempotent` delivery
 ordering, such as `blobs-money`) fences renewal and acknowledgement by
@@ -751,8 +758,9 @@ a retry the stream's last notice already covers adds none. A processor that
 fills live gaps (below) may instead fill the range then, after a crash or a
 restart of its live lane, so `live_recovery` batches can follow a notice for
 the same blocks.
-Deduplicate batches by cursor: the notice and the following block share a
-block number.
+Deduplicate batches by `lastCursor`: the notice and the following block share
+a block number, and the parts of a block past the live batch limits share an
+`acknowledgeableCursor`.
 A processor with
 [`[processors.live_gap_fill]`](/docs/operations/configuration-guide/#live-gap-fill)
 first fills a range of at most `max_blocks` blocks from history. The live

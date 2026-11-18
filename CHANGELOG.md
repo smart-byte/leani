@@ -8,6 +8,23 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- A live stream batch holds as many whole commits as
+  `api.delivery.live_batches` allows, reading on toward its target for at
+  most `maximum_delay`: one block at the head, and many blocks for a consumer
+  that is behind, which received one block per batch and so needed one
+  acknowledgement round trip per block. `processedBlockCount` and
+  `progressUnitCount` count the commits a batch ends, blocks and finality or
+  gap notices, and `fromBlock` and `throughBlock` are the lowest and highest
+  block number of its changes. `undo` changes never share a batch with other
+  changes, so a run of undo batches still ends at a batch boundary. The SDK's
+  `LiveStreamBatch` types both counts as `string`. A destination that takes a
+  live batch for one block, or deduplicates live batches by
+  `acknowledgeableCursor`, deduplicates by `lastCursor` instead: the parts of
+  a block past the limits offer the same `acknowledgeableCursor`.
+- `api.delivery.live_batches` defaults to the history lane's limits, a
+  `4MiB` target, `16MiB` and 20,000 changes per batch, 8,192 commits, and 4
+  buffered batches or `64MiB`, and keeps its `10ms` delay. Before, it took
+  `64KiB`, `1MiB`, 1,000 changes, 8 commits, and 2 batches or `2MiB`.
 - The store moves to schema 31, which adds three columns to durable
   consumers. The first start counts each consumer's lag from its
   unacknowledged changes once, in time proportional to them.
@@ -20,6 +37,15 @@ record, and documented RPC contracts.
   consumer's whole unacknowledged backlog every time, so a consumer that
   acknowledged every batch caught up in time proportional to the square of
   its backlog.
+- A live block whose changes pass the live batch limits arrives in several
+  batches, which the consumer acknowledges at the block's end: every one but
+  the last offers the end of the commit before it as its
+  `acknowledgeableCursor`. The stream ended at such a block on every
+  reconnect with `single_block_exceeds_delivery_batch_limit`, so its consumer
+  stopped for good while the node reported healthy; an `evm-events`
+  processor without `addresses` sees such blocks as normal traffic. Only a
+  single change larger than `maximum_encoded_bytes` still ends the stream,
+  with `single_change_exceeds_delivery_batch_limit`.
 
 ## [0.2.0-rc.2] - 2026-11-17
 
