@@ -6,6 +6,21 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- The store moves to schema 31, which adds three columns to durable
+  consumers. The first start counts each consumer's lag from its
+  unacknowledged changes once, in time proportional to them.
+
+### Fixed
+
+- Acknowledging, renewing a consumer's lease, reading a consumer, and
+  scraping `/metrics` read each consumer's lag from counters the store keeps
+  as changes are appended, acknowledged, and pruned. They counted the
+  consumer's whole unacknowledged backlog every time, so a consumer that
+  acknowledged every batch caught up in time proportional to the square of
+  its backlog.
+
 ## [0.2.0-rc.2] - 2026-11-17
 
 ### Added
