@@ -927,12 +927,12 @@ those limits mid-fill stops there. It holds the block after the range and
 announces nothing. While the store would refuse that block, because the lane
 is paused above its stream's resume mark (90 % of `max_bytes`), a node-wide
 budget has no room for it, or the lane is paused at a storage limit while
-storage stays above its low-water mark, the lane fetches no history for the
-fill, as long as the block after the range is among the retained frames.
-Once finality prunes that frame during a long hold, the lane recovers it from
-history on every live block, as any paused lane recovers its first unapplied
-block. After a restart of the live lanes, a lane held at a node-wide budget
-can fetch once more before it waits again. The lane continues the fill once
+storage stays above its low-water mark, the lane fetches no history. When
+finality prunes the frame of the block after the range during a long hold,
+the lane recovers that block from history once the store would take it, as
+any paused lane recovers its first unapplied block. After a restart of the
+live lanes, a lane held at a node-wide budget can fetch once more before it
+waits again. The lane continues the fill once
 the store would take the block: once consumers acknowledge and pruning brings
 its stream down to the resume mark, once pruning any stream gives a node-wide
 budget room, or once storage has room. The unfilled rest is recomputed from

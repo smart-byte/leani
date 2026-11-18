@@ -52,6 +52,11 @@ record, and documented RPC contracts.
   delivery limit does, for an unfinished handoff and failed the network
   lanes closed, about once a minute after a restart, which nearly stopped
   every other processor.
+- A lane that the store would refuse, as at a delivery or storage limit,
+  fetches no history for its first unapplied block once finality pruned that
+  block's frame, weighing the bytes the store refused that block for. It
+  fetched the block's chunk from history again on every live block, only for
+  the store to refuse it.
 
 ## [0.2.0-rc.2] - 2026-11-17
 

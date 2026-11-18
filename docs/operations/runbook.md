@@ -1066,12 +1066,11 @@ A lane that reaches a delivery or storage limit mid-fill stops there. While
 the store would refuse its next block, at the stream's delivery limit, at a
 node-wide `[budgets.delivery]` or `[budgets.store]` budget, or at a storage
 limit while storage stays above its low-water mark, the lane fetches no
-history for the fill, as long as the block after the range is among the
-retained frames. Once finality prunes that frame during a long hold, the lane
-recovers it from history on every live block, as any paused lane recovers its
-first unapplied block. After a restart of the live lanes, a lane held at a
-node-wide budget can fetch once more before it waits again. Either way it
-reports `paused` with that reason (see
+history. When finality prunes the frame of the block after the range during a
+long hold, the lane recovers that block from history once the store would take
+it, as any paused lane recovers its first unapplied block. After a restart of
+the live lanes, a lane held at a node-wide budget can fetch once more before it
+waits again. Either way it reports `paused` with that reason (see
 [Parked processor live lane](#parked-processor-live-lane)), announces
 nothing, and continues the fill once the store would take the block: once
 consumers acknowledge and pruning makes room in its stream or in the
