@@ -4103,6 +4103,42 @@ impl SharedLiveRuntime {
         Ok(report)
     }
 
+    /// The running lanes, not parked at a gap, that still hold a pending
+    /// delta, each with the block of its first. A lane that is not running or
+    /// is parked at a gap, such as one paused at its delivery limit, holds the
+    /// deltas of the blocks it replays once it resumes, and is left out. Reads
+    /// one row per lane, where the processor statistics would scan every
+    /// delta, under the lane lock, so no live block parks or resumes a lane
+    /// between the reads.
+    ///
+    /// # Errors
+    ///
+    /// Returns store failures.
+    pub async fn running_lanes_with_pending_deltas(
+        &self,
+    ) -> Result<Vec<(ProcessorDescriptor, BlockNumber)>, RuntimeError> {
+        let _lane = self.lane_lock.lock().await;
+        let mut lanes = Vec::new();
+        for processor in &self.processors {
+            let descriptor = processor.descriptor();
+            if self.store.processor_runtime_state(descriptor).await?.state
+                != ProcessorRunState::Running
+                || self.store.live_lane_gap(descriptor).await?.is_some()
+            {
+                continue;
+            }
+            if let Some(delta) = self
+                .store
+                .pending_deltas(descriptor, BlockNumber(0), 1)
+                .await?
+                .first()
+            {
+                lanes.push((descriptor.clone(), delta.block.number));
+            }
+        }
+        Ok(lanes)
+    }
+
     /// Seed a verified finalized execution anchor before the live lanes open,
     /// first reverting every retained unfinalized canonical block that is not
     /// proven to be on its chain, and finalizing those `ancestry` proves.
@@ -25046,6 +25082,40 @@ mod tests {
                 .await
                 .expect("gap")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_deltas_of_running_lanes_are_read_while_no_lane_changes() {
+        let lanes: Vec<Arc<dyn Processor>> =
+            vec![Arc::new(BlockLocalCounter::named("checked-counter"))];
+        let history = Arc::new(CountingLiveGapRecovery::serving(Vec::new()));
+        let (_directory, store) = store().await;
+        let live = filling_live(
+            &store,
+            &lanes,
+            SharedLiveRuntimeConfig::default(),
+            &history,
+            Vec::new(),
+        );
+        live.reconcile_pending().await.expect("register the lane");
+        // While a live commit, drain, or park holds the lanes, the check
+        // waits for it.
+        let lane = live.lane_lock.clone().lock_owned().await;
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                live.running_lanes_with_pending_deltas()
+            )
+            .await
+            .is_err()
+        );
+        drop(lane);
+        assert!(
+            live.running_lanes_with_pending_deltas()
+                .await
+                .expect("check")
+                .is_empty()
         );
     }
 

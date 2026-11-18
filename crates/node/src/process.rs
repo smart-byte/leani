@@ -8120,7 +8120,7 @@ async fn run_rpc_lanes(
         cancellation.clone(),
         finality_ready,
     );
-    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, &processors, backfills);
+    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, backfills);
     tokio::pin!(live);
     tokio::pin!(finality);
     tokio::pin!(handoffs);
@@ -9653,7 +9653,7 @@ async fn run_network_lanes(
     );
     let archive_reconciliations =
         run_archive_reconciliations(config, &store, &processors, lane_cancellation.clone());
-    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, &processors, backfills);
+    let handoffs = finish_cold_handoffs(&store, &handoff_runtime, backfills);
     let stall = live_stall(
         live_ready_updates.clone(),
         finality_ready_updates.clone(),
@@ -10351,7 +10351,6 @@ struct ColdHandoffSummary {
 async fn finish_cold_handoffs(
     store: &leani_store_sqlite::SqliteStore,
     live: &leani_runtime::SharedLiveRuntime,
-    processors: &[std::sync::Arc<dyn leani_processor_api::Processor>],
     backfills: &mut ColdBackfills,
 ) -> Result<ColdHandoffSummary> {
     let mut records = Vec::with_capacity(backfills.len());
@@ -10394,21 +10393,17 @@ async fn finish_cold_handoffs(
     live.reconcile_pending()
         .await
         .context("drain ordered live deltas after hot/cold handoff")?;
-    // Checked per instance: the drain's report counts processors by kind. One
-    // row answers it, where the statistics would scan them all again.
-    for processor in processors {
-        let instance = processor.descriptor().instance.to_string();
-        if failed.contains(&instance) {
-            continue;
-        }
-        let pending = store
-            .pending_deltas(processor.descriptor(), leani_primitives::BlockNumber(0), 1)
-            .await
-            .with_context(|| format!("look for pending deltas of {instance}"))?;
-        if let Some(delta) = pending.first() {
+    // Checked per instance: the drain's report counts processors by kind.
+    for (processor, block) in live
+        .running_lanes_with_pending_deltas()
+        .await
+        .context("look for pending deltas after hot/cold handoff")?
+    {
+        let instance = processor.instance.to_string();
+        if !failed.contains(&instance) {
             bail!(
                 "processor {instance} retains pending deltas from block {} after verified handoff",
-                delta.block.number.0
+                block.0
             );
         }
     }
@@ -12738,9 +12733,8 @@ mod tests {
             Err(anyhow::Error::new(failure))
         });
         backfills.spawn("automatic-verified", async move { Ok(verified_record) });
-        let processors: Vec<Arc<dyn Processor>> = vec![failed.clone(), verified.clone()];
 
-        let summary = finish_cold_handoffs(&store, &live, &processors, &mut backfills)
+        let summary = finish_cold_handoffs(&store, &live, &mut backfills)
             .await
             .expect("one processor's failed cold backfill does not fail the other handoffs");
 
@@ -12851,8 +12845,7 @@ mod tests {
         backfills.spawn("automatic-unparked", async move {
             Err(anyhow::Error::new(failure))
         });
-        let processors: Vec<Arc<dyn Processor>> = vec![unparked.clone()];
-        let summary = finish_cold_handoffs(&bare, &bare_live, &processors, &mut backfills)
+        let summary = finish_cold_handoffs(&bare, &bare_live, &mut backfills)
             .await
             .expect("a failed cold backfill without a retained frame");
         assert_eq!(
@@ -12886,6 +12879,79 @@ mod tests {
             "{logged}"
         );
         assert!(!logged.contains("lane is parked"), "{logged}");
+    }
+
+    #[tokio::test]
+    async fn a_lane_held_at_its_delivery_limit_leaves_the_handoffs_verified() {
+        use std::sync::Arc;
+
+        use leani_primitives::{BlockNumber, BlockRange};
+        use leani_runtime::{SharedLiveRuntime, SharedLiveRuntimeConfig};
+        use leani_source_api::{ChainEvent, LiveStart};
+        use leani_store_sqlite::{ProcessorRunState, SqliteStore, StoreConfig};
+        use leani_testkit::{
+            LiveStep, ScriptedLiveSource, default_source_budget, fixture_source_descriptor,
+        };
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(StoreConfig::new(directory.path().join("handoff.sqlite")))
+            .await
+            .expect("store");
+        // Its live delivery holds two blocks' changes, 56 bytes each.
+        let held = Arc::new(
+            BlockLocalCounter::named("held-counter")
+                .with_split_delivery()
+                .with_delivery_max_bytes(150),
+        );
+        let mut parent = leani_primitives::BlockHash::ZERO;
+        let mut steps = Vec::new();
+        for number in 0..=3 {
+            let frame = fixture_frame(number, parent);
+            parent = frame.block.hash;
+            steps.push(LiveStep::Event(ChainEvent::Block(Box::new(frame))));
+        }
+        let live = SharedLiveRuntime::new(
+            store.clone(),
+            Arc::new(ScriptedLiveSource::new(
+                fixture_source_descriptor(
+                    "held-live",
+                    BlockRange::new(BlockNumber(0), BlockNumber(3)).expect("range"),
+                ),
+                steps,
+            )),
+            vec![held.clone()],
+            SharedLiveRuntimeConfig::default(),
+        )
+        .expect("live runtime");
+        live.run(
+            LiveStart::Head,
+            default_source_budget(),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("live run");
+        assert_eq!(
+            store
+                .processor_runtime_state(held.descriptor())
+                .await
+                .expect("state")
+                .state,
+            ProcessorRunState::Paused
+        );
+        let pending = || async {
+            store
+                .pending_deltas(held.descriptor(), BlockNumber(0), 8)
+                .await
+                .expect("pending deltas")
+                .len()
+        };
+        assert_eq!(pending().await, 1, "the lane holds its next block");
+
+        let summary = finish_cold_handoffs(&store, &live, &mut ColdBackfills::default())
+            .await
+            .expect("a held block is no unfinished handoff");
+        assert!(summary.failed.is_empty(), "{summary:?}");
+        assert_eq!(pending().await, 1);
     }
 
     #[tokio::test]
@@ -13532,7 +13598,7 @@ markets = ["ETH/USDT"]
         .expect("live runtime");
         let summary = tokio::time::timeout(
             Duration::from_secs(30),
-            finish_cold_handoffs(store, &live, processors, &mut backfills),
+            finish_cold_handoffs(store, &live, &mut backfills),
         )
         .await
         .expect("the handoffs finish")
