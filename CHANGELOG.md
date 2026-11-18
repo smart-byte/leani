@@ -46,6 +46,12 @@ record, and documented RPC contracts.
   processor without `addresses` sees such blocks as normal traffic. Only a
   single change larger than `maximum_encoded_bytes` still ends the stream,
   with `single_change_exceeds_delivery_batch_limit`.
+- The hot/cold handoff at the start of the network lanes passes over a
+  processor whose lane is paused, failed, or parked at a gap. It took the
+  delta such a lane holds for its next block, as a lane paused at its
+  delivery limit does, for an unfinished handoff and failed the network
+  lanes closed, about once a minute after a restart, which nearly stopped
+  every other processor.
 
 ## [0.2.0-rc.2] - 2026-11-17
 
