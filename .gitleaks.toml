@@ -33,3 +33,27 @@ condition = "AND"
 paths = ['''^crates/finality-beacon-api/src/lib\.rs$''']
 regexTarget = "secret"
 regexes = ['''^eth/v1/beacon/genesis$''']
+
+[[rules.allowlists]]
+description = "Public storage slot keys and block access list hashes in recorded Merkle-proof fixtures"
+condition = "AND"
+paths = ['''^crates/rpc/tests/fixtures/(?:mainnet_ens|sepolia_call|sepolia_transfer)\.json$''']
+regexTarget = "secret"
+regexes = [
+  '''^0x26e0ea9fc0925670b0083d032668f9464e8c6c6ed0383ee709f7e8758777fbeb$''',
+  '''^0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc$''',
+  '''^0x5a9b8ad69e6e25c5c98b652237895edd07d3e0ce28e306084d856fa4dfc97898$''',
+  '''^0x5a9b8ad69e6e25c5c98b652237895edd07d3e0ce28e306084d856fa4dfc97899$''',
+  '''^0x859ecef2e168dc10231b000bd53493b42bc9d944cac29d94582c1e1d43592131$''',
+  '''^0x859ecef2e168dc10231b000bd53493b42bc9d944cac29d94582c1e1d43592132$''',
+  '''^0x9f63b6aa7c9ae6a87aed6d2a486460bc7fabde733278ff83dea2b3db500c17c9$''',
+  '''^0x9f63b6aa7c9ae6a87aed6d2a486460bc7fabde733278ff83dea2b3db500c17ca$''',
+  '''^0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf6$''',
+  '''^0xb10e2d527612073b26eecdfd717e6a320cf44b4afac2b0732d9fcbe2b7fa0cf7$''',
+  '''^0xf0a80c0711c0a6ffd03ea5c1a42e33502f746d8a47f8cf7638fcb3408b428931$''',
+  '''^0xf0a80c0711c0a6ffd03ea5c1a42e33502f746d8a47f8cf7638fcb3408b428932$''',
+  '''^0x44a3fd831316309640f87a9216515b6f5357b5664bff36ecf126918ee53b272f$''',
+  '''^0x262bb27bbdd95c1cdc8e16957e36e38579ea44f7f6413dd7a9c75939def06b2c$''',
+  '''^0x26e10bd06ca080ac2142276feb95e3979d7670790439c5a04d022a701a23c48f$''',
+  '''^0xcb09d5ba39d187d37bf855951d7dfb5253610de08dbca200682c7ca4a7e17e28$''',
+]

@@ -9,9 +9,15 @@ scanner = File.expand_path("check-secrets.sh", __dir__)
 public_address = "0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640"
 fixture_path = "site/src/data/processors/uniswap-latest.json"
 sample = ("0123456789abcdef" * 3).chars.shuffle(random: Random.new(7)).join
+proof_fixture = "crates/rpc/tests/fixtures/sepolia_call.json"
+# The EIP-1967 implementation slot, a public constant a proof records.
+storage_slot = "0x360894a13ba1a3210667c828492db98dca3e2076cc3735a920a3ca505d382bbc"
+private_key = "0x#{("0123456789abcdef" * 4).chars.shuffle(random: Random.new(11)).join}"
 cases = [
   ["public address in its reviewed fixture", fixture_path, public_address, true, false],
   ["another key in the same fixture", fixture_path, sample, false, false],
+  ["public storage slot in a proof fixture", proof_fixture, storage_slot, true, false],
+  ["private key shaped value in a proof fixture", proof_fixture, private_key, false, false],
   ["same address in an unrelated credential file", "settings.json", public_address, false, false],
   ["deleted credential remains detectable", "settings.json", sample, false, true],
 ]
