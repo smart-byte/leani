@@ -124,11 +124,11 @@ maximum_buffered_bytes = "64MiB"
 compression = "gzip"
 
 [api.delivery.live_batches]
-target_encoded_bytes = "64KiB"
-maximum_encoded_bytes = "1MiB"
-maximum_events = 1000
-maximum_processed_blocks = 8
+target_encoded_bytes = "4MiB"
+maximum_encoded_bytes = "16MiB"
+maximum_events = 20000
+maximum_processed_blocks = 8192
 maximum_delay = "10ms"
-maximum_buffered_batches = 2
-maximum_buffered_bytes = "2MiB"
+maximum_buffered_batches = 4
+maximum_buffered_bytes = "64MiB"
 compression = "gzip"

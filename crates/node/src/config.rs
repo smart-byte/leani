@@ -1714,14 +1714,8 @@ impl DeliveryBatchConfig {
 
     const fn live_default() -> Self {
         Self {
-            target_encoded_bytes: HumanBytes(64 * 1024),
-            maximum_encoded_bytes: HumanBytes(1024 * 1024),
-            maximum_events: 1_000,
-            maximum_processed_blocks: 8,
             maximum_delay: HumanMilliseconds(10),
-            maximum_buffered_batches: 2,
-            maximum_buffered_bytes: HumanBytes(2 * 1024 * 1024),
-            compression: DeliveryCompressionConfig::Gzip,
+            ..Self::history_default()
         }
     }
 }

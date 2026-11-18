@@ -175,8 +175,9 @@ try {
     for await (const batch of delivery.batches()) {
       if (batch.laneKind === "live") {
         const record = batch.record;
+        // A part of a block past the live batch limits ends no block.
         const batchProcessedBlocks = Number(record.processedBlockCount);
-        if (batchProcessedBlocks !== 1) {
+        if (!Number.isSafeInteger(batchProcessedBlocks) || batchProcessedBlocks < 0) {
           throw new Error("SDK destination received an invalid live block count");
         }
         firstLiveBatchMs ??= elapsedSinceUnixMilliseconds(benchmarkStartedUnixMs);

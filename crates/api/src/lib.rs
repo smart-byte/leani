@@ -510,17 +510,14 @@ impl DeliveryBatchLimits {
         }
     }
 
+    /// The history lane's limits, keeping the live delay. A consumer at the
+    /// head gets one block per batch whatever the limits are, so they size
+    /// the batches of a consumer that is behind.
     #[must_use]
     pub const fn live_default() -> Self {
         Self {
-            target_encoded_bytes: 64 * 1024,
-            maximum_encoded_bytes: 1024 * 1024,
-            maximum_events: 1_000,
-            maximum_processed_blocks: 8,
             maximum_delay: Duration::from_millis(10),
-            maximum_buffered_batches: 2,
-            maximum_buffered_bytes: 2 * 1024 * 1024,
-            compression: DeliveryCompression::Gzip,
+            ..Self::history_default()
         }
     }
 
@@ -4605,13 +4602,26 @@ struct LiveConsumerStreamState {
     stream_id: String,
     consumer_id: String,
     fetch_after: u64,
-    fetched: VecDeque<ChangeRecord>,
+    /// The last sequence a batch sent that ends a whole commit, or the
+    /// consumer's acknowledged sequence before the first.
+    last_commit_end: u64,
+    fetched: VecDeque<LiveRecord>,
     /// The last page read reached the stream head, so the last block in
     /// `fetched` is whole: a block's records commit together.
     fetched_through_head: bool,
+    /// When the next batch began, from which it reads on for at most
+    /// `maximum_delay`.
+    batch_started: Option<Instant>,
     gzip: bool,
     terminal: bool,
     lease: ConsumerSessionGuard,
+}
+
+/// A record read for a live batch, its change rendered once as it is read,
+/// or the failure to render it.
+struct LiveRecord {
+    record: ChangeRecord,
+    change: Result<(ChangeEnvelope, u64), String>,
 }
 
 async fn stream_live_consumer(
@@ -4674,8 +4684,10 @@ async fn stream_live_consumer(
         stream_id: stream_id.clone(),
         consumer_id: consumer.clone(),
         fetch_after: durable_consumer.acknowledged_sequence,
+        last_commit_end: durable_consumer.acknowledged_sequence,
         fetched: VecDeque::new(),
         fetched_through_head: false,
+        batch_started: None,
         gzip,
         terminal: false,
         lease: lease_guard,
@@ -4878,158 +4890,31 @@ async fn poll_live_consumer(
     // would starve an idle stream of heartbeats on a busy node.
     let heartbeat_due = tokio::time::Instant::now() + stream_state.state.config.heartbeat_interval;
     loop {
-        if let Some((first, block_records)) = whole_live_block(
-            &stream_state.fetched,
-            stream_state.fetched_through_head,
-            stream_state.state.config.live_batch_limits.maximum_events,
-        ) {
-            let records = stream_state
-                .fetched
-                .drain(..block_records)
-                .collect::<Vec<_>>();
-            let delivered_through = records
-                .last()
-                .map_or(first.cursor.sequence, |record| record.cursor.sequence);
-            let live_limits = stream_state.state.config.live_batch_limits;
-            if u64::try_from(records.len()).unwrap_or(u64::MAX) > live_limits.maximum_events {
-                stream_state.terminal = true;
-                return Some((
-                    Ok(ndjson_failure(
-                        "single_block_exceeds_delivery_batch_limit",
-                        format!(
-                            "one live block contains more than {} delivery records",
-                            live_limits.maximum_events
-                        ),
-                        None,
-                        None,
-                    )),
-                    stream_state,
-                ));
-            }
-            let domain_change_count = records
-                .iter()
-                .filter(|record| !record.change.kind.starts_with("system."))
-                .count();
-            let encoded_bytes = records.iter().fold(0_u64, |total, record| {
-                total.saturating_add(
-                    u64::try_from(record.change.key.len() + record.change.payload.len())
-                        .unwrap_or(u64::MAX),
+        match next_live_batch(&mut stream_state) {
+            Ok(Some((batch, delivered_through))) => {
+                if let Some(failure) = record_session_delivery(
+                    &stream_state.state,
+                    &stream_state.stream_id,
+                    &stream_state.consumer_id,
+                    stream_state.lease.generation,
+                    delivered_through,
                 )
-            });
-            let changes = records
-                .into_iter()
-                .map(|record| {
-                    change_envelope_in_stream(
-                        &stream_state.state,
-                        stream_state.processor.as_ref(),
-                        &stream_state.stream_id,
-                        record,
-                    )
-                })
-                .collect::<Result<Vec<_>, _>>();
-            let changes = match changes {
-                Ok(changes) => changes,
-                Err(error) => {
+                .await
+                {
                     stream_state.terminal = true;
-                    return Some((
-                        Ok(ndjson_failure(
-                            "delivery_encoding_failed",
-                            error.to_string(),
-                            None,
-                            None,
-                        )),
-                        stream_state,
-                    ));
+                    return Some((Ok(failure), stream_state));
                 }
-            };
-            let encoded_change_bytes = changes.iter().fold(0_u64, |total, change| {
-                total.saturating_add(
-                    serde_json::to_vec(change)
-                        .ok()
-                        .and_then(|bytes| u64::try_from(bytes.len()).ok())
-                        .unwrap_or(u64::MAX),
-                )
-            });
-            let encoded_change_array_bytes =
-                encoded_change_array_bytes(encoded_change_bytes, changes.len());
-            if encoded_change_array_bytes > live_limits.maximum_encoded_bytes {
-                stream_state.terminal = true;
-                return Some((
-                    Ok(ndjson_failure(
-                        "single_block_exceeds_delivery_batch_limit",
-                        format!(
-                            "one live block requires at least {encoded_change_array_bytes} encoded bytes; maximum is {}",
-                            live_limits.maximum_encoded_bytes
-                        ),
-                        None,
-                        None,
-                    )),
-                    stream_state,
-                ));
+                return Some((Ok(ndjson_line_or_error(&batch)), stream_state));
             }
-            let first_cursor = changes
-                .first()
-                .map_or_else(String::new, |change| change.cursor.clone());
-            let last_cursor = changes
-                .last()
-                .map_or_else(String::new, |change| change.cursor.clone());
-            let encoded_event_payload = match serde_json::to_vec(&changes) {
-                Ok(encoded) => encoded,
-                Err(error) => {
-                    stream_state.terminal = true;
-                    return Some((
-                        Ok(ndjson_failure(
-                            "delivery_encoding_failed",
-                            error.to_string(),
-                            None,
-                            None,
-                        )),
-                        stream_state,
-                    ));
-                }
-            };
-            let transmitted_event_bytes = if stream_state.gzip {
-                gzip_member(&encoded_event_payload).map_or(u64::MAX, |bytes| {
-                    u64::try_from(bytes.len()).unwrap_or(u64::MAX)
-                })
-            } else {
-                u64::try_from(encoded_event_payload.len()).unwrap_or(u64::MAX)
-            };
-            let batch = ConsumerStreamBatch {
-                record_type: "batch",
-                stream_id: stream_state.stream_id.clone(),
-                origin_kind: first.origin.kind.as_str().to_owned(),
-                origin_id: first.origin.id.clone(),
-                publication_revision: first.origin.publication_revision.to_string(),
-                from_block: first.block.number.0,
-                through_block: first.block.number.0,
-                processed_block_count: "1".to_owned(),
-                domain_change_count: domain_change_count.to_string(),
-                progress_unit_count: "1".to_owned(),
-                raw_payload_bytes: encoded_bytes.to_string(),
-                uncompressed_encoded_bytes: encoded_event_payload.len().to_string(),
-                transmitted_bytes: transmitted_event_bytes.to_string(),
-                build_delay_ms: "0".to_owned(),
-                first_cursor: Some(first_cursor),
-                acknowledgeable_cursor: last_cursor.clone(),
-                last_cursor: Some(last_cursor),
-                changes,
-            };
-            if let Some(failure) = record_session_delivery(
-                &stream_state.state,
-                &stream_state.stream_id,
-                &stream_state.consumer_id,
-                stream_state.lease.generation,
-                delivered_through,
-            )
-            .await
-            {
+            Ok(None) => {}
+            Err(failure) => {
                 stream_state.terminal = true;
                 return Some((Ok(failure), stream_state));
             }
-            return Some((Ok(ndjson_line_or_error(&batch)), stream_state));
         }
 
+        // No more than a history page: the store reads every payload of a
+        // page before a byte limit applies.
         let fetch_limit = usize::try_from(
             stream_state
                 .state
@@ -5038,8 +4923,8 @@ async fn poll_live_consumer(
                 .maximum_events
                 .saturating_add(1),
         )
-        .unwrap_or(10_000)
-        .min(10_000);
+        .unwrap_or(MAX_PAGE_SIZE)
+        .min(MAX_PAGE_SIZE);
         match stream_state
             .state
             .store
@@ -5058,6 +4943,10 @@ async fn poll_live_consumer(
                 stream_state.fetch_after = records
                     .last()
                     .map_or(stream_state.fetch_after, |record| record.cursor.sequence);
+                let records = records
+                    .into_iter()
+                    .map(|record| live_record(&stream_state, record))
+                    .collect::<Vec<_>>();
                 stream_state.fetched.extend(records);
             }
             Ok(_) if !stream_state.fetched.is_empty() => {
@@ -5122,26 +5011,237 @@ async fn poll_live_consumer(
     }
 }
 
-/// The first block of `fetched` and its record count, once it can go out as
-/// one batch: a record of another commit follows it, or the page read that
-/// fetched it reached the stream head, since a block's records commit
-/// together. A block already past `maximum_events` is returned to fail the
-/// stream. Otherwise a page read ended inside the block, which waits for the
-/// next read.
-fn whole_live_block(
-    fetched: &VecDeque<ChangeRecord>,
-    fetched_through_head: bool,
-    maximum_events: u64,
-) -> Option<(ChangeRecord, usize)> {
-    let first = fetched.front()?;
-    let records = fetched
-        .iter()
-        .take_while(|record| same_live_commit(first, record))
-        .count();
-    (records < fetched.len()
-        || fetched_through_head
-        || u64::try_from(records).unwrap_or(u64::MAX) > maximum_events)
-        .then(|| (first.clone(), records))
+/// Take the next batch off the front of `fetched`, with the sequence it
+/// delivers through; `None` to read more first, or the failure record that
+/// ends the stream.
+///
+/// A commit is the records of one block, finality notice, or gap notice,
+/// which the store writes together, so one is whole once a record of another
+/// follows it or a read reached the stream head. Whole commits of one origin
+/// pack into a batch up to the live limits; a batch reads on toward its
+/// target for at most `maximum_delay`. Undos and other commits never share a
+/// batch. A commit past the limits goes out in parts. Every part but its
+/// last offers the end of the last whole commit sent as its acknowledgeable
+/// cursor, so an acknowledgement never ends inside a commit and the consumer
+/// still moves past it. A record that failed to render ends the stream once
+/// it is the next to send.
+fn next_live_batch(
+    stream_state: &mut LiveConsumerStreamState,
+) -> Result<Option<(ConsumerStreamBatch, u64)>, Bytes> {
+    let Some(front) = stream_state.fetched.front() else {
+        return Ok(None);
+    };
+    let limits =
+        live_record_limits(stream_state, &front.record.origin).map_err(live_encoding_failure)?;
+    let started = *stream_state.batch_started.get_or_insert_with(Instant::now);
+    let fetched = &stream_state.fetched;
+    let undo =
+        |record: &LiveRecord| record.record.direction == leani_store_sqlite::ChangeDirection::Undo;
+    let fits = |events: usize, encoded: u64| {
+        u64::try_from(events).unwrap_or(u64::MAX) <= limits.maximum_events
+            && encoded_change_array_bytes(encoded, events) <= limits.maximum_encoded_bytes
+    };
+    // The whole commits that join the batch: their records, count, and
+    // encoded change bytes.
+    let (mut taken, mut commits, mut encoded) = (0, 0_u64, 0_u64);
+    while let Some(start) = fetched.get(taken) {
+        if taken > 0
+            && (start.record.origin != fetched[0].record.origin
+                || undo(start) != undo(&fetched[0])
+                || commits >= limits.maximum_processed_blocks)
+        {
+            break;
+        }
+        // The commit's records that fit with the batch, up to one that does
+        // not or failed to render.
+        let (mut records, mut bytes, mut stopped) = (0, 0_u64, false);
+        for record in fetched
+            .range(taken..)
+            .take_while(|record| same_live_commit(&start.record, &record.record))
+        {
+            match &record.change {
+                Ok((_, size))
+                    if fits(
+                        taken + records + 1,
+                        encoded.saturating_add(bytes).saturating_add(*size),
+                    ) =>
+                {
+                    records += 1;
+                    bytes = bytes.saturating_add(*size);
+                }
+                _ => {
+                    stopped = true;
+                    break;
+                }
+            }
+        }
+        if stopped {
+            if taken > 0 {
+                break;
+            }
+            if records == 0 {
+                return Err(match &fetched[0].change {
+                    Err(message) => live_encoding_failure(message.clone()),
+                    Ok((_, size)) => ndjson_failure(
+                        "single_change_exceeds_delivery_batch_limit",
+                        format!(
+                            "one live change requires at least {} encoded bytes; a batch holds at most {}",
+                            encoded_change_array_bytes(*size, 1),
+                            limits.maximum_encoded_bytes
+                        ),
+                        None,
+                        None,
+                    ),
+                });
+            }
+            return take_live_batch(stream_state, records, 0, started).map(Some);
+        }
+        if taken + records == fetched.len() && !stream_state.fetched_through_head {
+            // The commit may go on past the records read.
+            if taken == 0 || started.elapsed() < limits.maximum_delay {
+                return Ok(None);
+            }
+            break;
+        }
+        taken += records;
+        commits += 1;
+        encoded = encoded.saturating_add(bytes);
+        if encoded_change_array_bytes(encoded, taken) >= limits.target_encoded_bytes
+            || u64::try_from(taken).unwrap_or(u64::MAX) >= limits.maximum_events
+        {
+            break;
+        }
+    }
+    take_live_batch(stream_state, taken, commits, started).map(Some)
+}
+
+/// The live batch limits, with `maximum_encoded_bytes` lowered to leave room
+/// in `maximum_buffered_bytes` for a record's own fields: every batch record
+/// of `origin` then fits the buffer that sends it.
+fn live_record_limits(
+    stream_state: &LiveConsumerStreamState,
+    origin: &leani_store_sqlite::DeliveryOrigin,
+) -> Result<DeliveryBatchLimits, String> {
+    let limits = stream_state.state.config.live_batch_limits;
+    // Every count and cursor at its longest.
+    let cursor = encode_stream_cursor(
+        &stream_state.state,
+        stream_state.processor.as_ref(),
+        &stream_state.stream_id,
+        u64::MAX,
+    )
+    .map_err(|error| error.to_string())?;
+    let count = u64::MAX.to_string();
+    let fields = serde_json::to_vec(&ConsumerStreamBatch {
+        record_type: "batch",
+        stream_id: stream_state.stream_id.clone(),
+        origin_kind: origin.kind.as_str().to_owned(),
+        origin_id: origin.id.clone(),
+        publication_revision: count.clone(),
+        from_block: u64::MAX,
+        through_block: u64::MAX,
+        processed_block_count: count.clone(),
+        domain_change_count: count.clone(),
+        progress_unit_count: count.clone(),
+        raw_payload_bytes: count.clone(),
+        uncompressed_encoded_bytes: count.clone(),
+        transmitted_bytes: count.clone(),
+        build_delay_ms: count,
+        first_cursor: Some(cursor.clone()),
+        last_cursor: Some(cursor.clone()),
+        acknowledgeable_cursor: cursor,
+        changes: Vec::new(),
+    })
+    .map_err(|error| format!("encode delivery batch fields: {error}"))?;
+    // A record's changes take the place of the empty array, and a newline
+    // ends it.
+    let fields = u64::try_from(fields.len())
+        .unwrap_or(u64::MAX)
+        .saturating_sub(1);
+    Ok(DeliveryBatchLimits {
+        maximum_encoded_bytes: limits
+            .maximum_encoded_bytes
+            .min(limits.maximum_buffered_bytes.saturating_sub(fields)),
+        ..limits
+    })
+}
+
+/// Take the first `records` of `fetched` as a batch that ends `commits`
+/// whole commits, or is a part of the front commit when `commits` is 0.
+fn take_live_batch(
+    stream_state: &mut LiveConsumerStreamState,
+    records: usize,
+    commits: u64,
+    started: Instant,
+) -> Result<(ConsumerStreamBatch, u64), Bytes> {
+    stream_state.batch_started = None;
+    let sent = stream_state.fetched.drain(..records).collect::<Vec<_>>();
+    let origin = sent[0].record.origin.clone();
+    let delivered_through = sent[records - 1].record.cursor.sequence;
+    let mut batch = PendingHistoryBatch {
+        started,
+        origin,
+        from_block: u64::MAX,
+        through_block: 0,
+        processed_blocks: commits,
+        domain_changes: 0,
+        progress_units: commits,
+        raw_payload_bytes: 0,
+        encoded_change_bytes: 0,
+        acknowledgeable_cursor: String::new(),
+        acknowledgeable_sequence: stream_state.last_commit_end,
+        changes: Vec::with_capacity(records),
+    };
+    for LiveRecord { record, change } in sent {
+        let (change, bytes) = change.map_err(live_encoding_failure)?;
+        batch.from_block = batch.from_block.min(record.block.number.0);
+        batch.through_block = batch.through_block.max(record.block.number.0);
+        batch.domain_changes += u64::from(!record.change.kind.starts_with("system."));
+        batch.raw_payload_bytes = batch.raw_payload_bytes.saturating_add(
+            u64::try_from(record.change.key.len() + record.change.payload.len())
+                .unwrap_or(u64::MAX),
+        );
+        batch.encoded_change_bytes = batch.encoded_change_bytes.saturating_add(bytes);
+        batch.changes.push(change);
+    }
+    if commits == 0 {
+        batch.acknowledgeable_cursor = encode_stream_cursor(
+            &stream_state.state,
+            stream_state.processor.as_ref(),
+            &stream_state.stream_id,
+            stream_state.last_commit_end,
+        )
+        .map_err(|error| live_encoding_failure(error.to_string()))?;
+    } else {
+        batch
+            .acknowledgeable_cursor
+            .clone_from(&batch.changes[records - 1].cursor);
+        batch.acknowledgeable_sequence = delivered_through;
+        stream_state.last_commit_end = delivered_through;
+    }
+    let batch = consumer_stream_batch(&stream_state.stream_id, stream_state.gzip, batch)
+        .map_err(live_encoding_failure)?;
+    Ok((batch, delivered_through))
+}
+
+fn live_record(stream_state: &LiveConsumerStreamState, record: ChangeRecord) -> LiveRecord {
+    let change = change_envelope_in_stream(
+        &stream_state.state,
+        stream_state.processor.as_ref(),
+        &stream_state.stream_id,
+        record.clone(),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|change| {
+        let bytes = serde_json::to_vec(&change)
+            .map_err(|error| format!("encode delivery change: {error}"))?;
+        Ok((change, u64::try_from(bytes.len()).unwrap_or(u64::MAX)))
+    });
+    LiveRecord { record, change }
+}
+
+fn live_encoding_failure(message: String) -> Bytes {
+    ndjson_failure("delivery_encoding_failed", message, None, None)
 }
 
 /// Record a batch as delivered through `sequence` for the session sending
@@ -5925,16 +6025,14 @@ async fn emit_history_batch(
         );
     };
     let delivered_through = pending.acknowledgeable_sequence;
-    let first_cursor = pending.changes.first().map(|change| change.cursor.clone());
-    let last_cursor = pending.changes.last().map(|change| change.cursor.clone());
-    let encoded_event_payload = match serde_json::to_vec(&pending.changes) {
-        Ok(encoded) => encoded,
-        Err(error) => {
+    let batch = match consumer_stream_batch(&stream_state.stream_id, stream_state.gzip, pending) {
+        Ok(batch) => batch,
+        Err(message) => {
             stream_state.terminal = true;
             return (
                 Ok(ndjson_failure(
                     "delivery_encoding_failed",
-                    error.to_string(),
+                    message,
                     None,
                     None,
                 )),
@@ -5942,28 +6040,41 @@ async fn emit_history_batch(
             );
         }
     };
-    let transmitted_event_bytes = if stream_state.gzip {
-        match gzip_member(&encoded_event_payload) {
-            Ok(compressed) => compressed.len(),
-            Err(error) => {
-                stream_state.terminal = true;
-                return (
-                    Ok(ndjson_failure(
-                        "delivery_encoding_failed",
-                        error.to_string(),
-                        None,
-                        None,
-                    )),
-                    stream_state,
-                );
-            }
-        }
+    if let Some(failure) = record_session_delivery(
+        &stream_state.state,
+        &stream_state.stream_id,
+        &stream_state.consumer_id,
+        stream_state.lease.generation,
+        delivered_through,
+    )
+    .await
+    {
+        stream_state.terminal = true;
+        return (Ok(failure), stream_state);
+    }
+    (Ok(ndjson_line_or_error(&batch)), stream_state)
+}
+
+/// The batch record for `pending`, with its encoded and transmitted sizes.
+fn consumer_stream_batch(
+    stream_id: &str,
+    gzip: bool,
+    pending: PendingHistoryBatch,
+) -> Result<ConsumerStreamBatch, String> {
+    let first_cursor = pending.changes.first().map(|change| change.cursor.clone());
+    let last_cursor = pending.changes.last().map(|change| change.cursor.clone());
+    let encoded_event_payload =
+        serde_json::to_vec(&pending.changes).map_err(|error| error.to_string())?;
+    let transmitted_event_bytes = if gzip {
+        gzip_member(&encoded_event_payload)
+            .map_err(|error| error.to_string())?
+            .len()
     } else {
         encoded_event_payload.len()
     };
-    let batch = ConsumerStreamBatch {
+    Ok(ConsumerStreamBatch {
         record_type: "batch",
-        stream_id: stream_state.stream_id.clone(),
+        stream_id: stream_id.to_owned(),
         origin_kind: pending.origin.kind.as_str().to_owned(),
         origin_id: pending.origin.id.clone(),
         publication_revision: pending.origin.publication_revision.to_string(),
@@ -5980,20 +6091,7 @@ async fn emit_history_batch(
         last_cursor,
         acknowledgeable_cursor: pending.acknowledgeable_cursor,
         changes: pending.changes,
-    };
-    if let Some(failure) = record_session_delivery(
-        &stream_state.state,
-        &stream_state.stream_id,
-        &stream_state.consumer_id,
-        stream_state.lease.generation,
-        delivered_through,
-    )
-    .await
-    {
-        stream_state.terminal = true;
-        return (Ok(failure), stream_state);
-    }
-    (Ok(ndjson_line_or_error(&batch)), stream_state)
+    })
 }
 
 async fn emit_backfill_completion(
@@ -8778,9 +8876,10 @@ mod tests {
     }
 
     /// A block-local counter whose block `n` publishes `n + 1` changes, so a
-    /// live commit can end past a page read.
+    /// live commit can end past a page read, and whose changes of the block
+    /// it names, if any, cannot be rendered as JSON.
     #[derive(Debug)]
-    struct FanOutCounter(leani_testkit::BlockLocalCounter);
+    struct FanOutCounter(leani_testkit::BlockLocalCounter, Option<u64>);
 
     #[async_trait]
     impl Processor for FanOutCounter {
@@ -8825,6 +8924,21 @@ mod tests {
                 changes.push(change);
             }
             Ok(leani_processor_api::DomainChanges { changes })
+        }
+
+        fn change_json(
+            &self,
+            change: &leani_processor_api::DomainChange,
+        ) -> Result<Option<Value>, leani_processor_api::ProcessorError> {
+            if self
+                .1
+                .is_some_and(|block| change.key.starts_with(&block.to_be_bytes()))
+            {
+                return Err(leani_processor_api::ProcessorError::Invariant(
+                    "stored change has an unknown layout".to_owned(),
+                ));
+            }
+            Ok(None)
         }
     }
 
@@ -11541,7 +11655,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let mut chunks = response.into_body().into_data_stream();
         let mut records = Vec::new();
-        for _ in 0..5 {
+        for _ in 0..2 {
             let chunk = tokio::time::timeout(Duration::from_secs(5), chunks.next())
                 .await
                 .expect("stream record in time")
@@ -11559,26 +11673,20 @@ mod tests {
             .map(|interval| (interval["fromBlock"].clone(), interval["toBlock"].clone()))
             .collect::<Vec<_>>();
         assert_eq!(available, [(json!(1), json!(2)), (json!(6), json!(6))]);
-        // ...and the notice is a batch of its own before block 6.
-        let blocks = records[1..]
-            .iter()
-            .map(|batch| {
-                (
-                    batch["fromBlock"].clone(),
-                    batch["domainChangeCount"].clone(),
-                )
-            })
-            .collect::<Vec<_>>();
+        // ...and the notice comes before block 6, in the batch that brings
+        // the consumer up to date.
+        let batch = &records[1];
         assert_eq!(
-            blocks,
-            [
-                (json!(1), json!("1")),
-                (json!(2), json!("1")),
-                (json!(6), json!("0")),
-                (json!(6), json!("1")),
-            ]
+            (
+                &batch["fromBlock"],
+                &batch["throughBlock"],
+                &batch["processedBlockCount"],
+                &batch["domainChangeCount"],
+            ),
+            (&json!(1), &json!(6), &json!("4"), &json!("3")),
+            "{batch}"
         );
-        let notice = &records[3]["changes"][0];
+        let notice = &batch["changes"][2];
         assert_eq!(notice["kind"], "system.live_gap.put");
         assert_eq!(notice["operation"], "finalized");
         assert_eq!(
@@ -11674,9 +11782,8 @@ mod tests {
         let mut chunks = first.into_body().into_data_stream();
         let mut last_cursor = None;
         let mut session_token = None;
-        for (expected_type, expected_block) in
-            [("hello", None), ("batch", Some(1)), ("batch", Some(2))]
-        {
+        // The consumer is two blocks behind, which one batch delivers.
+        for expected_type in ["hello", "batch"] {
             let chunk = tokio::time::timeout(Duration::from_secs(5), chunks.next())
                 .await
                 .expect("stream record in time")
@@ -11684,13 +11791,13 @@ mod tests {
                 .expect("stream bytes");
             let record: Value = serde_json::from_slice(&chunk).expect("NDJSON record");
             assert_eq!(record["type"], expected_type);
-            if let Some(expected_block) = expected_block {
+            if expected_type == "batch" {
                 assert_eq!(record["originKind"], "live");
-                assert_eq!(record["fromBlock"], expected_block);
-                assert_eq!(record["throughBlock"], expected_block);
-                assert_eq!(record["processedBlockCount"], "1");
-                assert_eq!(record["domainChangeCount"], "1");
-                assert_eq!(record["changes"].as_array().expect("changes").len(), 1);
+                assert_eq!(record["fromBlock"], 1);
+                assert_eq!(record["throughBlock"], 2);
+                assert_eq!(record["processedBlockCount"], "2");
+                assert_eq!(record["domainChangeCount"], "2");
+                assert_eq!(record["changes"].as_array().expect("changes").len(), 2);
                 last_cursor = record["lastCursor"].as_str().map(str::to_owned);
             } else {
                 assert_eq!(record["streamKind"], "live");
@@ -12880,31 +12987,415 @@ mod tests {
         stream_two_whole_live_blocks(4).await;
     }
 
-    #[tokio::test]
-    async fn a_live_block_past_the_event_limit_fails_without_reading_on() {
-        // Review 1, minor 2: a read that ended inside a block too large for
-        // one batch must not wait for the rest of it, which would buffer
-        // the whole block.
+    /// A live stream over fan-out blocks `1..=through`, block `n` holding
+    /// `n + 1` changes and the `unrenderable` block's failing to render, under
+    /// `live_batch_limits`: the router, the stream after its hello with what
+    /// it buffered past it, and the session token.
+    async fn fan_out_live_stream(
+        through: u64,
+        live_batch_limits: DeliveryBatchLimits,
+        unrenderable: Option<u64>,
+    ) -> (
+        tempfile::TempDir,
+        Router,
+        (axum::body::BodyDataStream, Vec<u8>),
+        String,
+    ) {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
             directory.path().join("node.sqlite"),
         ))
         .await
         .expect("store");
-        let processor = FanOutCounter(leani_testkit::BlockLocalCounter::default());
-        apply_finalized_blocks(&store, &processor, 1..=2).await;
-        let second_block = store
-            .changes(processor.descriptor(), ChainId(1), 2, 10)
+        let counter = leani_testkit::BlockLocalCounter::default();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(FanOutCounter(
+            counter.with_lifecycle(lifecycle),
+            unrenderable,
+        ));
+        store
+            .register_processor(processor.descriptor())
             .await
-            .expect("block 2")
-            .into_iter()
-            .collect::<VecDeque<_>>();
-        assert_eq!(second_block.len(), 3);
-        let batch = |maximum_events| {
-            whole_live_block(&second_block, false, maximum_events).map(|(_, records)| records)
-        };
-        assert_eq!(batch(3), None);
-        assert_eq!(batch(2), Some(3));
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        apply_finalized_blocks(&store, processor.as_ref(), 1..=through).await;
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(
+            store,
+            vec![configured],
+            Vec::new(),
+            ApiConfig {
+                live_batch_limits,
+                ..ApiConfig::default()
+            },
+        )
+        .expect("router");
+        let stream = app
+            .clone()
+            .oneshot(get_request(
+                "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+            ))
+            .await
+            .expect("stream");
+        assert_eq!(stream.status(), StatusCode::OK);
+        let mut body = stream.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        let hello = next_ndjson_record(&mut body, &mut buffered).await;
+        let token = hello["sessionToken"]
+            .as_str()
+            .expect("session token")
+            .to_owned();
+        (directory, app, (body, buffered), token)
+    }
+
+    fn live_acknowledgement(token: &str, cursor: &Value) -> Request<Body> {
+        Request::post("/v1/processors/synthetic-counter/streams/live/consumers/destination/ack")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(CONSUMER_SESSION_HEADER, token)
+            .body(Body::from(json!({ "cursor": cursor }).to_string()))
+            .expect("acknowledgement request")
+    }
+
+    #[tokio::test]
+    async fn live_batches_pack_the_whole_blocks_a_consumer_is_behind_by() {
+        let (_directory, app, (mut body, mut buffered), token) =
+            fan_out_live_stream(3, DeliveryBatchLimits::live_default(), None).await;
+        let batch = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(
+            (
+                &batch["fromBlock"],
+                &batch["throughBlock"],
+                &batch["processedBlockCount"],
+                &batch["progressUnitCount"],
+                batch["changes"].as_array().map(Vec::len),
+            ),
+            (&json!(1), &json!(3), &json!("3"), &json!("3"), Some(9)),
+            "{batch}"
+        );
+        assert_eq!(batch["acknowledgeableCursor"], batch["lastCursor"]);
+        let (status, consumer) = send(
+            &app,
+            live_acknowledgement(&token, &batch["acknowledgeableCursor"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{consumer}");
+        assert_eq!(consumer["acknowledgedSequence"], "9");
+        assert_eq!(consumer["lagChanges"], "0");
+
+        // The block limit ends a batch too.
+        let (_directory, _app, (mut body, mut buffered), _token) = fan_out_live_stream(
+            3,
+            DeliveryBatchLimits {
+                maximum_processed_blocks: 2,
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let mut blocks = Vec::new();
+        for _ in 0..2 {
+            let batch = next_ndjson_record(&mut body, &mut buffered).await;
+            blocks.push((batch["fromBlock"].clone(), batch["throughBlock"].clone()));
+        }
+        assert_eq!(blocks, [(json!(1), json!(2)), (json!(3), json!(3))]);
+    }
+
+    #[tokio::test]
+    async fn live_batches_keep_a_reorgs_undos_apart_from_other_blocks() {
+        // An application that rebuilds aggregates once per run of undo
+        // batches finds the run's end at a batch boundary.
+        use leani_testkit::{BlockLocalCounter, fixture_frame};
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = SqliteStore::open(leani_store_sqlite::StoreConfig::new(
+            directory.path().join("node.sqlite"),
+        ))
+        .await
+        .expect("store");
+        let counter = BlockLocalCounter::default().with_split_delivery();
+        let lifecycle =
+            acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
+        let processor = Arc::new(counter.with_lifecycle(lifecycle));
+        store
+            .register_processor(processor.descriptor())
+            .await
+            .expect("register processor");
+        store
+            .create_consumer_in_stream(
+                processor.descriptor(),
+                &default_delivery_stream_id(processor.descriptor()),
+                "destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::EarliestRetained,
+                Duration::from_secs(30),
+            )
+            .await
+            .expect("consumer");
+        let first = fixture_frame(1, BlockHash::ZERO);
+        let second = fixture_frame(2, first.block.hash);
+        let mut replacement = fixture_frame(2, first.block.hash);
+        replacement.block.hash = BlockHash::new([0x22; 32]);
+        for (sequence, frame) in [(1, &first), (2, &second), (3, &replacement)] {
+            if sequence == 3 {
+                store
+                    .undo(
+                        processor.descriptor(),
+                        ChainId(1),
+                        BlockNumber(2),
+                        second.block.hash,
+                        &[],
+                    )
+                    .await
+                    .expect("undo block 2");
+            }
+            let delta = processor.map(frame).await.expect("map");
+            store
+                .apply(
+                    processor.as_ref(),
+                    ProcessorCursor {
+                        chain_id: frame.chain_id,
+                        processor_id: processor.descriptor().id.to_string(),
+                        processor_version: processor.descriptor().version.to_string(),
+                        block_number: frame.block.number,
+                        block_hash: frame.block.hash,
+                        finality: Finality::Attested,
+                        sequence,
+                    },
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+        }
+        let configured: Arc<dyn Processor> = processor;
+        let app = router_with_processors(store, vec![configured], Vec::new(), ApiConfig::default())
+            .expect("router");
+        let stream = app
+            .oneshot(get_request(
+                "/v1/processors/synthetic-counter/streams/live/consumers/destination/stream",
+            ))
+            .await
+            .expect("stream");
+        let mut body = stream.into_body().into_data_stream();
+        let mut buffered = Vec::new();
+        assert_eq!(
+            next_ndjson_record(&mut body, &mut buffered).await["type"],
+            "hello"
+        );
+        let mut batches = Vec::new();
+        for _ in 0..3 {
+            let batch = next_ndjson_record(&mut body, &mut buffered).await;
+            let operations = batch["changes"]
+                .as_array()
+                .expect("changes")
+                .iter()
+                .map(|change| change["operation"].as_str().expect("operation").to_owned())
+                .collect::<Vec<_>>();
+            batches.push((batch["fromBlock"].clone(), operations));
+        }
+        assert_eq!(
+            batches,
+            [
+                (json!(1), vec!["apply".to_owned(), "apply".to_owned()]),
+                (json!(2), vec!["undo".to_owned()]),
+                (json!(2), vec!["apply".to_owned()]),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_block_past_the_limits_arrives_in_parts_acknowledged_only_at_its_end() {
+        // Block 2's three changes exceed a two-event batch.
+        let (_directory, app, (mut body, mut buffered), token) = fan_out_live_stream(
+            2,
+            DeliveryBatchLimits {
+                maximum_events: 2,
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let mut batches = Vec::new();
+        for _ in 0..3 {
+            batches.push(next_ndjson_record(&mut body, &mut buffered).await);
+        }
+        assert_eq!(
+            batches
+                .iter()
+                .map(|batch| (
+                    batch["throughBlock"].as_u64().expect("block"),
+                    batch["changes"].as_array().expect("changes").len(),
+                    batch["processedBlockCount"].as_str().expect("count"),
+                ))
+                .collect::<Vec<_>>(),
+            [(1, 2, "1"), (2, 2, "0"), (2, 1, "1")]
+        );
+        // The first part offers block 1's end again, and the last part ends
+        // block 2.
+        assert_eq!(
+            batches[1]["acknowledgeableCursor"],
+            batches[0]["acknowledgeableCursor"]
+        );
+        assert_ne!(
+            batches[1]["acknowledgeableCursor"],
+            batches[1]["lastCursor"]
+        );
+        assert_eq!(
+            batches[2]["acknowledgeableCursor"],
+            batches[2]["lastCursor"]
+        );
+        let (status, response) = send(
+            &app,
+            live_acknowledgement(&token, &batches[1]["lastCursor"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{response}");
+        assert_eq!(response["error"]["code"], "acknowledgement_mid_block");
+        for (batch, acknowledged) in [(&batches[1], "2"), (&batches[2], "5")] {
+            let (status, response) = send(
+                &app,
+                live_acknowledgement(&token, &batch["acknowledgeableCursor"]),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{response}");
+            assert_eq!(response["acknowledgedSequence"], acknowledged);
+        }
+
+        // A part of the first block offers where the consumer started.
+        let (_directory, app, (mut body, mut buffered), token) = fan_out_live_stream(
+            1,
+            DeliveryBatchLimits {
+                maximum_events: 1,
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let part = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(part["processedBlockCount"], "0", "{part}");
+        let (status, response) = send(
+            &app,
+            live_acknowledgement(&token, &part["acknowledgeableCursor"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        assert_eq!(response["acknowledgedSequence"], "0");
+    }
+
+    #[tokio::test]
+    async fn a_live_change_past_the_byte_limit_ends_the_stream() {
+        let (_directory, _app, (mut body, mut buffered), _token) = fan_out_live_stream(
+            1,
+            DeliveryBatchLimits {
+                target_encoded_bytes: 64,
+                maximum_encoded_bytes: 64,
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let failure = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(
+            failure["code"], "single_change_exceeds_delivery_batch_limit",
+            "{failure}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_change_that_cannot_be_rendered_ends_the_stream_after_the_blocks_before_it() {
+        let (_directory, _app, (mut body, mut buffered), _token) =
+            fan_out_live_stream(3, DeliveryBatchLimits::live_default(), Some(3)).await;
+        let batch = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(
+            (&batch["fromBlock"], &batch["throughBlock"]),
+            (&json!(1), &json!(2)),
+            "{batch}"
+        );
+        let failure = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(failure["code"], "delivery_encoding_failed", "{failure}");
+    }
+
+    #[tokio::test]
+    async fn live_records_leave_room_in_the_buffer_for_their_own_fields() {
+        // Packed to `maximum_encoded_bytes` of changes, a record would not
+        // fit a buffer of as many bytes, and the stream would end there on
+        // every reconnect.
+        let (_directory, _app, (mut body, mut buffered), _token) =
+            fan_out_live_stream(30, DeliveryBatchLimits::live_default(), None).await;
+        let packed = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(packed["processedBlockCount"], "30", "{packed}");
+        let bytes = packed["uncompressedEncodedBytes"]
+            .as_str()
+            .and_then(|bytes| bytes.parse::<u64>().ok())
+            .expect("encoded bytes");
+        let (_directory, _app, (mut body, mut buffered), _token) = fan_out_live_stream(
+            30,
+            DeliveryBatchLimits {
+                target_encoded_bytes: bytes,
+                maximum_encoded_bytes: bytes,
+                maximum_buffered_bytes: bytes,
+                compression: DeliveryCompression::None,
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let mut blocks = 0;
+        while blocks < 30 {
+            let batch = next_ndjson_record(&mut body, &mut buffered).await;
+            assert_eq!(batch["type"], "batch", "{batch}");
+            blocks += batch["processedBlockCount"]
+                .as_str()
+                .and_then(|count| count.parse::<u64>().ok())
+                .expect("block count");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_live_batch_reads_on_toward_its_target_for_at_most_its_delay() {
+        // Blocks 1..=44 hold 1,034 changes: a page of 1,000 ends inside
+        // block 44.
+        let (_directory, _app, (mut body, mut buffered), _token) = fan_out_live_stream(
+            44,
+            DeliveryBatchLimits {
+                maximum_delay: Duration::from_secs(60),
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let batch = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(batch["processedBlockCount"], "44", "{batch}");
+
+        let (_directory, _app, (mut body, mut buffered), _token) = fan_out_live_stream(
+            44,
+            DeliveryBatchLimits {
+                maximum_delay: Duration::from_nanos(1),
+                ..DeliveryBatchLimits::live_default()
+            },
+            None,
+        )
+        .await;
+        let batch = next_ndjson_record(&mut body, &mut buffered).await;
+        assert_eq!(
+            (
+                &batch["throughBlock"],
+                batch["changes"].as_array().map(Vec::len)
+            ),
+            (&json!(43), Some(989)),
+            "{batch}"
+        );
     }
 
     /// Stream two fan-out blocks, of 2 and 3 records, through a live stream
@@ -12920,7 +13411,7 @@ mod tests {
         let counter = leani_testkit::BlockLocalCounter::default();
         let lifecycle =
             acknowledged_delivery(counter.descriptor().lifecycle.clone(), "destination");
-        let processor = Arc::new(FanOutCounter(counter.with_lifecycle(lifecycle)));
+        let processor = Arc::new(FanOutCounter(counter.with_lifecycle(lifecycle), None));
         store
             .register_processor(processor.descriptor())
             .await

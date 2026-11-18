@@ -35,8 +35,8 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
   are on it: without execution peers within a minute, or after an outage
   longer than about a day. The application receives their `undo` changes, and
   the blocks become part of the skipped range. After a restart that follows
-  a long outage, and on reorgs, several blocks can be reverted in a row: one
-  `undo` batch per block, newest first. Rebuild derived data once per such
+  a long outage, and on reorgs, several blocks can be reverted in a row, in
+  `undo`-only batches, newest first. Rebuild derived data once per such
   run, as [Undo runs](/docs/concepts/coverage-finality-and-reorgs/#undo-runs)
   describes.
 - On the application's side, a crash between its commit and its
@@ -87,8 +87,10 @@ its operator requests them as `POST /admin/v1/materialization-jobs`.
 6. **Write idempotently.** Live, history, and redelivered batches can overlap
    and arrive out of block order. Write each block's rows as an upsert keyed
    by block, so that a block arriving twice, or from history after live,
-   changes nothing. Deduplicate batches by cursor, not by block: block `n`
-   can come as a notice batch and then as its own batch. A `live_recovery`
+   changes nothing. Deduplicate batches by `lastCursor`, not by block or
+   `acknowledgeableCursor`: block `n` can come as a notice batch and then as
+   its own batch, and a block past the live batch limits comes in several
+   batches that offer the same `acknowledgeableCursor`. A `live_recovery`
    batch can repeat a block that a history subscription delivers, such as one
    the application requested from its coverage diff while the lane filled the
    same range. A notice can also be followed by `live_recovery` batches for

@@ -641,8 +641,14 @@ export interface paths {
         };
         /**
          * Stream the dedicated live lane for a durable consumer
-         * @description Each batch holds one whole block's commit, and records the consumer's
-         *     delivered sequence through it. A request whose `Sec-Fetch-Site` is
+         * @description Each batch holds whole commits of one origin, blocks and finality or
+         *     gap notices, up to `api.delivery.live_batches`: one at the head, many
+         *     for a consumer that is behind. A commit past those limits arrives in
+         *     parts, whose `processedBlockCount` is `"0"` and whose
+         *     `acknowledgeableCursor` ends the commit before it. Each batch records
+         *     the consumer's delivered sequence through its last change, so parts
+         *     share an `acknowledgeableCursor` with the batch before them:
+         *     deduplicate batches by `lastCursor`. A request whose `Sec-Fetch-Site` is
          *     `cross-site` or `same-site` without an allowed `Origin`, such as a
          *     navigation of another site's frame, gets 403 `cross_site_request`.
          *     When the node shuts down, the stream ends after a whole record;
@@ -3284,8 +3290,8 @@ export interface operations {
         responses: {
             /**
              * @description Newline-delimited JSON records: first a `hello` with the
-             *     processor's coverage as the session starts, then whole-block
-             *     `batch` records and, while idle, `heartbeat` records. An `error`
+             *     processor's coverage as the session starts, then `batch` records
+             *     and, while idle, `heartbeat` records. An `error`
              *     or `reset_required` record ends the stream. A batch of a
              *     `system.live_gap.put` change announces blocks the live lane
              *     skipped and did not fill.

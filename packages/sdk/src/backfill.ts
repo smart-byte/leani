@@ -312,15 +312,22 @@ export interface LiveStreamBatch<T = unknown> {
   publicationRevision: "0";
   fromBlock: number;
   throughBlock: number;
-  processedBlockCount: "1";
+  /** The commits the batch ends: blocks, and finality or gap notices. A
+   * consumer that is behind receives many per batch. `"0"` for a part of a
+   * block larger than the live batch limits. */
+  processedBlockCount: string;
   domainChangeCount: string;
-  progressUnitCount: "1";
+  /** The same count as `processedBlockCount`. */
+  progressUnitCount: string;
   rawPayloadBytes: string;
   uncompressedEncodedBytes: string;
   transmittedBytes: string;
   buildDelayMs: string;
   firstCursor: string;
   lastCursor: string;
+  /** The end of the batch's last commit. A part of a larger block offers
+   * the end of the commit before it, so no acknowledgement ends inside a
+   * block. */
   acknowledgeableCursor: string;
   changes: ChangeEnvelope<T>[];
 }

@@ -159,8 +159,8 @@ leani init uniswap-v3 ETH/USDC --keep window --window-days 30 --memory 1GiB --ye
   prereleases are not `latest` on npm.
 - A reorg, or the revert at a restart after a long outage, can undo several
   blocks in a row. The durable live delivery stream, which the SDK's
-  `streamLive()` from `@smart-byte/leani-sdk/backfill` reads, delivers one
-  `undo` batch per block, newest first. Rebuild derived aggregates once per
+  `streamLive()` from `@smart-byte/leani-sdk/backfill` reads, delivers them
+  in `undo`-only batches, newest first. Rebuild derived aggregates once per
   run, as "Undo runs" in
   `$LEANI_SOURCE/docs/concepts/coverage-finality-and-reorgs.mdx` (or
   https://leani.dev/_llms-txt/concepts.txt) describes.
