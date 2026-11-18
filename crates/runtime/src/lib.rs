@@ -3887,9 +3887,10 @@ pub struct SharedLiveRuntime {
     config: SharedLiveRuntimeConfig,
     finalized_gap_recovery: Option<Arc<dyn FinalizedLiveGapRecovery>>,
     unavailable_processors: Arc<StdMutex<HashSet<String>>>,
-    /// By instance, the first block a lane's fill could not apply because the
-    /// store refused it at a delivery limit, and the delivery bytes it needs.
-    /// The fill fetches that block again only once the store would take them.
+    /// By instance, the last block a lane's replay or fill could not apply
+    /// because the store refused it at a delivery limit, and the delivery
+    /// bytes it needs. The lane fetches that block from history again only
+    /// once the store would take them.
     refused_fills: Arc<StdMutex<HashMap<String, (BlockNumber, u64)>>>,
     /// Serializes processor-lane work across clones: a live commit, a gap
     /// drain, or parking a lane. A reconcile on one clone therefore never
@@ -5201,19 +5202,7 @@ impl SharedLiveRuntime {
                 let outcome = match self.apply_recovered_delta(processor, &delta).await {
                     Ok(outcome) => outcome,
                     Err(error) if fill_holds_the_lane(&error) => {
-                        // The store refuses the block until a delivery limit
-                        // has room for its bytes; until then, fetching it
-                        // again is for nothing.
-                        if let RuntimeError::Store(StoreError::DeliveryLimit {
-                            incoming_bytes,
-                            ..
-                        }) = &error
-                        {
-                            self.refused_fills
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(descriptor.instance.to_string(), (next, *incoming_bytes));
-                        }
+                        self.remember_refused_block(descriptor, next, &error);
                         return Ok(GapFill::Hold(GapHold::Refused(error)));
                     }
                     Err(error) if fill_gives_up(&error) => {
@@ -5316,6 +5305,23 @@ impl SharedLiveRuntime {
             }
         }
         Ok(None)
+    }
+
+    /// Remember the bytes `block` needs when the store refused it at a
+    /// delivery limit: until a limit has room for them, fetching it again is
+    /// for nothing.
+    fn remember_refused_block(
+        &self,
+        descriptor: &ProcessorDescriptor,
+        block: BlockNumber,
+        error: &RuntimeError,
+    ) {
+        if let RuntimeError::Store(StoreError::DeliveryLimit { incoming_bytes, .. }) = error {
+            self.refused_fills
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(descriptor.instance.to_string(), (block, *incoming_bytes));
+        }
     }
 
     /// The capacity limit at which the store would refuse the lane's next
@@ -5758,6 +5764,7 @@ impl SharedLiveRuntime {
         let outcome = match applied {
             Ok(outcome) => outcome,
             Err(error) if live_lane_isolatable_error(&error) => {
+                self.remember_refused_block(processor.descriptor(), delta.block.number, &error);
                 self.isolate_replay_failure(processor, delta.block, &error)
                     .await?;
                 return Ok(false);
@@ -6058,6 +6065,14 @@ impl SharedLiveRuntime {
                 .await?;
             return Ok(false);
         };
+        // As a fill does, a lane the store would refuse fetches nothing.
+        if let Some(reason) = self
+            .store_refuses_lane(processor.descriptor(), first.number)
+            .await?
+        {
+            self.pause_live_gap(processor, first, reason).await?;
+            return Ok(false);
+        }
         let finalized_head = self
             .store
             .finalized_canonical_head(chain_id)
@@ -25083,6 +25098,151 @@ mod tests {
                 .expect("gap")
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn a_held_lane_recovers_its_pruned_gap_frame_only_once_the_store_has_room() {
+        let chain = live_blocks(7);
+        // Its live delivery holds six blocks' changes, 56 bytes each.
+        let counter = {
+            let counter = BlockLocalCounter::named("held-recovery-counter").with_split_delivery();
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.delivery.max_bytes = 360;
+            lifecycle.delivery.on_limit = DeliveryLimitAction::Pause;
+            Arc::new(counter.with_lifecycle(lifecycle))
+        };
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(&chain)));
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                SharedLiveRuntimeConfig::default(),
+                &history,
+                steps,
+            )
+        };
+        run_live(&runtime(block_events(&chain)))
+            .await
+            .expect("live run");
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[6].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        // Finality prunes block 6's frame during the hold.
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(7), chain[7].block.hash)
+            .await
+            .expect("finalize");
+        store
+            .prune_recent_frames(ChainId(1), BlockNumber(7), 1, 1, 1)
+            .await
+            .expect("prune recent frames");
+        assert!(
+            store
+                .recent_frame(ChainId(1), BlockNumber(6))
+                .await
+                .expect("frame")
+                .is_none()
+        );
+        for _ in 0..3 {
+            runtime(Vec::new())
+                .reconcile_pending()
+                .await
+                .expect("drain");
+        }
+        assert_eq!(history.calls(), 0);
+
+        // Once the consumer acknowledges, the next drain recovers block 6
+        // and replays block 7.
+        store
+            .prune_changes_before(counter.descriptor(), u64::MAX)
+            .await
+            .expect("free delivery capacity");
+        let report = runtime(Vec::new())
+            .reconcile_pending()
+            .await
+            .expect("drain");
+        assert_eq!(history.calls(), 1);
+        assert_eq!(report.processors["held-recovery-counter"].applied, 2);
+        assert_gap_recovered(&store, counter.as_ref()).await;
+    }
+
+    #[tokio::test]
+    async fn a_lane_held_below_its_resume_mark_fetches_its_pruned_gap_frame_once_its_block_fits() {
+        let chain = live_blocks(3);
+        // Blocks 0 and 1, 56 bytes each, leave its stream below the 135-byte
+        // resume mark, without room for block 2.
+        let counter = {
+            let counter = BlockLocalCounter::named("tight-recovery-counter").with_split_delivery();
+            let mut lifecycle = counter.descriptor().lifecycle.clone();
+            lifecycle.delivery.max_bytes = 150;
+            lifecycle.delivery.on_limit = DeliveryLimitAction::Pause;
+            Arc::new(counter.with_lifecycle(lifecycle))
+        };
+        let lanes: Vec<Arc<dyn Processor>> = vec![counter.clone()];
+        let history = Arc::new(CountingLiveGapRecovery::serving(finalized_copies(&chain)));
+        let (_directory, store) = store().await;
+        let runtime = |steps| {
+            filling_live(
+                &store,
+                &lanes,
+                SharedLiveRuntimeConfig::default(),
+                &history,
+                steps,
+            )
+        };
+        let live = runtime(block_events(&chain));
+        run_live(&live).await.expect("live run");
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[2].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
+        store
+            .mark_recent_finalized(ChainId(1), BlockNumber(3), chain[3].block.hash)
+            .await
+            .expect("finalize");
+        store
+            .prune_recent_frames(ChainId(1), BlockNumber(3), 1, 1, 1)
+            .await
+            .expect("prune recent frames");
+        for _ in 0..3 {
+            live.reconcile_pending().await.expect("drain");
+        }
+        assert_eq!(history.calls(), 0);
+        // After a restart the lane learns the bytes from one refused fetch.
+        let restarted = runtime(Vec::new());
+        for _ in 0..3 {
+            restarted.reconcile_pending().await.expect("drain");
+        }
+        assert_eq!(history.calls(), 1);
+
+        // Once the consumer acknowledges, the next drain recovers block 2,
+        // and block 3 waits at the limit in turn.
+        store
+            .prune_changes_before(counter.descriptor(), u64::MAX)
+            .await
+            .expect("free delivery capacity");
+        let report = restarted.reconcile_pending().await.expect("drain");
+        assert_eq!(history.calls(), 2);
+        assert_eq!(report.processors["tight-recovery-counter"].applied, 1);
+        assert_parked_at(
+            &store,
+            counter.as_ref(),
+            chain[3].block,
+            ProcessorRunState::Paused,
+            "delivery_spool_hard_limit",
+        )
+        .await;
     }
 
     #[tokio::test]
