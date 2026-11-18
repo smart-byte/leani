@@ -76,10 +76,11 @@ const SCHEMA_V27: &str = include_str!("../migrations/0027_maintenance_indexes.sq
 const SCHEMA_V28: &str = include_str!("../migrations/0028_settled_level.sql");
 const SCHEMA_V29: &str = include_str!("../migrations/0029_header_fee_recipients.sql");
 const SCHEMA_V30: &str = include_str!("../migrations/0030_confirmed_level.sql");
+const SCHEMA_V31: &str = include_str!("../migrations/0031_consumer_lag.sql");
 /// Current on-disk `SQLite` schema version written by this crate.
-pub const CURRENT_SCHEMA_VERSION: u32 = 30;
+pub const CURRENT_SCHEMA_VERSION: u32 = 31;
 /// Each schema above 1 with the migration that reaches it, in order.
-const MIGRATIONS: [(u32, &str); 29] = [
+const MIGRATIONS: [(u32, &str); 30] = [
     (2, SCHEMA_V2),
     (3, SCHEMA_V3),
     (4, SCHEMA_V4),
@@ -109,6 +110,7 @@ const MIGRATIONS: [(u32, &str); 29] = [
     (28, SCHEMA_V28),
     (29, SCHEMA_V29),
     (30, SCHEMA_V30),
+    (31, SCHEMA_V31),
 ];
 /// Schema that added the node secret, which its migration generates.
 const NODE_SECRET_SCHEMA_VERSION: u32 = 23;
@@ -12392,6 +12394,11 @@ impl SqliteStore {
         .bind(credential_hash)
         .execute(&mut *transaction)
         .await?;
+        sqlx::query(CONSUMER_LAG_RECOUNT)
+            .bind(stream_id)
+            .bind(consumer_id)
+            .execute(&mut *transaction)
+            .await?;
         transaction.commit().await?;
         self.consumer_in_stream(descriptor, stream_id, consumer_id)
             .await?
@@ -12590,7 +12597,11 @@ impl SqliteStore {
         .await
     }
 
-    /// Measure one consumer's lag within an explicit delivery stream.
+    /// Measure one consumer's lag within an explicit delivery stream: the
+    /// retained changes after its acknowledged sequence, the distinct blocks
+    /// they belong to, their key and payload bytes, and the age of the first
+    /// of them. The counts are kept as changes are appended, acknowledged and
+    /// pruned, so the read costs the same however far the consumer is behind.
     ///
     /// # Errors
     ///
@@ -12602,27 +12613,24 @@ impl SqliteStore {
         stream_id: &str,
         consumer_id: &str,
     ) -> Result<ConsumerLag, StoreError> {
-        let consumer = self
-            .consumer_in_stream(descriptor, stream_id, consumer_id)
-            .await?
-            .ok_or_else(|| StoreError::ConsumerNotFound {
-                instance: processor_instance(descriptor),
-                consumer_id: consumer_id.to_owned(),
-            })?;
+        self.validate_delivery_stream(&processor_instance(descriptor), stream_id)
+            .await?;
         let row = sqlx::query(
-            "SELECT COUNT(*) AS changes,
-                    COUNT(DISTINCT block_number) AS blocks,
-                    COALESCE(SUM(length(entity_key) + length(payload)), 0) AS bytes,
-                    MIN(created_at_unix_ms) AS oldest
-             FROM change_log WHERE stream_id = ? AND stream_sequence > ?",
+            "SELECT lag_changes AS changes, lag_blocks AS blocks, lag_bytes AS bytes,
+                    (SELECT created_at_unix_ms FROM change_log
+                     WHERE change_log.stream_id = durable_consumers.stream_id
+                       AND change_log.stream_sequence > durable_consumers.acknowledged_sequence
+                     ORDER BY change_log.stream_sequence LIMIT 1) AS oldest
+             FROM durable_consumers WHERE stream_id = ? AND consumer_id = ?",
         )
-        .bind(&consumer.stream_id)
-        .bind(u64_i64(
-            consumer.acknowledged_sequence,
-            "consumer acknowledged sequence",
-        )?)
-        .fetch_one(&self.inner.pool)
-        .await?;
+        .bind(stream_id)
+        .bind(consumer_id)
+        .fetch_optional(&self.inner.pool)
+        .await?
+        .ok_or_else(|| StoreError::ConsumerNotFound {
+            instance: processor_instance(descriptor),
+            consumer_id: consumer_id.to_owned(),
+        })?;
         let oldest: Option<i64> = row.try_get("oldest")?;
         let now = i64_u64(now_i64()?, "current wall clock")?;
         let age_ms = if let Some(oldest) = oldest {
@@ -13386,6 +13394,16 @@ impl SqliteStore {
         let acknowledged_work_blocks = acknowledged_work_blocks
             .checked_add(newly_acknowledged_work)
             .ok_or(StoreError::Numeric("consumer acknowledged work blocks"))?;
+        let (lag_changes, lag_bytes, lag_blocks): (i64, i64, i64) =
+            sqlx::query_as(ACKNOWLEDGED_LAG)
+                .bind(stream_id)
+                .bind(u64_i64(
+                    acknowledged,
+                    "prior acknowledged delivery sequence",
+                )?)
+                .bind(u64_i64(sequence, "acknowledged delivery sequence")?)
+                .fetch_one(&mut *transaction)
+                .await?;
         let acknowledged_sequence = u64_i64(sequence, "acknowledged sequence")?;
         let acknowledged_work_blocks = u64_i64(
             acknowledged_work_blocks,
@@ -13401,6 +13419,9 @@ impl SqliteStore {
                  SET acknowledged_sequence = ?,
                      delivered_sequence = MAX(delivered_sequence, ?),
                      acknowledged_work_blocks = ?,
+                     lag_changes = lag_changes - ?,
+                     lag_bytes = lag_bytes - ?,
+                     lag_blocks = lag_blocks - ?,
                      lease_expires_at_unix_ms = ?,
                      updated_at_unix_ms = ?
                  WHERE stream_id = ? AND consumer_id = ?
@@ -13410,6 +13431,9 @@ impl SqliteStore {
             .bind(acknowledged_sequence)
             .bind(acknowledged_sequence)
             .bind(acknowledged_work_blocks)
+            .bind(lag_changes)
+            .bind(lag_bytes)
+            .bind(lag_blocks)
             .bind(next_expiry)
             .bind(now)
             .bind(stream_id)
@@ -13424,12 +13448,18 @@ impl SqliteStore {
                  SET acknowledged_sequence = ?,
                      delivered_sequence = MAX(delivered_sequence, ?),
                      acknowledged_work_blocks = ?,
+                     lag_changes = lag_changes - ?,
+                     lag_bytes = lag_bytes - ?,
+                     lag_blocks = lag_blocks - ?,
                      updated_at_unix_ms = ?
                  WHERE stream_id = ? AND consumer_id = ?",
             )
             .bind(acknowledged_sequence)
             .bind(acknowledged_sequence)
             .bind(acknowledged_work_blocks)
+            .bind(lag_changes)
+            .bind(lag_bytes)
+            .bind(lag_blocks)
             .bind(now)
             .bind(stream_id)
             .bind(consumer_id)
@@ -13614,6 +13644,11 @@ impl SqliteStore {
         .bind(now)
         .execute(&self.inner.pool)
         .await?;
+        sqlx::query(CONSUMER_LAG_RECOUNT)
+            .bind(&stream_id)
+            .bind(consumer_id)
+            .execute(&self.inner.pool)
+            .await?;
         Ok(())
     }
 
@@ -13876,6 +13911,11 @@ impl SqliteStore {
             .bind(stream_id)
             .bind(u64_i64(effective, "effective prune sequence")?)
             .fetch_one(&mut *transaction)
+            .await?;
+        sqlx::query(PRUNED_LAG)
+            .bind(stream_id)
+            .bind(u64_i64(effective, "effective prune sequence")?)
+            .execute(&mut *transaction)
             .await?;
         let result =
             sqlx::query("DELETE FROM change_log WHERE stream_id = ? AND stream_sequence < ?")
@@ -16712,7 +16752,7 @@ async fn append_changes(
                 .await?;
         }
     }
-    if !changes.is_empty() {
+    if let Some(first) = first {
         sqlx::query(
             "UPDATE delivery_streams
              SET next_sequence = ?, live_bytes = live_bytes + ?
@@ -16723,6 +16763,17 @@ async fn append_changes(
         .bind(stream_id)
         .execute(&mut **transaction)
         .await?;
+        sqlx::query(APPENDED_LAG)
+            .bind(
+                i64::try_from(changes.len())
+                    .map_err(|_| StoreError::Numeric("appended changes"))?,
+            )
+            .bind(u64_i64(appended_bytes, "appended delivery change bytes")?)
+            .bind(u64_i64(block.number.0, "block_number")?)
+            .bind(u64_i64(first, "stream change sequence")?)
+            .bind(stream_id)
+            .execute(&mut **transaction)
+            .await?;
     }
     Ok((first, last))
 }
@@ -17791,6 +17842,71 @@ const DELIVERY_AGE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM cha
 /// its limit, so that change would keep it paused.
 const DELIVERY_PRESSURE_PRUNE_CANDIDATE: &str = "SELECT MAX(stream_sequence) FROM change_log
      WHERE stream_id = ? AND +block_number <= ?";
+/// Add a block's appended changes to the lag of each consumer of stream
+/// `?5`: their count `?1` and bytes `?2`, and block `?3` unless a change of
+/// it before `?4`, the first appended, is still unacknowledged there.
+const APPENDED_LAG: &str = "UPDATE durable_consumers
+     SET lag_changes = lag_changes + ?1,
+         lag_bytes = lag_bytes + ?2,
+         lag_blocks = lag_blocks + NOT EXISTS (
+             SELECT 1 FROM change_log
+             WHERE change_log.stream_id = durable_consumers.stream_id
+               AND change_log.block_number = ?3
+               AND change_log.stream_sequence > durable_consumers.acknowledged_sequence
+               AND change_log.stream_sequence < ?4)
+     WHERE stream_id = ?5";
+/// The lag that acknowledging a stream's changes after `?2` through `?3`
+/// takes off a consumer: their count and bytes, and the blocks left with no
+/// change after `?3`. `+block_number` keeps the block index, whose order
+/// would spare the distinct step a sort, from scanning the whole stream.
+const ACKNOWLEDGED_LAG: &str = "SELECT COUNT(*),
+            COALESCE(SUM(length(entity_key) + length(payload)), 0),
+            (SELECT COUNT(*) FROM (
+                 SELECT DISTINCT +block_number AS block_number FROM change_log
+                 WHERE stream_id = ?1 AND stream_sequence > ?2 AND stream_sequence <= ?3
+             ) AS acked
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM change_log AS rest
+                 WHERE rest.stream_id = ?1 AND rest.block_number = acked.block_number
+                   AND rest.stream_sequence > ?3))
+     FROM change_log
+     WHERE stream_id = ?1 AND stream_sequence > ?2 AND stream_sequence <= ?3";
+/// Take the changes that pruning a stream below `?2` deletes off the lag of
+/// each consumer that has not acknowledged all of them, its blocks searched
+/// by sequence as in [`ACKNOWLEDGED_LAG`].
+const PRUNED_LAG: &str = "UPDATE durable_consumers
+     SET lag_changes = lag_changes - (
+             SELECT COUNT(*) FROM change_log
+             WHERE stream_id = ?1
+               AND stream_sequence > durable_consumers.acknowledged_sequence
+               AND stream_sequence < ?2),
+         lag_bytes = lag_bytes - (
+             SELECT COALESCE(SUM(length(entity_key) + length(payload)), 0) FROM change_log
+             WHERE stream_id = ?1
+               AND stream_sequence > durable_consumers.acknowledged_sequence
+               AND stream_sequence < ?2),
+         lag_blocks = lag_blocks - (
+             SELECT COUNT(*) FROM (
+                 SELECT DISTINCT +block_number AS block_number FROM change_log
+                 WHERE stream_id = ?1
+                   AND stream_sequence > durable_consumers.acknowledged_sequence
+                   AND stream_sequence < ?2
+             ) AS pruned
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM change_log AS kept
+                 WHERE kept.stream_id = ?1 AND kept.block_number = pruned.block_number
+                   AND kept.stream_sequence >= ?2))
+     WHERE stream_id = ?1 AND acknowledged_sequence + 1 < ?2";
+/// Count one consumer's lag from its stream's changes, for a consumer whose
+/// acknowledged sequence was set without an acknowledgement.
+const CONSUMER_LAG_RECOUNT: &str = "UPDATE durable_consumers
+     SET (lag_changes, lag_blocks, lag_bytes) = (
+         SELECT COUNT(*), COUNT(DISTINCT block_number),
+                COALESCE(SUM(length(entity_key) + length(payload)), 0)
+         FROM change_log
+         WHERE change_log.stream_id = durable_consumers.stream_id
+           AND change_log.stream_sequence > durable_consumers.acknowledged_sequence)
+     WHERE stream_id = ? AND consumer_id = ?";
 /// Changes below a sequence, counted up to a limit.
 const DELIVERY_PRUNE_ELIGIBLE_CHANGES: &str = "SELECT COUNT(*) FROM (
          SELECT 1 FROM change_log
@@ -30245,6 +30361,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn consumer_lag_accounting_searches_the_sequences_it_counts() {
+        // The block index serves only one block's changes: searched by stream
+        // alone, it walks every retained change on each acknowledgement.
+        let (_directory, store) = store().await;
+        for statement in [ACKNOWLEDGED_LAG, PRUNED_LAG, CONSUMER_LAG_RECOUNT] {
+            let plan = query_plan(&store, statement).await;
+            assert!(
+                plan.iter().any(|step| step.starts_with("SEARCH")
+                    && step.contains("change_log_stream_sequence_unique")
+                    && step.contains("stream_sequence>?"))
+                    && !plan.iter().any(|step| step.starts_with("SCAN change_log")
+                        || step.contains("change_log_stream_block")
+                            && !step.contains("block_number=?")),
+                "{statement}\n{plan:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn recent_frame_accounting_reads_only_the_size_index() {
         let (_directory, store) = store().await;
         for statement in [RECENT_FRAME_BYTES, RECENT_FRAME_STATS, RECENT_FRAME_SIZES] {
@@ -30331,6 +30466,277 @@ mod tests {
             i64::try_from(stats.live_bytes).expect("live bytes"),
             retained_bytes().await
         );
+    }
+
+    /// The lag the store keeps for `consumer`, beside the one a scan of its
+    /// stream's changes after its acknowledged sequence counts.
+    async fn kept_and_scanned_lag(
+        store: &SqliteStore,
+        descriptor: &ProcessorDescriptor,
+        consumer: &str,
+    ) -> ((u64, u64, u64), (u64, u64, u64)) {
+        let kept = store
+            .consumer_lag(descriptor, consumer)
+            .await
+            .expect("consumer lag");
+        let acknowledged = store
+            .consumer(descriptor, consumer)
+            .await
+            .expect("consumer")
+            .expect("consumer exists")
+            .acknowledged_sequence;
+        let (changes, blocks, bytes): (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COUNT(DISTINCT block_number),
+                    COALESCE(SUM(length(entity_key) + length(payload)), 0)
+             FROM change_log WHERE stream_id = ? AND stream_sequence > ?",
+        )
+        .bind(default_delivery_stream_id(descriptor))
+        .bind(i64::try_from(acknowledged).expect("sequence"))
+        .fetch_one(&store.inner.pool)
+        .await
+        .expect("scan lag");
+        let scanned = [changes, blocks, bytes].map(|value| u64::try_from(value).expect("count"));
+        (
+            (kept.changes, kept.blocks, kept.bytes),
+            (scanned[0], scanned[1], scanned[2]),
+        )
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn consumer_lag_follows_appends_acknowledgements_and_pruning() {
+        let (_directory, store) = store().await;
+        let mut processor = until_acknowledged(FixtureProcessor::new());
+        processor.changes_per_block = 2;
+        let descriptor = processor.descriptor.clone();
+        let stream_id = default_delivery_stream_id(&descriptor);
+        let consumers = ["required-destination", "observer", "late"];
+        let assert_lag = |step: &'static str| {
+            let store = &store;
+            let descriptor = &descriptor;
+            async move {
+                for consumer in consumers {
+                    if store
+                        .consumer(descriptor, consumer)
+                        .await
+                        .expect("consumer")
+                        .is_none()
+                    {
+                        continue;
+                    }
+                    let (kept, scanned) = kept_and_scanned_lag(store, descriptor, consumer).await;
+                    assert_eq!(kept, scanned, "{step}: {consumer}");
+                }
+            }
+        };
+        let apply = |current: BlockFrame, sequence: u64| {
+            let store = &store;
+            let processor = &processor;
+            async move {
+                let delta = processor.map(&current).await.expect("map");
+                store
+                    .apply(
+                        processor,
+                        cursor(processor, &current, sequence),
+                        &delta,
+                        &[],
+                    )
+                    .await
+                    .expect("apply");
+                current
+            }
+        };
+        let mut chain = vec![apply(frame(1, BlockHash::ZERO), 1).await];
+        for number in 2..=3 {
+            let parent = chain.last().expect("parent").block.hash;
+            chain.push(apply(frame(number, parent), number).await);
+        }
+        for (consumer, role) in [
+            ("required-destination", ConsumerRole::Required),
+            ("observer", ConsumerRole::BestEffort),
+        ] {
+            store
+                .create_consumer(
+                    &descriptor,
+                    consumer,
+                    role,
+                    ConsumerStartPosition::EarliestRetained,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("consumer");
+        }
+        assert_lag("created at the earliest change").await;
+        let fourth = apply(frame(4, chain[2].block.hash), 4).await;
+        store
+            .create_consumer(
+                &descriptor,
+                "late",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::CurrentHead,
+                Duration::from_secs(60),
+            )
+            .await
+            .expect("consumer");
+        assert_lag("appended").await;
+
+        // A reorg undoes block 4 and applies another block 4: its number
+        // counts once while any of its changes is unacknowledged.
+        store
+            .undo(
+                &descriptor,
+                ChainId(1),
+                BlockNumber(4),
+                fourth.block.hash,
+                &[],
+            )
+            .await
+            .expect("undo block 4");
+        let mut replacement = frame(4, chain[2].block.hash);
+        replacement.block.hash = BlockHash::new([0x44; 32]);
+        apply(replacement, 5).await;
+        assert_lag("reorged").await;
+        // The finality marker names block 2 again, after changes of later
+        // blocks.
+        store
+            .mark_finalized(&descriptor, BlockNumber(2), chain[1].block.hash)
+            .await
+            .expect("finalize block 2");
+        assert_lag("finalized").await;
+
+        let acknowledge = |consumer: &'static str, sequence: u64| {
+            let store = &store;
+            let descriptor = &descriptor;
+            let stream_id = &stream_id;
+            async move {
+                assert!(
+                    store
+                        .record_consumer_delivery_in_stream(stream_id, consumer, None, sequence)
+                        .await
+                        .expect("record delivery")
+                );
+                store
+                    .acknowledge_consumer(descriptor, consumer, sequence)
+                    .await
+                    .expect("acknowledge");
+            }
+        };
+        // Into block 2, whose other change keeps it in the lag; then past
+        // block 3; and once more, which takes nothing off.
+        acknowledge("required-destination", 3).await;
+        assert_lag("acknowledged inside a block").await;
+        acknowledge("required-destination", 6).await;
+        acknowledge("required-destination", 6).await;
+        acknowledge("observer", 1).await;
+        assert_lag("acknowledged").await;
+
+        // Pruning deletes changes the best-effort observer never
+        // acknowledged; block 2's finality marker stays behind.
+        let (before, _) = kept_and_scanned_lag(&store, &descriptor, "observer").await;
+        let outcome = store
+            .prune_changes_before(&descriptor, u64::MAX)
+            .await
+            .expect("prune");
+        assert!(outcome.deleted > 1, "{outcome:?}");
+        assert_lag("pruned").await;
+        let (after, _) = kept_and_scanned_lag(&store, &descriptor, "observer").await;
+        assert!(
+            after.0 < before.0 && after.1 < before.1,
+            "{before:?} -> {after:?}"
+        );
+
+        let head: i64 =
+            sqlx::query_scalar("SELECT MAX(stream_sequence) FROM change_log WHERE stream_id = ?")
+                .bind(&stream_id)
+                .fetch_one(&store.inner.pool)
+                .await
+                .expect("head");
+        acknowledge("required-destination", u64::try_from(head).expect("head")).await;
+        assert_eq!(
+            kept_and_scanned_lag(&store, &descriptor, "required-destination")
+                .await
+                .0,
+            (0, 0, 0)
+        );
+        assert_eq!(
+            store
+                .consumer_lag(&descriptor, "required-destination")
+                .await
+                .expect("lag")
+                .age_ms,
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schema_30_store_counts_each_consumers_lag_on_upgrade() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("node.sqlite");
+        let store = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("open");
+        let mut processor = until_acknowledged(FixtureProcessor::new());
+        processor.changes_per_block = 3;
+        let mut parent = BlockHash::ZERO;
+        for number in 1..=4 {
+            let current = frame(number, parent);
+            parent = current.block.hash;
+            let delta = processor.map(&current).await.expect("map");
+            store
+                .apply(
+                    &processor,
+                    cursor(&processor, &current, number),
+                    &delta,
+                    &[],
+                )
+                .await
+                .expect("apply");
+        }
+        for (consumer, role, start) in [
+            (
+                "required-destination",
+                ConsumerRole::Required,
+                ConsumerStartPosition::After(4),
+            ),
+            (
+                "observer",
+                ConsumerRole::BestEffort,
+                ConsumerStartPosition::EarliestRetained,
+            ),
+        ] {
+            store
+                .create_consumer(
+                    &processor.descriptor,
+                    consumer,
+                    role,
+                    start,
+                    Duration::from_secs(60),
+                )
+                .await
+                .expect("consumer");
+        }
+        sqlx::raw_sql(
+            "ALTER TABLE durable_consumers DROP COLUMN lag_changes;
+             ALTER TABLE durable_consumers DROP COLUMN lag_blocks;
+             ALTER TABLE durable_consumers DROP COLUMN lag_bytes;
+             UPDATE node_meta SET value = X'0000001E' WHERE key = 'schema_version';",
+        )
+        .execute(&store.inner.pool)
+        .await
+        .expect("rewind to schema 30");
+        store.inner.pool.close().await;
+        drop(store);
+
+        let reopened = SqliteStore::open(StoreConfig::new(&path))
+            .await
+            .expect("schema 30 upgrades in place");
+        assert_eq!(schema_on_disk(&path).await, CURRENT_SCHEMA_VERSION);
+        for (consumer, changes, blocks) in [("required-destination", 8, 3), ("observer", 12, 4)] {
+            let (kept, scanned) =
+                kept_and_scanned_lag(&reopened, &processor.descriptor, consumer).await;
+            assert_eq!(kept, scanned, "{consumer}");
+            assert_eq!((kept.0, kept.1), (changes, blocks), "{consumer}");
+        }
     }
 
     /// `finalized_through` before its indexed probes: MAX over a UNION.
@@ -30478,6 +30884,9 @@ mod tests {
              DROP TABLE IF EXISTS processor_identity_aliases;
              DROP TABLE IF EXISTS chain_settlement;
              DROP TABLE IF EXISTS processor_settlement;
+             ALTER TABLE durable_consumers DROP COLUMN lag_changes;
+             ALTER TABLE durable_consumers DROP COLUMN lag_blocks;
+             ALTER TABLE durable_consumers DROP COLUMN lag_bytes;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -30489,7 +30898,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 21 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
@@ -30804,6 +31213,9 @@ mod tests {
              DROP TABLE IF EXISTS processor_identity_aliases;
              DROP TABLE IF EXISTS chain_settlement;
              DROP TABLE IF EXISTS processor_settlement;
+             ALTER TABLE durable_consumers DROP COLUMN lag_changes;
+             ALTER TABLE durable_consumers DROP COLUMN lag_blocks;
+             ALTER TABLE durable_consumers DROP COLUMN lag_bytes;
              UPDATE node_meta SET value = X'00000015' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -30928,10 +31340,10 @@ mod tests {
             .connect()
             .await
             .expect("connection");
-        sqlx::query("UPDATE node_meta SET value = X'0000001f' WHERE key = 'schema_version'")
+        sqlx::query("UPDATE node_meta SET value = X'00000020' WHERE key = 'schema_version'")
             .execute(&mut connection)
             .await
-            .expect("schema 31");
+            .expect("schema 32");
         connection.close().await.expect("close");
         let refused = SqliteStore::backup(&newer, &directory.path().join("newer-backup.sqlite"))
             .await
@@ -30941,7 +31353,7 @@ mod tests {
             "{refused}"
         );
         assert!(!directory.path().join("newer-backup.sqlite").exists());
-        assert_eq!(schema_on_disk(&newer).await, 31);
+        assert_eq!(schema_on_disk(&newer).await, 32);
     }
 
     /// Store `current` as a recent frame in schema 1 frame encoding, then
@@ -30970,10 +31382,15 @@ mod tests {
             .execute(&store.inner.pool)
             .await
             .expect("schema 1 frame");
-        sqlx::raw_sql("UPDATE node_meta SET value = X'0000001C' WHERE key = 'schema_version';")
-            .execute(&store.inner.pool)
-            .await
-            .expect("rewind to schema 28");
+        sqlx::raw_sql(
+            "ALTER TABLE durable_consumers DROP COLUMN lag_changes;
+             ALTER TABLE durable_consumers DROP COLUMN lag_blocks;
+             ALTER TABLE durable_consumers DROP COLUMN lag_bytes;
+             UPDATE node_meta SET value = X'0000001C' WHERE key = 'schema_version';",
+        )
+        .execute(&store.inner.pool)
+        .await
+        .expect("rewind to schema 28");
         store.inner.pool.close().await;
         SqliteStore::open(StoreConfig::new(path)).await
     }
@@ -31098,6 +31515,9 @@ mod tests {
              DROP TABLE IF EXISTS chain_settlement;
              DROP TABLE IF EXISTS processor_settlement;
              UPDATE durable_consumers SET delivered_sequence = acknowledged_sequence;
+             ALTER TABLE durable_consumers DROP COLUMN lag_changes;
+             ALTER TABLE durable_consumers DROP COLUMN lag_blocks;
+             ALTER TABLE durable_consumers DROP COLUMN lag_bytes;
              UPDATE node_meta SET value = X'00000016' WHERE key = 'schema_version';",
         )
         .execute(&store.inner.pool)
@@ -31127,7 +31547,7 @@ mod tests {
         let reopened = SqliteStore::open(StoreConfig::new(&path))
             .await
             .expect("schema 22 upgrades in place");
-        assert_eq!(CURRENT_SCHEMA_VERSION, 30);
+        assert_eq!(CURRENT_SCHEMA_VERSION, 31);
         assert_eq!(
             reopened.stats().await.expect("stats").schema_version,
             CURRENT_SCHEMA_VERSION
