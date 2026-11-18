@@ -11,7 +11,7 @@ its rollups live, labels every block with how final it is, and serves the
 data your app needs over JSON-RPC, HTTP, and a TypeScript SDK. No API key, no
 archive node.
 
-Status: release candidate (`v0.2.0-rc.2`). Read the
+Status: release candidate (`v0.2.0-rc.3`). Read the
 [known limitations](docs/operations/preview-limitations.md) before deploying.
 
 [blobs.money](https://blobs.money) and [ticker.leani.dev](https://ticker.leani.dev)
@@ -25,7 +25,7 @@ brew install smart-byte/tap/leani
 
 Or take a checksummed archive from
 [GitHub releases](https://github.com/smart-byte/leani/releases), run the
-container image `ghcr.io/smart-byte/leani:v0.2.0-rc.2`, or
+container image `ghcr.io/smart-byte/leani:v0.2.0-rc.3`, or
 [build from source](https://leani.dev/docs/getting-started/install/).
 
 Using a coding agent? `npx skills add smart-byte/leani -g` installs the Leani
@@ -74,7 +74,7 @@ A node replaces three services you would otherwise rent:
 Install the SDK version that matches your node release:
 
 ```bash
-bun add @smart-byte/leani-sdk@0.2.0-rc.2
+bun add @smart-byte/leani-sdk@0.2.0-rc.3
 ```
 
 ```ts

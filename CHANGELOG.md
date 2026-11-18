@@ -6,6 +6,8 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+## [0.2.0-rc.3] - 2026-11-18
+
 ### Changed
 
 - A live stream batch holds as many whole commits as
