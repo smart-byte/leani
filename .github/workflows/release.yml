@@ -78,7 +78,7 @@ jobs:
 
   archive:
     name: ${{ matrix.target }} archive
-    needs: [validate, sbom]
+    needs: validate
     if: ${{ !inputs.publish }}
     runs-on: ${{ matrix.runner }}
     strategy:

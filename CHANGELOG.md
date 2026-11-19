@@ -6,6 +6,11 @@ record, and documented RPC contracts.
 
 ## [Unreleased]
 
+### Changed
+
+- The four binary archive builds of a release candidate start without waiting
+  for the SBOM job, which must still pass before the candidate is assembled.
+
 ## [0.2.0-rc.3] - 2026-11-18
 
 ### Changed
