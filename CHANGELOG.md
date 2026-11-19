@@ -26,6 +26,9 @@ record, and documented RPC contracts.
   to publish. It took the newest successful preparation run, so a candidate
   rebuilt in between, whose archives never match byte for byte, stopped every
   rerun at a destination the first attempt had reached.
+- A merge to `main` right after a release commit no longer cancels that
+  commit's CI, security, site, or container run, which stopped its release
+  until the run was repeated.
 
 ## [0.2.0-rc.3] - 2026-11-18
 

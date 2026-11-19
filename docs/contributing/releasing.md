@@ -86,7 +86,9 @@ dependencies, and writes only with its `RELEASE_CONTROL_TOKEN` secret. npm
 publishes a local archive file named right after `publish`. No workflow
 may run on `pull_request_target` or `workflow_run`: both run with the base
 repository's token, secrets, and cache on behalf of events a pull request
-controls.
+controls. A workflow that runs on pushes to `main` gives each commit its own
+concurrency group, so a later merge never cancels a run that the commit's
+release requires.
 `ruby scripts/check-release-ci.rb --workflows` enforces this, and CI runs it
 through `scripts/test-release-ci.rb`. Change its policy table only together
 with this page.
