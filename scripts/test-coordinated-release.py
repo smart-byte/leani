@@ -164,6 +164,7 @@ class Publication(unittest.TestCase):
         self.events = []
         self.extra_runs = {}
         self.candidate_stages = {}
+        self.tag_scan = None
         self.moved_tag = False
         self.unreviewed_source = False
         self.pending_crates = False
@@ -276,6 +277,13 @@ class Publication(unittest.TestCase):
             runs = [*self.extra_runs.get(stage, []), self.run_record(self.run_ids[stage], workflow)]
             if stage == self.failed_gate:
                 runs.insert(0, {**self.run_record(500, workflow), "event": "push", "conclusion": "failure"})
+            if stage == "security" and self.tag_scan is not None:
+                # Creating a release tag starts a scan; it runs for tag_scan more listings.
+                scan = {**self.run_record(600, workflow), "event": "push", "head_branch": f"v{self.version}"}
+                if self.tag_scan:
+                    scan.update(status="in_progress", conclusion=None)
+                    self.tag_scan -= 1
+                runs.insert(0, scan)
             if stage == "crates" and self.pending_crates:
                 waiting = self.run_record(800, workflow)
                 waiting.update(status="waiting", conclusion=None, display_title=(
@@ -491,6 +499,13 @@ class Publication(unittest.TestCase):
         with self.services() as coordinator:
             coordinator.publish(self.plan, 99)
         self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["sdk-release.yml"])
+
+    def test_verification_waits_for_a_scan_the_release_tags_started(self):
+        self.tag_scan = 2
+        with self.services() as coordinator:
+            coordinator.publish(self.plan, 99)
+        self.assertEqual(self.tag_scan, 0)
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["crates-release.yml"])
 
     def test_newer_failed_validation_blocks_publication(self):
         self.failed_gate = "security"

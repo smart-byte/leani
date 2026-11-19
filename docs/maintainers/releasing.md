@@ -25,11 +25,29 @@ two dispatches:
    commit and stops if the latest one failed, so a known failure never reserves
    a version. It then starts or reuses exact-commit CI, security, site,
    container, binary, Rust-library, and SDK preparation runs and verifies their
-   artifacts. Finally it dispatches the binary, Rust-library, SDK, and container
+   artifacts, and waits for the security scans that creating the tags starts.
+   Finally it dispatches the binary, Rust-library, SDK, and container
    publishers at once, checks each publication against the verified
    candidate, promotes the site, waits until leani.dev serves the release, and
    opens the [Homebrew](#homebrew) tap PR. Merge the tap PR after its tests
    pass; the run summary links it.
+
+Building the candidates takes about half an hour, and **release** can reuse
+builds that ran while its approval was pending. Right after the release PR
+merges, before anything else lands on `main`, dispatch the three preparation
+workflows from `main`:
+
+```bash
+gh workflow run release.yml --ref main -f version=v<version> -f publish=false
+gh workflow run crates-release.yml --ref main -f publish=false
+gh workflow run sdk-release.yml --ref main -f publish=false
+```
+
+Then dispatch **release**, and approve it once all three have succeeded. It
+reuses a successful preparation run of the release commit whichever ref
+dispatched it, and the container candidate comes from `main`'s own run. A
+build that is still running is not reused, so an earlier approval starts new
+builds, and a build of another commit, because `main` moved first, is ignored.
 
 The **candidate** and **publish** actions run the two halves of **release**
 separately, for example to inspect the candidates before publishing them.

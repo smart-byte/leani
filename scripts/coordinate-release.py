@@ -309,12 +309,17 @@ class Coordinator:
         # Release tags are never moved, so a failure already known on this
         # commit must stop the release before its tags exist.
         for stage in (*GATES, "container"):
-            runs = self.runs(WORKFLOWS[stage], commit)
-            while runs and runs[0]["status"] != "completed":
-                self.pause()
-                runs = self.runs(WORKFLOWS[stage], commit)
-            if runs and runs[0]["conclusion"] != "success":
+            run = self.latest_run(stage, commit)
+            if run and run["conclusion"] != "success":
                 raise ReleaseError(f"the latest {stage} run failed on {commit}; rerun or fix it before reserving release tags")
+
+    def latest_run(self, stage, commit):
+        # The newest run of a commit decides, so one still running is awaited.
+        runs = self.runs(WORKFLOWS[stage], commit)
+        while runs and runs[0]["status"] != "completed":
+            self.pause()
+            runs = self.runs(WORKFLOWS[stage], commit)
+        return runs[0] if runs else None
 
     def candidate(self, release, output, commit=None):
         release = version(release)
@@ -385,10 +390,11 @@ class Coordinator:
         for stage, run_id in plan["runs"].items():
             self.gh.successful_run(run_id, WORKFLOWS[stage], commit, ("push", "workflow_dispatch"))
         # Keep the latest-run rule for actual CI/security/site results. An
-        # older successful run cannot override a newer failed validation.
+        # older successful run cannot override a newer failed validation, and
+        # creating the release tags starts new security scans of the commit.
         for stage in GATES:
-            latest = self.runs(WORKFLOWS[stage], commit)
-            if not latest or latest[0]["status"] != "completed" or latest[0]["conclusion"] != "success":
+            run = self.latest_run(stage, commit)
+            if not run or run["conclusion"] != "success":
                 raise ReleaseError(f"latest {stage} validation must pass on the release commit")
         return release, commit
 
