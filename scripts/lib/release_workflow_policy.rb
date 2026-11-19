@@ -95,6 +95,7 @@ module ReleaseWorkflowPolicy
     end
     errors << "#{file}: workflow permissions must be declared and read-only" unless read_only?(document["permissions"])
     errors << "#{file}: only protected publish jobs may read secrets" if secrets?(document.except("jobs"))
+    check_main_concurrency(file, document, errors)
     jobs = document.fetch("jobs", {})
     jobs.each do |name, job|
       check_checkouts(file, name, job, errors)
@@ -116,6 +117,28 @@ module ReleaseWorkflowPolicy
     when nil then []
     else [value.to_s]
     end
+  end
+
+  # A release waits for the runs of its exact main commit. A concurrency group
+  # shared across main commits lets a later push cancel such a run, or replace
+  # it while it is still pending.
+  def self.check_main_concurrency(file, document, errors)
+    return unless runs_on_main_pushes?(document)
+
+    concurrency = document["concurrency"]
+    group = concurrency.is_a?(Hash) ? concurrency["group"] : concurrency
+    return if group.nil? || group.to_s.include?("github.sha")
+
+    errors << "#{file}: concurrency must give each main commit its own group (github.sha)"
+  end
+
+  def self.runs_on_main_pushes?(document)
+    return false unless triggers(document).include?("push")
+
+    on = document.key?("on") ? document["on"] : document[true]
+    push = (on.is_a?(Hash) && on["push"]) || {}
+    branches = push["branches"]
+    branches.nil? ? !push.key?("tags") : Array(branches).any? { |pattern| File.fnmatch(pattern, "main") }
   end
 
   def self.artifact_names(job, direction)

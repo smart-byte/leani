@@ -29,9 +29,10 @@ on:
 permissions:
   contents: read
 
-# A later build of the same ref must never cancel a publication awaiting approval.
+# A later build of the same ref must never cancel a publication awaiting
+# approval, and each main commit keeps the build its release reuses.
 concurrency:
-  group: container-${{ github.ref }}-${{ inputs.publish && 'publish' || 'build' }}
+  group: container-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}-${{ inputs.publish && 'publish' || 'build' }}
   cancel-in-progress: ${{ !inputs.publish }}
 
 jobs:

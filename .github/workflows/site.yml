@@ -39,8 +39,9 @@ on:
 permissions:
   contents: read
 
+# Each main commit keeps its own run, which a release of that commit requires.
 concurrency:
-  group: site-${{ github.ref }}
+  group: site-${{ github.ref == 'refs/heads/main' && github.sha || github.ref }}
   cancel-in-progress: true
 
 jobs:
