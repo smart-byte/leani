@@ -341,7 +341,11 @@ class Coordinator:
                 if runs and (runs[0]["status"] != "completed" or runs[0]["conclusion"] == "success"):
                     selected = runs[0]["id"]
             else:
-                for run in runs:
+                # A rebuilt candidate never matches the bytes an earlier attempt
+                # already published, so a retry keeps the candidate that the
+                # newest publisher run named.
+                used = next(filter(None, (publication_candidate(run, stage) for run in runs)), None)
+                for run in sorted(runs, key=lambda run: run["id"] != used):
                     if run["status"] == "completed" and run["conclusion"] == "success" and set(self.artifact_names(stage, release)) <= self.gh.artifacts(run["id"]).keys():
                         selected = run["id"]
                         break

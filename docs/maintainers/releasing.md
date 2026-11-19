@@ -50,15 +50,16 @@ releases whose commit already contains it (`0.1.0-rc.2` onward).
 
 If a release fails, dispatch **release** again with the same version, adding
 `release_commit` with the release's exact SHA once `main` has moved on. It
-reuses the tags and successful preparation runs and checks GitHub asset hashes,
-crates.io checksums, npm archive integrity, and GHCR image identities before
-writing. Matching publications are reused; different bytes stop the release. A
-partial Rust-library publication uploads only missing crates, and a partial
-GitHub draft can finish uploading missing assets. Registries are not a
-transaction: completed publications remain available if a later step fails.
-A failed publisher does not stop the others; the run fails once every
-publisher has finished and each success is verified. A rerun rejoins
-publishers that are still running instead of starting them again. A
+reuses the tags and successful preparation runs, keeping each candidate an
+earlier attempt started to publish even when a newer one exists. It checks
+GitHub asset hashes, crates.io checksums, npm archive integrity, and GHCR image
+identities before writing. Matching publications are reused; different bytes
+stop the release. A partial Rust-library publication uploads only missing
+crates, and a partial GitHub draft can finish uploading missing assets.
+Registries are not a transaction: completed publications remain available if
+a later step fails. A failed publisher does not stop the others; the run fails
+once every publisher has finished and each success is verified. A rerun
+rejoins publishers that are still running instead of starting them again. A
 failed **publish** resumes the same way with the same candidate run ID. The run
 summary links each workflow and records publication progress.
 

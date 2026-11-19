@@ -162,6 +162,8 @@ class Publication(unittest.TestCase):
         self.failed_workflow = None
         self.dispatched = {}
         self.events = []
+        self.extra_runs = {}
+        self.candidate_stages = {}
         self.moved_tag = False
         self.unreviewed_source = False
         self.pending_crates = False
@@ -221,6 +223,9 @@ class Publication(unittest.TestCase):
                 "head_branch": "feature" if run_id == 99 and self.unreviewed_source else "main",
                 "status": "completed", "conclusion": "success", "name": workflow, "html_url": f"https://github.com/example/leani/actions/runs/{run_id}"}
 
+    def stage_of(self, run_id):
+        return self.candidate_stages.get(run_id) or next(stage for stage, value in self.run_ids.items() if value == run_id)
+
     def github_release(self):
         assets = [{"name": path.name, "id": index, "digest": "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()}
                   for index, path in enumerate(sorted(self.binary.iterdir()))]
@@ -268,7 +273,7 @@ class Publication(unittest.TestCase):
         if path.startswith("actions/workflows/"):
             workflow = path.split('/')[2]
             stage = next(stage for stage, value in release.WORKFLOWS.items() if value == workflow)
-            runs = [self.run_record(self.run_ids[stage], workflow)]
+            runs = [*self.extra_runs.get(stage, []), self.run_record(self.run_ids[stage], workflow)]
             if stage == self.failed_gate:
                 runs.insert(0, {**self.run_record(500, workflow), "event": "push", "conclusion": "failure"})
             if stage == "crates" and self.pending_crates:
@@ -279,8 +284,7 @@ class Publication(unittest.TestCase):
             return {"workflow_runs": runs}
         if path.endswith("/artifacts?per_page=100"):
             run_id = int(path.split('/')[2])
-            stage = next(stage for stage, value in self.run_ids.items() if value == run_id)
-            names = release.Coordinator(self.gh).artifact_names(stage, self.version)
+            names = release.Coordinator(self.gh).artifact_names(self.stage_of(run_id), self.version)
             return {"total_count": len(names), "artifacts": [{"name": name, "expired": False, "expires_at": f"2026-10-{run_id}T00:00:00Z"}
                                                             for name in names]}
         if path.startswith("actions/runs/"):
@@ -291,8 +295,7 @@ class Publication(unittest.TestCase):
                 workflow = self.dispatched[run_id]
                 self.events.append(f"poll {workflow}")
             else:
-                workflow = {99: "release-coordinate.yml", 800: "crates-release.yml"}.get(run_id) or next(
-                    release.WORKFLOWS[stage] for stage, value in self.run_ids.items() if value == run_id)
+                workflow = {99: "release-coordinate.yml", 800: "crates-release.yml"}.get(run_id) or release.WORKFLOWS[self.stage_of(run_id)]
             record = self.run_record(run_id, workflow)
             if run_id in self.dispatched and workflow == self.failed_workflow:
                 record["conclusion"] = "failure"
@@ -437,6 +440,21 @@ class Publication(unittest.TestCase):
         self.assertEqual(self.dispatches, [])
         # The container preparation run's artifacts expire first.
         self.assertTrue(coordinator.messages[-1].endswith(f"before 2026-10-{self.run_ids['container']}T00:00:00Z"))
+
+    def test_retry_keeps_the_candidate_an_earlier_attempt_published(self):
+        rebuilt = self.run_record(40, "release.yml")
+        self.candidate_stages[40] = "binaries"
+        self.extra_runs["binaries"] = [rebuilt]
+        output = self.root / "candidate-plan.json"
+        with self.services() as coordinator:
+            coordinator.candidate(self.version, output)
+        self.assertEqual(json.loads(output.read_text())["runs"]["binaries"], 40)
+        publisher = {**self.run_record(41, "release.yml"), "conclusion": "failure", "display_title":
+                     f"Prepare release [leani-publish-{self.run_ids['binaries']}-binaries-" + "0" * 32 + "]"}
+        self.extra_runs["binaries"] = [publisher, rebuilt]
+        with self.services() as coordinator:
+            coordinator.candidate(self.version, output)
+        self.assertEqual(json.loads(output.read_text())["runs"]["binaries"], self.run_ids["binaries"])
 
     def test_known_failure_on_main_stops_before_release_tags_exist(self):
         self.missing_tags = True
