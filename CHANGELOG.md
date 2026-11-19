@@ -15,6 +15,10 @@ record, and documented RPC contracts.
   longer stops the others: the run fails once every publisher has finished and
   each success is verified, and a rerun rejoins publishers that are still
   running instead of starting them again.
+- Maintainers can build a release's candidates from `main` while its approval
+  is pending, and the release reuses them. The coordinator waits for the
+  security scans that creating the release tags starts, instead of failing
+  while they still run.
 
 ### Fixed
 
