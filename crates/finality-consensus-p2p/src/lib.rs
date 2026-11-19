@@ -1803,7 +1803,7 @@ fn spawn_swarm(
         )
         .map_err(|error| ConsensusP2pError::Network(error.to_string()))?
         .with_behaviour(|_| libp2p_stream::Behaviour::new())
-        .map_err(|error| ConsensusP2pError::Network(error.to_string()))?
+        .unwrap_or_else(|never| match never {})
         .with_swarm_config(|config| config.with_idle_connection_timeout(Duration::from_secs(90)))
         .build();
     let mut control = swarm.behaviour().new_control();

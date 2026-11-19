@@ -29,7 +29,7 @@ use libp2p::{
     identify, identity,
     multiaddr::Protocol,
     noise, ping,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::SwarmEvent,
     tcp, yamux,
 };
 use op_alloy_rpc_types_engine::OpNetworkPayloadEnvelope;
@@ -242,13 +242,23 @@ fn peer_address(enr: &Enr) -> Option<(PeerId, Multiaddr)> {
     Some((peer_id, address))
 }
 
-/// Peers drop connections that answer neither identify nor ping.
-#[derive(NetworkBehaviour)]
-struct Behaviour {
-    gossipsub: gossipsub::Behaviour,
-    identify: identify::Behaviour,
-    ping: ping::Behaviour,
+#[expect(
+    unreachable_code,
+    reason = "libp2p derives dispatch for uninhabited handler events"
+)]
+mod behaviour {
+    use libp2p::{gossipsub, identify, ping, swarm::NetworkBehaviour};
+
+    /// Peers drop connections that answer neither identify nor ping.
+    #[derive(NetworkBehaviour)]
+    pub(super) struct Behaviour {
+        pub(super) gossipsub: gossipsub::Behaviour,
+        pub(super) identify: identify::Behaviour,
+        pub(super) ping: ping::Behaviour,
+    }
 }
+
+use behaviour::{Behaviour, BehaviourEvent};
 
 #[derive(Clone, Debug)]
 pub struct OpGossipConfig {
@@ -401,7 +411,7 @@ pub async fn follow(
         )
         .map_err(|error| OpGossipError::Transport(error.to_string()))?
         .with_behaviour(|_| behaviour)
-        .map_err(|error| OpGossipError::Transport(error.to_string()))?
+        .unwrap_or_else(|never| match never {})
         .with_swarm_config(|swarm| swarm.with_idle_connection_timeout(Duration::from_secs(120)))
         .build();
     let mut versions = Vec::new();

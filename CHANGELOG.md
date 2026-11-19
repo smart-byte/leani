@@ -8,6 +8,9 @@ record, and documented RPC contracts.
 
 ### Changed
 
+- The build toolchain moves to Rust 1.100.0. Rebuilding the bundled Wasm
+  processors changes their BLAKE3 hashes. When replacing an installed module,
+  update its configured hash pin and rebuild its processor instance.
 - The four binary archive builds of a release candidate start without waiting
   for the SBOM job, which must still pass before the candidate is assembled.
 - The release coordinator runs the GitHub release, crates.io, npm, and GHCR
