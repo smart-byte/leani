@@ -16,6 +16,13 @@ record, and documented RPC contracts.
   each success is verified, and a rerun rejoins publishers that are still
   running instead of starting them again.
 
+### Fixed
+
+- A rerun of a failed release keeps each candidate its earlier attempt started
+  to publish. It took the newest successful preparation run, so a candidate
+  rebuilt in between, whose archives never match byte for byte, stopped every
+  rerun at a destination the first attempt had reached.
+
 ## [0.2.0-rc.3] - 2026-11-18
 
 ### Changed
