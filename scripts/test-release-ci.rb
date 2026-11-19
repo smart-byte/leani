@@ -1,6 +1,7 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 
+require "digest"
 require "fileutils"
 require "json"
 require "open3"
@@ -239,3 +240,81 @@ Dir.mktmpdir("leani-release-workflows-test-") do |directory|
   end
 end
 puts "#{policy_cases.length} release workflow policy scenarios passed"
+
+# The container publisher's push step runs against a fake registry. A release
+# tag that holds another image stops it before any push, and a retry keeps the
+# tags that already hold the verified images.
+push_step = YAML.safe_load(File.read(File.join(workflows, "container.yml")))
+                .dig("jobs", "publish", "steps").find { |item| item["id"] == "push" }.fetch("run")
+image = "ghcr.io/example/leani"
+tag = "v0.1.0-rc.2"
+identities = { "amd64" => "sha256:#{'1' * 64}", "arm64" => "sha256:#{'2' * 64}" }
+held = ->(arch, identity = identities[arch]) { { "config" => { "digest" => identity }, "digest" => "sha256:held-#{arch}" } }
+held_index = { "manifests" => %w[amd64 arm64].map { |arch| { "digest" => "sha256:held-#{arch}" } }, "digest" => "sha256:held-index" }
+container_cases = [
+  ["a new release pushes both images and assembles their tag", {},
+   ["push #{image}:#{tag}-amd64", "push #{image}:#{tag}-arm64", "create #{image}:#{tag}"], nil],
+  ["a retry keeps an image tag that holds its verified image", { "#{image}:#{tag}-amd64" => held.call("amd64") },
+   ["push #{image}:#{tag}-arm64", "create #{image}:#{tag}"], nil],
+  ["a complete publication is left as it is",
+   { "#{image}:#{tag}-amd64" => held.call("amd64"), "#{image}:#{tag}-arm64" => held.call("arm64"), "#{image}:#{tag}" => held_index },
+   [], nil],
+  ["an image tag that holds another image is never moved",
+   { "#{image}:#{tag}-arm64" => held.call("arm64", "sha256:#{'3' * 64}") }, [], "#{image}:#{tag}-arm64 already holds another image"],
+  ["a multiarchitecture tag that holds other images is never moved", { "#{image}:#{tag}" => held_index },
+   [], "#{image}:#{tag} already holds other images"],
+]
+
+Dir.mktmpdir("leani-container-publish-test-") do |directory|
+  shim = File.join(directory, "docker")
+  File.write(shim, "#!#{RbConfig.ruby}\n" + <<~'RUBY')
+    require "json"
+    path = ENV.fetch("DOCKER_TEST_STATE")
+    state = JSON.parse(File.read(path))
+    registry = state["registry"]
+    case ARGV
+    in ["load", "--input", archive] then state["loaded"] = archive[/leani-container-(\w+)\.tar\.gz\z/, 1]
+    in ["image", "inspect", "leani:scan", "--format", "{{.Id}}"] then puts state["images"].fetch(state["loaded"])
+    in ["image", "inspect", "leani:scan", "--format", "{{.Architecture}}"] then puts state["loaded"]
+    in ["tag", "leani:scan", _] then nil
+    in ["push", ref]
+      registry[ref] = { "config" => { "digest" => state["images"].fetch(state["loaded"]) }, "digest" => "sha256:pushed-#{state['loaded']}" }
+      state["writes"] << "push #{ref}"
+    in ["image", "inspect", ref, "--format", "{{index .RepoDigests 0}}"] then puts "#{ref.rpartition(':').first}@#{registry.fetch(ref)['digest']}"
+    in ["buildx", "imagetools", "create", "--tag", ref, *sources]
+      registry[ref] = { "manifests" => sources.map { |source| { "digest" => source.split("@").last } }, "digest" => "sha256:index" }
+      state["writes"] << "create #{ref}"
+    in ["buildx", "imagetools", "inspect", ref, *options]
+      entry = registry[ref] or abort("ERROR: #{ref}: not found")
+      puts(case options
+           in ["--raw"] then JSON.generate(entry.except("digest"))
+           in ["--format", _] then JSON.generate("digest" => entry["digest"])
+           in [] then ref
+           end)
+    end
+    File.write(path, JSON.generate(state))
+  RUBY
+  File.chmod(0o755, shim)
+  container_cases.each_with_index do |(name, registry, writes, error), index|
+    work = File.join(directory, index.to_s)
+    identities.each do |arch, identity|
+      candidate = File.join(work, "images", "leani-container-#{arch}")
+      FileUtils.mkdir_p(candidate)
+      files = { "leani-container-#{arch}.tar.gz" => arch, "leani-container-#{arch}.cdx.json" => "{}", "image.id" => "#{identity}\n" }
+      files.each { |file, contents| File.write(File.join(candidate, file), contents) }
+      File.write(File.join(candidate, "SHA256SUMS"), files.map { |file, contents| "#{Digest::SHA256.hexdigest(contents)}  #{file}\n" }.join)
+    end
+    File.write(File.join(work, "step.sh"), push_step)
+    state = File.join(work, "state.json")
+    File.write(state, JSON.generate("registry" => registry, "images" => identities, "writes" => []))
+    environment = { "PATH" => "#{directory}:#{ENV.fetch('PATH')}", "GITHUB_REPOSITORY" => "Example/leani", "IMAGE_TAG" => tag,
+                    "GITHUB_OUTPUT" => File.join(work, "output"), "DOCKER_TEST_STATE" => state }
+    output, status = Open3.capture2e(environment, "bash", "--noprofile", "--norc", "-eo", "pipefail", "step.sh", chdir: work)
+    raise "#{name}: unexpected result: #{output}" unless status.success? == error.nil?
+    raise "#{name}: rejected for another reason: #{output}" if error && !output.include?(error)
+    actual = JSON.parse(File.read(state)).fetch("writes")
+    raise "#{name}: wrote #{actual.inspect}, expected #{writes.inspect}" unless actual == writes
+    puts "PASS #{name}"
+  end
+end
+puts "#{container_cases.length} container publication scenarios passed"
