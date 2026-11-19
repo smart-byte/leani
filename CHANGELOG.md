@@ -29,6 +29,11 @@ record, and documented RPC contracts.
 - A merge to `main` right after a release commit no longer cancels that
   commit's CI, security, site, or container run, which stopped its release
   until the run was repeated.
+- Container publication never moves a release image tag. It pushed over
+  existing tags, which only the coordinator checked, so a publisher run
+  dispatched on its own could replace a published image. A tag that holds
+  another image now stops it before the first push, and a retry keeps the
+  tags that already hold the release's images.
 
 ## [0.2.0-rc.3] - 2026-11-18
 

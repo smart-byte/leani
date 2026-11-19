@@ -294,6 +294,9 @@ successful preparation run's `candidate_run_id`, and passing Rust, security,
 and site workflows; a read-only job checks them. The `release-ghcr` job then
 loads and verifies the saved images before publishing them, assembles the
 multiarchitecture tag from their registry digests, and attests the result.
+It never moves a release tag: a tag that holds another image stops it before
+the first push, and a retry keeps the tags that already hold the verified
+images.
 Its job summary lists the published digests.
 GitHub's automatic `GITHUB_TOKEN` supplies GHCR authentication. Verify
 anonymous pulls for both architectures before announcing the release.

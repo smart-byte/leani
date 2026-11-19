@@ -192,20 +192,51 @@ jobs:
         env:
           IMAGE_TAG: ${{ inputs.image_tag }}
         run: |
-          image="ghcr.io/${GITHUB_REPOSITORY,,}"
+          image="ghcr.io/$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          # Prints a tag's raw manifest, or nothing when the tag does not exist.
+          manifest() {
+            if docker buildx imagetools inspect "$1" --raw > manifest.json 2> inspect.log; then
+              cat manifest.json
+            elif ! grep -Eqi 'not found|manifest unknown' inspect.log; then
+              cat inspect.log >&2
+              return 1
+            fi
+          }
+          # Release tags never move: every tag is checked before the first
+          # push, and a retry keeps the tags that already hold these images.
           for arch in amd64 arm64; do
             directory="images/leani-container-$arch"
             (cd "$directory" && sha256sum --check SHA256SUMS)
-            docker load --input "$directory/leani-container-$arch.tar.gz"
-            test "$(docker image inspect leani:scan --format '{{.Id}}')" = "$(cat "$directory/image.id")"
-            test "$(docker image inspect leani:scan --format '{{.Architecture}}')" = "$arch"
-            docker tag leani:scan "$image:$IMAGE_TAG-$arch"
-            docker push "$image:$IMAGE_TAG-$arch"
-            docker image inspect "$image:$IMAGE_TAG-$arch" --format '{{index .RepoDigests 0}}' > "$arch.digest"
-            echo "$arch-digest=$(cut -d@ -f2 "$arch.digest")" >> "$GITHUB_OUTPUT"
+            existing=$(manifest "$image:$IMAGE_TAG-$arch")
+            if [ -n "$existing" ]; then
+              if [ "$(jq -r .config.digest <<< "$existing")" != "$(cat "$directory/image.id")" ]; then
+                echo "$image:$IMAGE_TAG-$arch already holds another image" >&2
+                exit 1
+              fi
+              docker buildx imagetools inspect "$image:$IMAGE_TAG-$arch" --format '{{json .Manifest}}' | jq -r .digest > "$arch.digest"
+            fi
           done
-          docker buildx imagetools create --tag "$image:$IMAGE_TAG" \
-            "$(cat amd64.digest)" "$(cat arm64.digest)"
+          index=$(manifest "$image:$IMAGE_TAG")
+          if [ -n "$index" ] && [ "$(jq -r '.manifests[].digest' <<< "$index" | sort)" != "$(cat amd64.digest arm64.digest 2> /dev/null | sort)" ]; then
+            echo "$image:$IMAGE_TAG already holds other images" >&2
+            exit 1
+          fi
+          for arch in amd64 arm64; do
+            if [ ! -s "$arch.digest" ]; then
+              directory="images/leani-container-$arch"
+              docker load --input "$directory/leani-container-$arch.tar.gz"
+              test "$(docker image inspect leani:scan --format '{{.Id}}')" = "$(cat "$directory/image.id")"
+              test "$(docker image inspect leani:scan --format '{{.Architecture}}')" = "$arch"
+              docker tag leani:scan "$image:$IMAGE_TAG-$arch"
+              docker push "$image:$IMAGE_TAG-$arch"
+              docker image inspect "$image:$IMAGE_TAG-$arch" --format '{{index .RepoDigests 0}}' | cut -d@ -f2 > "$arch.digest"
+            fi
+            echo "$arch-digest=$(cat "$arch.digest")" >> "$GITHUB_OUTPUT"
+          done
+          if [ -z "$index" ]; then
+            docker buildx imagetools create --tag "$image:$IMAGE_TAG" \
+              "$image@$(cat amd64.digest)" "$image@$(cat arm64.digest)"
+          fi
           docker buildx imagetools inspect "$image:$IMAGE_TAG"
           index_digest=$(docker buildx imagetools inspect "$image:$IMAGE_TAG" --format '{{json .Manifest}}' | jq -r .digest)
           echo "image=$image" >> "$GITHUB_OUTPUT"
