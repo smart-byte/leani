@@ -4027,7 +4027,7 @@ THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-flate2 1.1.10 — https://github.com/rust-lang/flate2-rs
+flate2 1.1.11 — https://github.com/rust-lang/flate2-rs
 
 Copyright (c) 2014-2026 Alex Crichton
 
@@ -11324,7 +11324,7 @@ ICU 1.8.1 to ICU 57.1 © 1995-2016 International Business Machines Corporation a
 ==============================================================================
 zlib License (Zlib)
 ==============================================================================
-zlib-rs 0.6.6 — https://github.com/trifectatechfoundation/zlib-rs
+zlib-rs 0.6.8 — https://github.com/trifectatechfoundation/zlib-rs
 
 (C) 2024 Trifecta Tech Foundation 
 
