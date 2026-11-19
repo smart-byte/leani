@@ -26,7 +26,7 @@ two dispatches:
    a version. It then starts or reuses exact-commit CI, security, site,
    container, binary, Rust-library, and SDK preparation runs and verifies their
    artifacts. Finally it dispatches the binary, Rust-library, SDK, and container
-   publishers in order, checks each publication against the verified
+   publishers at once, checks each publication against the verified
    candidate, promotes the site, waits until leani.dev serves the release, and
    opens the [Homebrew](#homebrew) tap PR. Merge the tap PR after its tests
    pass; the run summary links it.
@@ -55,7 +55,10 @@ crates.io checksums, npm archive integrity, and GHCR image identities before
 writing. Matching publications are reused; different bytes stop the release. A
 partial Rust-library publication uploads only missing crates, and a partial
 GitHub draft can finish uploading missing assets. Registries are not a
-transaction: completed publications remain available if a later step fails. A
+transaction: completed publications remain available if a later step fails.
+A failed publisher does not stop the others; the run fails once every
+publisher has finished and each success is verified. A rerun rejoins
+publishers that are still running instead of starting them again. A
 failed **publish** resumes the same way with the same candidate run ID. The run
 summary links each workflow and records publication progress.
 
@@ -187,14 +190,16 @@ verifies the explicit `container_candidate_run_id` for the release commit. It
 must be successful and carry both unexpired container artifacts. A later
 container publication waiting for approval or failing does not invalidate that
 preparation. CI, security, and site still require their newest exact-commit
-validation runs to succeed. The coordinator publishes in this order:
+validation runs to succeed. The publishers write to separate destinations, so
+the coordinator dispatches them at once:
 
-1. `release.yml` from the `v*` tag, in `release-github`;
-2. `crates-release.yml` from the `v*` tag and `sdk-release.yml` from the
-   `sdk-v*` tag, in `release-crates` and `release-npm`;
-3. `container.yml` from the `v*` tag, in `release-ghcr`;
-4. `site-promote.yml` from the `v*` tag once the GitHub release is published,
-   in `site-production`.
+- `release.yml` from the `v*` tag, in `release-github`;
+- `crates-release.yml` from the `v*` tag and `sdk-release.yml` from the
+  `sdk-v*` tag, in `release-crates` and `release-npm`;
+- `container.yml` from the `v*` tag, in `release-ghcr`.
+
+Once all four are published, it dispatches `site-promote.yml` from the `v*`
+tag, in `site-production`.
 
 A standalone publisher must also supply `container_candidate_run_id`; container
 publication uses its own `candidate_run_id`. To regenerate expired images,

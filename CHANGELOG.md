@@ -10,6 +10,11 @@ record, and documented RPC contracts.
 
 - The four binary archive builds of a release candidate start without waiting
   for the SBOM job, which must still pass before the candidate is assembled.
+- The release coordinator runs the GitHub release, crates.io, npm, and GHCR
+  publishers at once instead of one after another. A failed publisher no
+  longer stops the others: the run fails once every publisher has finished and
+  each success is verified, and a rerun rejoins publishers that are still
+  running instead of starting them again.
 
 ## [0.2.0-rc.3] - 2026-11-18
 

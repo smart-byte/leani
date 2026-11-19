@@ -157,6 +157,14 @@ def release_published(gh, expected, release):
     return True
 
 
+def publication_candidate(run, stage):
+    # A publisher run is named [leani-publish-<candidate run>-<stage>-<random>],
+    # so every rerun finds the publications of a candidate, whichever
+    # coordinator run dispatched them.
+    match = re.search(rf"\[leani-publish-(\d+)-{stage}-[a-f0-9]{{32}}\]$", run.get("display_title", ""))
+    return int(match[1]) if match else None
+
+
 class Coordinator:
     def __init__(self, gh, timeout=14400, tap=None):
         self.gh = gh
@@ -194,28 +202,34 @@ class Coordinator:
             raise ReleaseError(f"GitHub did not return the {workflow} run it started")
         return result["workflow_run_id"]
 
-    def resume_publication(self, stage, candidate_run_id, commit):
-        prefix = f"leani-publish-{candidate_run_id}-{stage}"
+    def resume_publication(self, stage, candidate, commit):
         for run in self.runs(WORKFLOWS[stage], commit):
-            marker = r"\[" + re.escape(prefix) + r"-[a-f0-9]{32}\]$"
-            if run["status"] != "completed" and re.search(marker, run.get("display_title", "")):
+            if run["status"] != "completed" and publication_candidate(run, stage) == candidate:
                 self.report(f"{stage}: resuming its existing publication run #{run['id']}")
-                return run["id"], prefix
-        return None, prefix
+                return run["id"]
+        return None
+
+    def finish(self, run_ids):
+        states, completed = {}, {}
+        while True:
+            for run_id in run_ids:
+                if run_id in completed:
+                    continue
+                run = self.gh.run(run_id)
+                if run["status"] != states.get(run_id):
+                    self.report(f"[{run['name']} #{run_id}]({run['html_url']}): {run['status']}")
+                    states[run_id] = run["status"]
+                if run["status"] == "completed":
+                    completed[run_id] = run
+            if all(run_id in completed for run_id in run_ids):
+                return completed
+            self.pause()
 
     def wait(self, run_id):
-        previous = None
-        while True:
-            run = self.gh.run(run_id)
-            state = run["status"]
-            if state != previous:
-                self.report(f"[{run['name']} #{run_id}]({run['html_url']}): {state}")
-                previous = state
-            if state == "completed":
-                if run["conclusion"] != "success":
-                    raise ReleaseError(f"run {run_id} finished with {run['conclusion']}; completed publications are preserved")
-                return run
-            self.pause()
+        run = self.finish([run_id])[run_id]
+        if run["conclusion"] != "success":
+            raise ReleaseError(f"run {run_id} finished with {run['conclusion']}; completed publications are preserved")
+        return run
 
     def verify_tag(self, name, commit, create=False):
         ref = self.gh.api(f"git/ref/tags/{name}", missing=True)
@@ -377,16 +391,17 @@ class Coordinator:
     def release(self, release, output, commit=None):
         # One trigger: build and verify every candidate, publish it, and promote the site.
         # A failed run is resumed by dispatching release again: candidate reuses the
-        # tags and successful preparation runs, and publication skips verified artifacts.
+        # tags and successful preparation runs, and publication skips verified
+        # artifacts and rejoins publishers that are still running.
         plan = self.candidate(release, output, commit)
         release, commit = self.verify_release(plan)
-        self.publish_verified(plan, release, commit, os.environ.get("GITHUB_RUN_ID", "local"), promote_site=True)
+        self.publish_verified(plan, release, commit, promote_site=True)
 
     def publish(self, plan, candidate_run_id, promote_site=False):
         release, commit = self.validate_plan(plan, candidate_run_id)
-        self.publish_verified(plan, release, commit, candidate_run_id, promote_site)
+        self.publish_verified(plan, release, commit, promote_site)
 
-    def publish_verified(self, plan, release, commit, candidate_run_id, promote_site):
+    def publish_verified(self, plan, release, commit, promote_site):
         with tempfile.TemporaryDirectory(prefix="leani-publish-") as directory:
             self.collect(plan, directory, compare=True)
             root = Path(directory)
@@ -404,29 +419,43 @@ class Coordinator:
             # Check every destination before the first write. Existing versions
             # with different bytes are an error, never a reason to overwrite.
             done = {stage: check() for stage, check in checks.items()}
+            publishers = {}
             for stage in ("binaries", "crates", "sdk", "container"):
                 if done[stage]:
                     self.report(f"{stage}: already published; verified candidate bytes")
                     continue
+                candidate = plan["runs"][stage]
                 inputs = {"publish": True, "container_candidate_run_id": str(plan["runs"]["container"])}
                 ref = f"sdk-v{release}" if stage == "sdk" else f"v{release}"
                 if stage == "binaries":
-                    inputs.update(version=f"v{release}", candidate_run_id=str(plan["runs"][stage]))
+                    inputs.update(version=f"v{release}", candidate_run_id=str(candidate))
                 elif stage in ("crates", "sdk"):
-                    inputs.update(bootstrap=False, candidate_run_id=str(plan["runs"][stage]))
+                    inputs.update(bootstrap=False, candidate_run_id=str(candidate))
                 else:
-                    inputs = {"publish": True, "image_tag": f"v{release}", "candidate_run_id": str(plan["runs"][stage])}
-                pending, prefix = self.resume_publication(stage, candidate_run_id, commit)
-                self.wait(pending or self.dispatch(WORKFLOWS[stage], ref, inputs, prefix))
+                    inputs = {"publish": True, "image_tag": f"v{release}", "candidate_run_id": str(candidate)}
+                publishers[stage] = (self.resume_publication(stage, candidate, commit)
+                                     or self.dispatch(WORKFLOWS[stage], ref, inputs, f"leani-publish-{candidate}-{stage}"))
+            # The destinations are independent, so their publishers run at once.
+            # Each one finishes and is verified before any failure is raised, so
+            # no publisher keeps writing unverified after this run stops.
+            finished = self.finish(list(publishers.values()))
+            failures = []
+            for stage, run_id in publishers.items():
+                if finished[run_id]["conclusion"] != "success":
+                    failures.append(f"{stage} run {run_id} finished with {finished[run_id]['conclusion']}")
+                    continue
                 # Registries and their CDNs can briefly lag a finished publisher.
-                # ponytail: 20 checks 15 s apart; raise the count if npm needs longer.
+                # 20 checks 15 s apart; raise the count if npm needs longer.
                 for _ in range(20):
                     if checks[stage]():
                         break
                     self.pause()
                 else:
-                    raise ReleaseError(f"{stage} publication finished but the verified artifacts are not available")
+                    failures.append(f"{stage} publication finished but the verified artifacts are not available")
+                    continue
                 self.report(f"{stage}: published and verified")
+            if failures:
+                raise ReleaseError("; ".join(failures) + "; completed publications are preserved")
             if promote_site and self.site_follows(release):
                 branch = self.gh.api("git/ref/heads/site-production", missing=True)
                 if branch and branch["object"]["sha"] == commit:

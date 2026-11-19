@@ -160,7 +160,8 @@ class Publication(unittest.TestCase):
         self.published = {"binaries", "sdk", "container"}
         self.partial_crates = {"leani-primitives", "leani-source-api"}
         self.failed_workflow = None
-        self.last_dispatch = None
+        self.dispatched = {}
+        self.events = []
         self.moved_tag = False
         self.unreviewed_source = False
         self.pending_crates = False
@@ -252,15 +253,18 @@ class Publication(unittest.TestCase):
             record = self.github_release()
             return record if record and not record["draft"] else None
         if path.endswith("/dispatches"):
+            workflow = path.split('/')[2]
             self.dispatches.append((path, data))
-            self.last_dispatch = path.split('/')[2]
-            if self.last_dispatch == "site-promote.yml":
+            run_id = 901 + len(self.dispatched)
+            self.dispatched[run_id] = workflow
+            self.events.append(f"dispatch {workflow}")
+            if workflow == "site-promote.yml":
                 self.site_commit = self.sha
-            elif self.last_dispatch != self.failed_workflow:
-                self.published.add(next(stage for stage, workflow in release.WORKFLOWS.items() if workflow == self.last_dispatch))
-                if self.last_dispatch == "release.yml":
+            elif workflow != self.failed_workflow:
+                self.published.add(next(stage for stage, value in release.WORKFLOWS.items() if value == workflow))
+                if workflow == "release.yml":
                     self.draft_assets = None
-            return {"workflow_run_id": 900}
+            return {"workflow_run_id": run_id}
         if path.startswith("actions/workflows/"):
             workflow = path.split('/')[2]
             stage = next(stage for stage, value in release.WORKFLOWS.items() if value == workflow)
@@ -268,9 +272,9 @@ class Publication(unittest.TestCase):
             if stage == self.failed_gate:
                 runs.insert(0, {**self.run_record(500, workflow), "event": "push", "conclusion": "failure"})
             if stage == "crates" and self.pending_crates:
-                waiting = self.run_record(900, workflow)
-                waiting.update(status="waiting", conclusion=None,
-                               display_title="Prepare Rust library release [leani-publish-99-crates-" + "0" * 32 + "]")
+                waiting = self.run_record(800, workflow)
+                waiting.update(status="waiting", conclusion=None, display_title=(
+                    f"Prepare Rust library release [leani-publish-{self.run_ids['crates']}-crates-" + "0" * 32 + "]"))
                 runs.insert(0, waiting)
             return {"workflow_runs": runs}
         if path.endswith("/artifacts?per_page=100"):
@@ -281,13 +285,16 @@ class Publication(unittest.TestCase):
                                                             for name in names]}
         if path.startswith("actions/runs/"):
             run_id = int(path.split('/')[2])
-            if run_id == 900 and self.pending_crates:
+            if run_id == 800 and self.pending_crates:
                 self.published.add("crates")
-                self.last_dispatch = "crates-release.yml"
-            workflow = "release-coordinate.yml" if run_id == 99 else self.last_dispatch if run_id == 900 else next(
-                release.WORKFLOWS[stage] for stage, value in self.run_ids.items() if value == run_id)
+            if run_id in self.dispatched:
+                workflow = self.dispatched[run_id]
+                self.events.append(f"poll {workflow}")
+            else:
+                workflow = {99: "release-coordinate.yml", 800: "crates-release.yml"}.get(run_id) or next(
+                    release.WORKFLOWS[stage] for stage, value in self.run_ids.items() if value == run_id)
             record = self.run_record(run_id, workflow)
-            if run_id == 900 and workflow == self.failed_workflow:
+            if run_id in self.dispatched and workflow == self.failed_workflow:
                 record["conclusion"] = "failure"
             return record
         raise AssertionError(f"unexpected GitHub API request: {path}")
@@ -486,27 +493,35 @@ class Publication(unittest.TestCase):
         self.assertEqual(self.dispatches, [])
         self.assertIn("crates", self.published)
 
-    def test_full_release_publishes_all_components_in_order(self):
+    def test_rerun_release_rejoins_a_publisher_still_running(self):
+        self.pending_crates = True
+        with self.services() as coordinator:
+            coordinator.release(self.version, self.root / "release-plan.json")
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["site-promote.yml"])
+        self.assertIn("crates", self.published)
+
+    def test_full_release_starts_every_publisher_before_waiting(self):
         self.published.clear()
         self.partial_crates.clear()
         with self.services() as coordinator:
             coordinator.publish(self.plan, 99)
-        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches],
-                         ["release.yml", "crates-release.yml", "sdk-release.yml", "container.yml"])
+        self.assertEqual(self.events[:4], ["dispatch release.yml", "dispatch crates-release.yml",
+                                           "dispatch sdk-release.yml", "dispatch container.yml"])
         self.assertEqual(self.published, {"binaries", "crates", "sdk", "container"})
 
-    def test_failed_publisher_stops_and_retry_resumes_after_completed_publications(self):
+    def test_failed_publisher_lets_the_others_finish_and_a_retry_publishes_only_it(self):
         self.published.clear()
         self.partial_crates.clear()
         self.failed_workflow = "sdk-release.yml"
-        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "failure"):
+        with self.services() as coordinator, self.assertRaisesRegex(ReleaseError, "sdk run 903 finished with failure"):
             coordinator.publish(self.plan, 99)
-        self.assertEqual(self.published, {"binaries", "crates"})
+        self.assertEqual(self.published, {"binaries", "crates", "container"})
+        self.assertIn("container: published and verified", coordinator.messages)
         self.dispatches.clear()
         self.failed_workflow = None
         with self.services() as coordinator:
             coordinator.publish(self.plan, 99)
-        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["sdk-release.yml", "container.yml"])
+        self.assertEqual([path.split('/')[2] for path, _ in self.dispatches], ["sdk-release.yml"])
 
     def test_moved_release_tag_stops_before_publication(self):
         self.moved_tag = True
