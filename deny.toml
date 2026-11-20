@@ -78,6 +78,9 @@ allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = [
   "https://github.com/a16z/helios",
   "https://github.com/paradigmxyz/reth",
+  # Reth's own patches, copied into Cargo.toml; review on Reth bumps.
+  "https://github.com/DaniPopes/evm2",
+  "https://github.com/paradigmxyz/reth-core",
   "https://github.com/sigp/discv5",
   # Same upstream compatibility fix pinned in Cargo.toml; review on Reth bumps.
   "https://github.com/fgardt/proc-macro-error-2",

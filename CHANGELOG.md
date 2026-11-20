@@ -22,6 +22,8 @@ record, and documented RPC contracts.
   is pending, and the release reuses them. The coordinator waits for the
   security scans that creating the release tags starts, instead of failing
   while they still run.
+- Execution P2P and eraE history build on Reth 2.11.0. The handshake keeps
+  advertising eth/66 to eth/69, which Reth 2.11 would extend to eth/71.
 
 ### Fixed
 

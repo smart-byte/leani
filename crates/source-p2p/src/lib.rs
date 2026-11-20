@@ -99,9 +99,9 @@ pub use peer_store::{
 };
 
 /// Immutable Reth release used by this adapter.
-pub const RETH_VERSION: &str = "2.5.2";
+pub const RETH_VERSION: &str = "2.11.0";
 /// Immutable Reth commit used by this adapter.
-pub const RETH_REVISION: &str = "5a6940e351fed80458fe6c9da8581cbe4b8bd036";
+pub const RETH_REVISION: &str = "b9abbcc1b982755baa9021e6874e2e58936ca65f";
 const MAX_FIXED_RANGE_BLOCKS: u64 = 64;
 // ETH peers may serve at most 1,024 headers per response. Header-only proof
 // acquisition is small enough to use that protocol limit; body and receipt
@@ -3944,7 +3944,7 @@ fn load_or_create_secret_key(path: Option<&Path>) -> Result<SecretKey, P2pError>
         ))
     })?;
     let secret = rng_secret_key();
-    let encoded = hex::encode(secret.secret_bytes());
+    let encoded = hex::encode(secret.to_secret_bytes());
     let sequence = SECRET_KEY_WRITE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = path.with_extension(format!("secret.{}.{}.tmp", std::process::id(), sequence));
     let mut options = OpenOptions::new();
@@ -4045,7 +4045,14 @@ fn parse_secret_key(encoded: &str, path: &Path) -> Result<SecretKey, P2pError> {
             path.display()
         ))
     })?;
-    SecretKey::from_slice(&bytes).map_err(|error| {
+    let bytes = <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+        P2pError::InvalidConfig(format!(
+            "execution P2P identity {} holds {} bytes, not 32",
+            path.display(),
+            bytes.len()
+        ))
+    })?;
+    SecretKey::from_secret_bytes(bytes).map_err(|error| {
         P2pError::InvalidConfig(format!(
             "execution P2P identity {} is invalid: {error}",
             path.display()
@@ -4854,6 +4861,16 @@ impl RethP2pSource {
             // with it.
             let mut config = builder.build_with_noop_provider(self.chain_spec.clone());
             set_nat(&mut config, self.config.nat.clone());
+            // Reth advertises up to eth/71 by default; the requests here are
+            // built for eth/66 to eth/69.
+            config.hello_message.protocols = [
+                EthVersion::Eth69,
+                EthVersion::Eth68,
+                EthVersion::Eth67,
+                EthVersion::Eth66,
+            ]
+            .map(Into::into)
+            .to_vec();
             match tokio::spawn(async move { Box::pin(config.manager()).await }).await {
                 Ok(built) => built.map_err(|error| error.to_string()),
                 Err(error) => Err(format!("the network manager build stopped: {error}")),
@@ -12340,7 +12357,7 @@ mod tests {
     }
 
     fn node_record_at(marker: u8, address: Ipv4Addr) -> NodeRecord {
-        let secret = SecretKey::from_slice(&[marker; 32]).expect("valid test secret");
+        let secret = SecretKey::from_secret_bytes([marker; 32]).expect("valid test secret");
         NodeRecord::from_secret_key(
             SocketAddr::V4(SocketAddrV4::new(address, 30_300 + u16::from(marker))),
             &secret,
@@ -14004,7 +14021,7 @@ mod tests {
         let path = directory.path().join("execution-p2p-secret");
         let first = load_or_create_secret_key(Some(&path)).expect("create identity");
         let second = load_or_create_secret_key(Some(&path)).expect("reload identity");
-        assert_eq!(first.secret_bytes(), second.secret_bytes());
+        assert_eq!(first.to_secret_bytes(), second.to_secret_bytes());
         assert_eq!(
             std::fs::read_to_string(path).expect("identity file").len(),
             64
@@ -15278,7 +15295,7 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644))
             .expect("loosen identity");
         let reloaded = load_or_create_secret_key(Some(&path)).expect("reload identity");
-        assert_eq!(reloaded.secret_bytes(), created.secret_bytes());
+        assert_eq!(reloaded.to_secret_bytes(), created.to_secret_bytes());
         assert_eq!(
             mode(&path),
             0o600,
@@ -16268,20 +16285,29 @@ mod tests {
             || std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, discovery_port)).is_err();
         // Drop the build once Reth has bound Discv4, while Discv5 starts: a
         // lane reconnecting through it is cancelled, as when the network
-        // lanes restart.
+        // lanes restart. A build awaited in place pauses there and is
+        // dropped with Discv4 bound; one in its own task binds and finishes
+        // in the same scheduler turn, so it is shut down once it finishes.
         let mut build = Box::pin(source.network_session(head, NetworkLane::Live));
-        tokio::time::timeout(Duration::from_secs(10), async {
+        let finished = tokio::time::timeout(Duration::from_secs(10), async {
             while !discovery_bound() {
                 tokio::select! {
                     biased;
-                    session = &mut build => panic!("the build finished first: {:?}", session.err()),
-                    () = tokio::time::sleep(Duration::from_millis(5)) => {}
+                    session = &mut build => {
+                        session.expect("the network session");
+                        return true;
+                    }
+                    () = tokio::task::yield_now() => {}
                 }
             }
+            false
         })
         .await
         .expect("Reth bound the Discv4 port");
         drop(build);
+        if finished {
+            source.shutdown().await;
+        }
         let freed = tokio::time::timeout(Duration::from_secs(30), async {
             while discovery_bound() {
                 tokio::time::sleep(Duration::from_millis(100)).await;

@@ -1088,7 +1088,7 @@ mod tests {
     use super::*;
 
     fn node_record(marker: u8) -> NodeRecord {
-        let secret = SecretKey::from_slice(&[marker; 32]).expect("valid test secret");
+        let secret = SecretKey::from_secret_bytes([marker; 32]).expect("valid test secret");
         NodeRecord::from_secret_key(
             SocketAddr::V4(SocketAddrV4::new(
                 Ipv4Addr::new(127, 0, 0, marker),
