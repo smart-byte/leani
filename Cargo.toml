@@ -104,18 +104,18 @@ parquet = { version = "60.0.0", default-features = false, features = [
   "zstd",
 ] }
 postcard = { version = "1.1", features = ["alloc"] }
-reth-chainspec = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-primitives-traits = { version = "0.6.0", default-features = false }
-reth-discv5 = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-era = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-network = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-network-peers = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
-reth-tasks = { git = "https://github.com/paradigmxyz/reth", rev = "5a6940e351fed80458fe6c9da8581cbe4b8bd036" }
+reth-chainspec = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-ethereum-consensus = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-primitives-traits = { version = "0.8.2", default-features = false }
+reth-discv5 = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-dns-discovery = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-era = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-ethereum-primitives = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-network = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-network-p2p = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-network-peers = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
+reth-tasks = { git = "https://github.com/paradigmxyz/reth", tag = "v2.11.0" }
 semver = { version = "1.0", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -169,12 +169,23 @@ must_use_candidate = "allow"
 # without equality implementations.
 assert_is_empty = "allow"
 
-# Reth 2.5.2 still reaches proc-macro-error2 through its rustdoc-only
+# Reth 2.11.0 still reaches proc-macro-error2 through its rustdoc-only
 # aquamarine macros. The crate was archived before its Rust 2024
 # future-compatibility fix could merge, so pin the one-line upstream PR until
 # Reth removes or replaces aquamarine.
 [patch.crates-io]
 proc-macro-error2 = { git = "https://github.com/fgardt/proc-macro-error-2", rev = "53ff94b61c678593158db1a3d50269c6f0de0db7" }
+# Reth builds against these reth-core crates from git, not their crates.io
+# releases: the same revision keeps their types the ones Reth's crates use.
+reth-codecs = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-codecs-derive = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-primitives-traits = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+reth-zstd-compressors = { git = "https://github.com/paradigmxyz/reth-core", rev = "275ce4cf5befeb9f1e8acd935ff2882d2d25fc61" }
+
+# Reth pins evm2 through its pre-transfer repository, which redirects to
+# alloy-rs/evm2; Cargo rejects a patch from the same source.
+[patch."https://github.com/alloy-rs/evm2"]
+evm2 = { git = "https://github.com/DaniPopes/evm2", rev = "66687c18b34d3bdbb899f5eb7605070615c03475" }
 
 [profile.dev]
 debug = "line-tables-only"

@@ -79,7 +79,11 @@ async fn probe_receipts_use_the_negotiated_protocol() {
                 ..Head::default()
             })
             .build_with_noop_provider(MAINNET.clone());
-    peer_config.hello_message.protocols = vec![EthVersion::Eth69.into(), EthVersion::Eth70.into()];
+    peer_config.hello_message.protocols = vec![
+        EthVersion::Eth69.into(),
+        EthVersion::Eth70.into(),
+        EthVersion::Eth71.into(),
+    ];
     let (requests, mut incoming) = mpsc::channel(16);
     let peer = Box::pin(peer_config.manager())
         .await

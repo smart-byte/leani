@@ -396,7 +396,7 @@ explains each section.
 
 ## 13. Execution networking
 
-Leani consumes isolated networking crates from Reth 2.5.2 rather than
+Leani consumes isolated networking crates from Reth 2.11.0 rather than
 forking SHiNode or running a complete execution client. One manager persists
 for the process lifetime, uses a stable key in the data directory, shares a
 bounded peer cache across live/history work, enables Discv4, Discv5, and DNS

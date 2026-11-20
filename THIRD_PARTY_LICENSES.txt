@@ -1144,6 +1144,7 @@ Apache License 2.0 (Apache-2.0)
 ==============================================================================
 discv5 0.10.4 — https://github.com/sigp/discv5
 delay_map 0.4.1 — https://github.com/agemanning/delay_map
+discv5 0.12.0 — https://github.com/sigp/discv5
 parity-scale-codec 3.7.5 — https://github.com/paritytech/parity-scale-codec
 
                                  Apache License
@@ -2190,8 +2191,10 @@ Creative Commons Zero v1.0 Universal (CC0-1.0)
 ==============================================================================
 secp256k1-sys 0.10.1 — https://github.com/rust-bitcoin/rust-secp256k1/
 secp256k1-sys 0.11.0 — https://github.com/rust-bitcoin/rust-secp256k1/
+secp256k1-sys 0.14.1 — https://git.rust-bitcoin.org/rust-bitcoin/rust-secp256k1
 secp256k1 0.30.0 — https://github.com/rust-bitcoin/rust-secp256k1/
 secp256k1 0.31.1 — https://github.com/rust-bitcoin/rust-secp256k1/
+secp256k1 0.33.1 — https://git.rust-bitcoin.org/rust-bitcoin/rust-secp256k1
 
 Creative Commons Legal Code
 
@@ -2988,7 +2991,7 @@ The `cfg_aliases!` macro uses a lot of the code from [`tectonic_cfg_support::tar
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-quanta 0.12.6 — https://github.com/metrics-rs/quanta
+quanta 0.13.0 — https://github.com/metrics-rs/quanta
 
 // Copyright (c) 2019 Nuclear Furnace
 //
@@ -4344,32 +4347,6 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-winapi 0.3.9 — https://github.com/retep998/winapi-rs
-
-Copyright (c) 2015-2018 The winapi-rs Developers
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-==============================================================================
-MIT License (MIT)
-==============================================================================
 hkdf 0.12.4 — https://github.com/RustCrypto/KDFs/
 hkdf 0.13.0 — https://github.com/RustCrypto/KDFs/
 
@@ -4507,7 +4484,6 @@ MIT License (MIT)
 ==============================================================================
 const-random-macro 0.1.16 — https://github.com/tkaitchuck/constrandom
 const-random 0.1.18 — https://github.com/tkaitchuck/constrandom
-hashbrown 0.13.2 — https://github.com/rust-lang/hashbrown
 hashbrown 0.14.5 — https://github.com/rust-lang/hashbrown
 hashbrown 0.16.1 — https://github.com/rust-lang/hashbrown
 hashbrown 0.17.1 — https://github.com/rust-lang/hashbrown
@@ -4834,6 +4810,38 @@ MIT License (MIT)
 cipher 0.4.4 — https://github.com/RustCrypto/traits
 
 Copyright (c) 2016-2020 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+cipher 0.5.2 — https://github.com/RustCrypto/traits
+
+Copyright (c) 2016-2025 RustCrypto Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -5806,6 +5814,7 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+ctr 0.10.1 — https://github.com/RustCrypto/block-modes
 ctr 0.9.2 — https://github.com/RustCrypto/block-modes
 
 Copyright (c) 2018-2022 RustCrypto Developers
@@ -5903,6 +5912,39 @@ MIT License (MIT)
 opaque-debug 0.3.1 — https://github.com/RustCrypto/utils
 
 Copyright (c) 2018-2024 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+aes 0.9.4 — https://github.com/RustCrypto/block-ciphers
+
+Copyright (c) 2018-2024 The RustCrypto Project Developers
+Copyright (c) 2018 Artyom Pavlov
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -6704,6 +6746,38 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+universal-hash 0.6.1 — https://github.com/RustCrypto/traits
+
+Copyright (c) 2019-2025 RustCrypto Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 http-body-util 0.1.4 — https://github.com/hyperium/http-body
 http-body 1.1.0 — https://github.com/hyperium/http-body
 
@@ -6737,10 +6811,46 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+aes-gcm 0.11.1 — https://github.com/RustCrypto/AEADs
 chacha20 0.10.2 — https://github.com/RustCrypto/stream-ciphers
+ghash 0.6.0 — https://github.com/RustCrypto/universal-hashes
+polyval 0.7.3 — https://github.com/RustCrypto/universal-hashes
 zeroize_derive 1.5.0 — https://github.com/RustCrypto/utils
 
 Copyright (c) 2019-2026 The RustCrypto Project Developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+aead 0.6.1 — https://github.com/RustCrypto/traits
+
+Copyright (c) 2019-2026 The RustCrypto Project Developers
+Copyright (c) 2019 MobileCoin, LLC
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -6835,31 +6945,6 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-nonmax 0.5.5 — https://github.com/LPGhatguy/nonmax
-
-Copyright (c) 2020 Lucien Greathouse
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-==============================================================================
-MIT License (MIT)
-==============================================================================
 elliptic-curve 0.13.8 — https://github.com/RustCrypto/traits/tree/master/elliptic-curve
 
 Copyright (c) 2020-2022 RustCrypto Developers
@@ -6924,8 +7009,6 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-p256 0.13.2 — https://github.com/RustCrypto/elliptic-curves/tree/master/p256
-primeorder 0.13.6 — https://github.com/RustCrypto/elliptic-curves/tree/master/primeorder
 primeorder 0.14.0 — https://github.com/RustCrypto/elliptic-curves
 
 Copyright (c) 2020-2023 RustCrypto Developers
@@ -7058,6 +7141,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 elliptic-curve 0.14.3 — https://github.com/RustCrypto/traits
+p256 0.14.0 — https://github.com/RustCrypto/elliptic-curves
 
 Copyright (c) 2020-2026 RustCrypto Developers
 
@@ -7124,6 +7208,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 sha3 0.11.0 — https://github.com/RustCrypto/hashes
+sha3 0.12.0 — https://github.com/RustCrypto/hashes
 
 Copyright (c) 2020-2026 The RustCrypto Project Developers
 Copyright (c) 2016-2023 Artyom Pavlov, Marek Kotewicz
@@ -7445,6 +7530,39 @@ DEALINGS IN THE SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
+inout 0.2.6 — https://github.com/RustCrypto/utils
+
+Copyright (c) 2022-2025 The RustCrypto Project Developers
+Copyright (c) 2022 Artyom Pavlov
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
 cmov 0.5.4 — https://github.com/RustCrypto/utils
 hybrid-array 0.4.14 — https://github.com/RustCrypto/hybrid-array
 
@@ -7695,6 +7813,38 @@ wnaf 0.14.1 — https://github.com/RustCrypto/elliptic-curves
 
 Copyright (c) 2026 RustCrypto Developers
 Copyright (c) 2018-2025 `group` crate developers
+
+Permission is hereby granted, free of charge, to any
+person obtaining a copy of this software and associated
+documentation files (the "Software"), to deal in the
+Software without restriction, including without
+limitation the rights to use, copy, modify, merge,
+publish, distribute, sublicense, and/or sell copies of
+the Software, and to permit persons to whom the Software
+is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice
+shall be included in all copies or substantial portions
+of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF
+ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED
+TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT
+SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY
+CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR
+IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+DEALINGS IN THE SOFTWARE.
+
+
+==============================================================================
+MIT License (MIT)
+==============================================================================
+sponge-cursor 0.1.0 — https://github.com/RustCrypto/utils
+
+Copyright (c) 2026 The RustCrypto Project Developers
 
 Permission is hereby granted, free of charge, to any
 person obtaining a copy of this software and associated
@@ -8620,6 +8770,7 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 ==============================================================================
 enr 0.13.0 — https://github.com/sigp/enr
+enr 0.14.0 — https://github.com/sigp/enr
 
 MIT License
 
@@ -8808,45 +8959,6 @@ derive-where 1.6.1 — https://github.com/ModProg/derive-where
 MIT License
 
 Copyright (c) 2021 Roland Fredenhagen
-
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
-
-
-==============================================================================
-MIT License (MIT)
-==============================================================================
-revm-bytecode 42.0.0 — https://github.com/bluealloy/revm
-revm-context-interface 42.0.0 — https://github.com/bluealloy/revm
-revm-context 42.0.0 — https://github.com/bluealloy/revm
-revm-database-interface 42.0.0 — https://github.com/bluealloy/revm
-revm-database 42.0.0 — https://github.com/bluealloy/revm
-revm-handler 42.0.1 — https://github.com/bluealloy/revm
-revm-inspector 42.0.1 — https://github.com/bluealloy/revm
-revm-interpreter 42.0.0 — https://github.com/bluealloy/revm
-revm-precompile 42.0.1 — https://github.com/bluealloy/revm
-revm-primitives 42.0.0 — https://github.com/bluealloy/revm
-revm-state 42.0.0 — https://github.com/bluealloy/revm
-revm 42.0.1 — https://github.com/bluealloy/revm
-
-MIT License
-
-Copyright (c) 2021-2026 draganrakita
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
@@ -9170,46 +9282,51 @@ SOFTWARE.
 ==============================================================================
 MIT License (MIT)
 ==============================================================================
-reth-chain-state 2.5.2 — https://github.com/paradigmxyz/reth
-reth-chainspec 2.5.2 — https://github.com/paradigmxyz/reth
-reth-consensus-common 2.5.2 — https://github.com/paradigmxyz/reth
-reth-consensus 2.5.2 — https://github.com/paradigmxyz/reth
-reth-db-models 2.5.2 — https://github.com/paradigmxyz/reth
-reth-discv4 2.5.2 — https://github.com/paradigmxyz/reth
-reth-discv5 2.5.2 — https://github.com/paradigmxyz/reth
-reth-dns-discovery 2.5.2 — https://github.com/paradigmxyz/reth
-reth-ecies 2.5.2 — https://github.com/paradigmxyz/reth
-reth-era 2.5.2 — https://github.com/paradigmxyz/reth
-reth-errors 2.5.2 — https://github.com/paradigmxyz/reth
-reth-eth-wire-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-eth-wire 2.5.2 — https://github.com/paradigmxyz/reth
-reth-ethereum-consensus 2.5.2 — https://github.com/paradigmxyz/reth
-reth-ethereum-forks 2.5.2 — https://github.com/paradigmxyz/reth
-reth-ethereum-primitives 2.5.2 — https://github.com/paradigmxyz/reth
-reth-evm-ethereum 2.5.2 — https://github.com/paradigmxyz/reth
-reth-evm 2.5.2 — https://github.com/paradigmxyz/reth
-reth-execution-errors 2.5.2 — https://github.com/paradigmxyz/reth
-reth-execution-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-fs-util 2.5.2 — https://github.com/paradigmxyz/reth
-reth-metrics 2.5.2 — https://github.com/paradigmxyz/reth
-reth-net-banlist 2.5.2 — https://github.com/paradigmxyz/reth
-reth-net-nat 2.5.2 — https://github.com/paradigmxyz/reth
-reth-network-api 2.5.2 — https://github.com/paradigmxyz/reth
-reth-network-p2p 2.5.2 — https://github.com/paradigmxyz/reth
-reth-network-peers 2.5.2 — https://github.com/paradigmxyz/reth
-reth-network-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-network 2.5.2 — https://github.com/paradigmxyz/reth
-reth-prune-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-stages-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-static-file-types 2.5.2 — https://github.com/paradigmxyz/reth
-reth-storage-api 2.5.2 — https://github.com/paradigmxyz/reth
-reth-storage-errors 2.5.2 — https://github.com/paradigmxyz/reth
-reth-tasks 2.5.2 — https://github.com/paradigmxyz/reth
-reth-tokio-util 2.5.2 — https://github.com/paradigmxyz/reth
-reth-transaction-pool 2.5.2 — https://github.com/paradigmxyz/reth
-reth-trie-common 2.5.2 — https://github.com/paradigmxyz/reth
-reth-trie-sparse 2.5.2 — https://github.com/paradigmxyz/reth
-reth-trie 2.5.2 — https://github.com/paradigmxyz/reth
+evm2 0.1.0 — https://github.com/danipopes/evm2
+evm2-macros 0.1.0 — https://github.com/danipopes/evm2
+reth-codecs-derive 0.8.2 — https://github.com/paradigmxyz/reth-core
+reth-codecs 0.8.2 — https://github.com/paradigmxyz/reth-core
+reth-primitives-traits 0.8.2 — https://github.com/paradigmxyz/reth-core
+reth-chain-state 2.11.0 — https://github.com/paradigmxyz/reth
+reth-chainspec 2.11.0 — https://github.com/paradigmxyz/reth
+reth-consensus-common 2.11.0 — https://github.com/paradigmxyz/reth
+reth-consensus 2.11.0 — https://github.com/paradigmxyz/reth
+reth-db-models 2.11.0 — https://github.com/paradigmxyz/reth
+reth-discv4 2.11.0 — https://github.com/paradigmxyz/reth
+reth-discv5 2.11.0 — https://github.com/paradigmxyz/reth
+reth-dns-discovery 2.11.0 — https://github.com/paradigmxyz/reth
+reth-ecies 2.11.0 — https://github.com/paradigmxyz/reth
+reth-era 2.11.0 — https://github.com/paradigmxyz/reth
+reth-eth-wire-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-eth-wire 2.11.0 — https://github.com/paradigmxyz/reth
+reth-ethereum-consensus 2.11.0 — https://github.com/paradigmxyz/reth
+reth-ethereum-forks 2.11.0 — https://github.com/paradigmxyz/reth
+reth-ethereum-primitives 2.11.0 — https://github.com/paradigmxyz/reth
+reth-evm-ethereum 2.11.0 — https://github.com/paradigmxyz/reth
+reth-evm 2.11.0 — https://github.com/paradigmxyz/reth
+reth-execution-errors 2.11.0 — https://github.com/paradigmxyz/reth
+reth-execution-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-fs-util 2.11.0 — https://github.com/paradigmxyz/reth
+reth-lru 2.11.0 — https://github.com/paradigmxyz/reth
+reth-metrics 2.11.0 — https://github.com/paradigmxyz/reth
+reth-net-banlist 2.11.0 — https://github.com/paradigmxyz/reth
+reth-net-nat 2.11.0 — https://github.com/paradigmxyz/reth
+reth-network-api 2.11.0 — https://github.com/paradigmxyz/reth
+reth-network-p2p 2.11.0 — https://github.com/paradigmxyz/reth
+reth-network-peers 2.11.0 — https://github.com/paradigmxyz/reth
+reth-network-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-network 2.11.0 — https://github.com/paradigmxyz/reth
+reth-prune-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-stages-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-static-file-types 2.11.0 — https://github.com/paradigmxyz/reth
+reth-storage-api 2.11.0 — https://github.com/paradigmxyz/reth
+reth-storage-errors 2.11.0 — https://github.com/paradigmxyz/reth
+reth-tasks 2.11.0 — https://github.com/paradigmxyz/reth
+reth-tokio-util 2.11.0 — https://github.com/paradigmxyz/reth
+reth-transaction-pool 2.11.0 — https://github.com/paradigmxyz/reth
+reth-trie-common 2.11.0 — https://github.com/paradigmxyz/reth
+reth-trie-sparse 2.11.0 — https://github.com/paradigmxyz/reth
+reth-trie 2.11.0 — https://github.com/paradigmxyz/reth
 leani-api 0.2.0-rc.3 — https://github.com/smart-byte/leani
 leani-chain 0.2.0-rc.3 — https://github.com/smart-byte/leani
 leani-finality-beacon-api 0.2.0-rc.3 — https://github.com/smart-byte/leani
@@ -9244,20 +9361,19 @@ alloy-dyn-abi 1.7.3 — https://github.com/alloy-rs/core
 alloy-eip2124 0.2.0 — https://github.com/alloy-rs/eips
 alloy-eip2930 0.2.3 — https://github.com/alloy-rs/eips
 alloy-eip7702 0.6.3 — https://github.com/alloy-rs/eips
-alloy-eip7928 0.4.5 — https://github.com/alloy-rs/eips
+alloy-eip7928 0.4.13 — https://github.com/alloy-rs/eips
 alloy-eip8141 0.1.1 — https://github.com/alloy-rs/eips
 alloy-eips 2.5.0 — https://github.com/alloy-rs/alloy
-alloy-evm 0.38.0 — https://github.com/alloy-rs/alloy-evm
-alloy-genesis 2.4.1 — https://github.com/alloy-rs/alloy
+alloy-genesis 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-hardforks 0.4.11 — https://github.com/alloy-rs/hardforks
 alloy-json-abi 1.7.3 — https://github.com/alloy-rs/core
 alloy-network-primitives 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-primitives 1.7.3 — https://github.com/alloy-rs/core
 alloy-rlp-derive 0.3.17 — https://github.com/alloy-rs/rlp
 alloy-rlp 0.3.17 — https://github.com/alloy-rs/rlp
-alloy-rpc-types-admin 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-rpc-types-beacon 2.4.1 — https://github.com/alloy-rs/alloy
-alloy-rpc-types-engine 2.4.1 — https://github.com/alloy-rs/alloy
+alloy-rpc-types-admin 2.5.0 — https://github.com/alloy-rs/alloy
+alloy-rpc-types-beacon 2.5.0 — https://github.com/alloy-rs/alloy
+alloy-rpc-types-engine 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-rpc-types-eth 2.5.0 — https://github.com/alloy-rs/alloy
 alloy-rpc-types 2.4.1 — https://github.com/alloy-rs/alloy
 alloy-serde 2.5.0 — https://github.com/alloy-rs/alloy
@@ -9310,12 +9426,9 @@ op-alloy-rpc-types-engine 2.0.0 — https://github.com/ethereum-optimism/optimis
 prost-codec 0.4.0 — https://github.com/libp2p/rust-libp2p
 r-efi 5.3.0 — https://github.com/r-efi/r-efi
 r-efi 6.0.0 — https://github.com/r-efi/r-efi
-reth-codecs-derive 0.6.0 — https://github.com/paradigmxyz/reth-core
-reth-codecs 0.6.0 — https://github.com/paradigmxyz/reth-core
-reth-primitives-traits 0.6.0 — https://github.com/paradigmxyz/reth-core
 rtnetlink 0.20.0 — https://github.com/rust-netlink/rtnetlink
 ruint-macro 1.2.1 — https://github.com/recmo/uint
-ruint 1.20.0 — https://github.com/alloy-rs/ruint
+ruint 1.21.1 — https://github.com/alloy-rs/ruint
 rustls-platform-verifier-android 0.1.1 — https://github.com/rustls/rustls-platform-verifier
 rw-stream-sink 0.5.0 — https://github.com/libp2p/rust-libp2p
 siphasher 1.0.3 — https://github.com/jedisct1/rust-siphash
@@ -9323,14 +9436,13 @@ sqlx-core 0.9.0 — https://github.com/launchbadge/sqlx
 sqlx-sqlite 0.9.0 — https://github.com/launchbadge/sqlx
 syn-solidity 1.7.3 — https://github.com/alloy-rs/core
 uint 0.10.0 — https://github.com/paritytech/parity-common
+wasip1 1.0.0 — https://github.com/bytecodealliance/wasi
 wasmi 2.0.0 — https://github.com/wasmi-labs/wasmi
 wasmi_collections 2.0.0 — https://github.com/wasmi-labs/wasmi
 wasmi_core 2.0.0 — https://github.com/wasmi-labs/wasmi
 wasmi_ir 2.0.0 — https://github.com/wasmi-labs/wasmi
 wasmparser 0.228.0 — https://github.com/bytecodealliance/wasm-tools/tree/main/crates/wasmparser
 wide 0.7.33 — https://github.com/Lokathor/wide
-winapi-i686-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs
-winapi-x86_64-pc-windows-gnu 0.4.0 — https://github.com/retep998/winapi-rs
 windows-collections 0.3.2 — https://github.com/microsoft/windows-rs
 windows-core 0.62.2 — https://github.com/microsoft/windows-rs
 windows-future 0.3.2 — https://github.com/microsoft/windows-rs
@@ -9613,7 +9725,7 @@ MIT License (MIT)
 ==============================================================================
 adler2 2.0.1 — https://github.com/oyvindln/adler2
 alloy-chains 0.2.36 — https://github.com/alloy-rs/chains
-alloy-trie 0.9.8 — https://github.com/alloy-rs/trie
+alloy-trie 0.9.9 — https://github.com/alloy-rs/trie
 anyhow 1.0.104 — https://github.com/dtolnay/anyhow
 async-channel 2.5.0 — https://github.com/smol-rs/async-channel
 async-io 2.6.0 — https://github.com/smol-rs/async-io
@@ -9656,7 +9768,6 @@ proc-macro2 1.0.107 — https://github.com/dtolnay/proc-macro2
 quote 1.0.47 — https://github.com/dtolnay/quote
 rustix 1.1.6 — https://github.com/bytecodealliance/rustix
 rustversion 1.0.23 — https://github.com/dtolnay/rustversion
-schnellru 0.2.4 — https://github.com/koute/schnellru
 semver 1.0.28 — https://github.com/dtolnay/semver
 send_wrapper 0.4.0 — https://github.com/thk1/send_wrapper
 seq-macro 0.3.6 — https://github.com/dtolnay/seq-macro
@@ -9673,6 +9784,7 @@ thiserror-impl 1.0.69 — https://github.com/dtolnay/thiserror
 thiserror-impl 2.0.21 — https://github.com/dtolnay/thiserror
 thiserror 1.0.69 — https://github.com/dtolnay/thiserror
 thiserror 2.0.21 — https://github.com/dtolnay/thiserror
+typeid 1.0.3 — https://github.com/dtolnay/typeid
 unicode-ident 1.0.24 — https://github.com/dtolnay/unicode-ident
 wasi 0.11.1+wasi-snapshot-preview1 — https://github.com/bytecodealliance/wasi
 wasip2 1.0.4+wasi-0.2.12 — https://github.com/bytecodealliance/wasi-rs
@@ -11394,32 +11506,6 @@ freely, subject to the following restrictions:
 2. Altered source versions must be plainly marked as such, and must not be
    misrepresented as being the original software.
 3. This notice may not be removed or altered from any source distribution.
-
-==============================================================================
-zlib License (Zlib)
-==============================================================================
-slotmap 1.1.1 — https://github.com/orlp/slotmap
-
-Copyright (c) 2021 Orson Peters <orsonpeters@gmail.com>
-
-This software is provided 'as-is', without any express or implied warranty. In
-no event will the authors be held liable for any damages arising from the use of
-this software.
-
-Permission is granted to anyone to use this software for any purpose, including
-commercial applications, and to alter it and redistribute it freely, subject to
-the following restrictions:
-
- 1. The origin of this software must not be misrepresented; you must not claim
-    that you wrote the original software. If you use this software in a product,
-    an acknowledgment in the product documentation would be appreciated but is
-    not required.
-
- 2. Altered source versions must be plainly marked as such, and must not be
-    misrepresented as being the original software.
-
- 3. This notice may not be removed or altered from any source distribution.
-
 
 ==============================================================================
 zlib License (Zlib)

@@ -86,7 +86,7 @@ const TARGET_ACQUISITION_BYTES: u64 = 16 * 1_024 * 1_024;
 /// Each index has at most 8,192 * 5 offsets and their sorted positions. Keep
 /// metadata for a few adjacent eras, bounded independently of archive size.
 const MAX_CACHED_INDEXES: usize = 8;
-const RETH_REVISION: &str = "5a6940e351fed80458fe6c9da8581cbe4b8bd036";
+const RETH_REVISION: &str = "b9abbcc1b982755baa9021e6874e2e58936ca65f";
 
 /// Construction settings for one archive mirror.
 #[derive(Clone)]
